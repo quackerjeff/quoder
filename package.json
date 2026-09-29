@@ -5,5 +5,10 @@
   },
   "allowScripts": {
     "opencode-ai@1.18.33": true
+  },
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "typescript": "7.0.2",
+    "vitest": "5.0.2"
   }
 }

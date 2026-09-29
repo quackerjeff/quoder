@@ -13,11 +13,12 @@ Spec: `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/spec.md`
 
 ## Group 2: Define tests
 
-- [ ] Define probe contracts and red-phase automated tests | `src/capabilities.ts`, `src/report.ts`, `tests/unit/`
+- [x] Define probe contracts and red-phase automated tests | `src/capabilities.ts`, `src/report.ts`, `tests/unit/`
   - **Packages**: Use only the test/build dependencies approved and versioned by the preceding research task.
   - **Accept**: Tests define all nine capability outcomes, event classification, aggregate PASS/FAIL behavior, cleanup on success/error/cancellation, exact `hello.txt` content, project-directory confinement, the spec's nonce/sentinel isolation predicate, a real-permission-event predicate, and the cancellation start-event/terminal-state/no-late-completion predicates. Tests fail only because implementation is absent.
   - **Verify**: Run the versioned test command selected in `docs/tech.md` and confirm the expected red-phase failures are recorded in the task notes before marking complete.
   - **Constraints**: Test doubles may validate probe-owned logic but must not be presented as evidence that OpenCode capabilities exist. Do not invoke a live model in the default unit-test command.
+  - **Completed evidence**: Installed only the approved exact development dependencies: `typescript@7.0.2`, `vitest@5.0.2`, and `@types/node@24.12.2`. The strict TypeScript compile command completed successfully for both contract modules and both unit-test files. `npx --no-install vitest run --reporter=dot` collected 27 tests: one static capability-matrix contract passed and the other 26 failed at the explicit `Group 3 implementation absent: <contract>` placeholders. Those expected red-phase failures cover fresh unique session IDs, correlated final model output, structured events, permission events, exact file content, path confinement, cancellation ordering and no late completion, success/error/cancellation cleanup, verified deletion, nonce/sentinel isolation, and report aggregation/rendering. No live model or OpenCode runtime was invoked.
 
 ## Group 3: Implement the probe core
 
