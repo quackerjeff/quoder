@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@opencode-ai/sdk": "1.18.33",
+    "opencode-ai": "1.18.33"
+  },
+  "allowScripts": {
+    "opencode-ai@1.18.33": true
+  }
+}

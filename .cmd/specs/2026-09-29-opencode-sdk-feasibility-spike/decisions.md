@@ -31,3 +31,11 @@
 **Decision**: The feasibility spike exposes `npm run verify:live`, with exact Node, npm, OpenCode, and test-tool versions verified and recorded during Group 1.
 
 **Rationale**: The PRD requires a TypeScript program, and a stable npm script makes the environment-dependent probe repeatable without deciding the eventual production packaging or binary name.
+
+## 2026-09-29 — Use a version-scoped deletion compatibility bridge
+
+**Context**: `@opencode-ai/sdk@1.18.33` exposes no native delete method under `client.v2.session`, while the same package retains legacy `client.session.delete`.
+
+**Decision**: For exactly CLI/SDK version 1.18.33, the adapter may delete a Core V2-created session through `client.session.delete`, then must prove deletion by requiring a Core V2 get to return 404. Keep this behavior behind one adapter method and re-verify it on every OpenCode upgrade.
+
+**Rationale**: An isolated live check created a Core V2 session, observed it through Core V2, deleted it through the legacy endpoint with HTTP 200/`true`, and then received `404 SessionNotFoundError` through Core V2. This supplies direct compatibility evidence without pretending Core V2 has a native delete operation.

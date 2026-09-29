@@ -4,11 +4,12 @@ Spec: `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/spec.md`
 
 ## Group 1: Verify OpenCode contracts
 
-- [ ] Research and document the installed OpenCode TypeScript SDK/API | `docs/tech.md`
+- [x] Research and document the installed OpenCode TypeScript SDK/API | `docs/tech.md`
   - **Packages**: Determine and record the exact package name and installed/tested version; do not assume a package identifier before verification.
   - **Accept**: `docs/tech.md` cites authoritative sources or locally inspected package declarations for connection/hosting, project-directory selection, session create/delete, prompt submission, structured event streaming, permission response, cancellation, and final-result retrieval. It records exact package/runtime versions, import paths, signatures or typed call shapes, stability status, a deterministic `ask` action under the existing policy, cancellation terminal-state/event ordering, and version applicability.
   - **Verify**: `rg -n 'Package|Version|Import|Signature|Source|Project directory|Session creation|Session deletion|Streaming|Permission request|Permission response|Cancellation|Final result|Node|npm' docs/tech.md` returns a match for every named contract; then manually inspect the document and record a checklist in the task notes confirming each contract has an official URL or local package-file path and an exact tested version.
   - **Constraints**: Inspect the target environment and official/local package artifacts. Do not implement against inferred APIs. Flag any missing critical capability immediately.
+  - **Completed evidence**: Core V2 has no native delete method in 1.18.33. An isolated live check proved `client.session.delete` removes a `client.v2.session.create` session: legacy delete returned HTTP 200/`true`, and the following Core V2 get returned HTTP 404 `SessionNotFoundError`. The version-scoped compatibility bridge and all required contracts/checklist items are recorded in `docs/tech.md`.
 
 ## Group 2: Define tests
 
