@@ -2,6 +2,7 @@ import {
   createOpencodeClient,
   type ModelRef,
   type OpencodeClient,
+  type V2Event,
   type PermissionV2Reply,
   type SessionInputAdmitted,
   type SessionMessagesResponse,
@@ -125,6 +126,29 @@ export class OpenCodeAdapter {
     } catch (cause) {
       clearTimeout(timeout);
       throw this.#toError("subscribe to events", cause);
+    }
+  }
+
+  async globalEvents(): Promise<AsyncGenerator<V2Event, void, unknown>> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.#timeoutMs);
+    try {
+      const result = await this.#client.v2.event.subscribe({
+        signal: controller.signal,
+        sseMaxRetryAttempts: 0,
+      });
+      const stream = result.stream;
+      return (async function* timedStream() {
+        try {
+          yield* stream;
+        } finally {
+          clearTimeout(timeout);
+          controller.abort();
+        }
+      })();
+    } catch (cause) {
+      clearTimeout(timeout);
+      throw this.#toError("subscribe to global events", cause);
     }
   }
 

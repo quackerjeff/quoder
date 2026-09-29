@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".live-build"
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["tests/**/*.ts", ".live-build"]
+}

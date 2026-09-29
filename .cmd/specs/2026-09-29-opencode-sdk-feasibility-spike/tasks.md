@@ -31,11 +31,12 @@ Spec: `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/spec.md`
 
 ## Group 4: Implement live integration verification
 
-- [ ] Implement the opt-in disposable-repository integration scenario | `tests/integration/`, `scripts/`
+- [x] Implement the opt-in disposable-repository integration scenario | `tests/integration/`, `scripts/`
   - **Packages**: No additional packages unless researched, versioned, and documented in `docs/tech.md`.
   - **Accept**: `npm run verify:live` creates an isolated temporary Git repository; creates a fresh session scoped to it; invokes the existing local model; observes a structured streaming event; exercises an actual OpenCode permission request and response; verifies exact `hello.txt` content; executes the specified cancellation protocol; deletes sessions; creates a second session; performs the exact nonce/sentinel isolation assertion; prints each of the nine named criteria exactly once; prints an overall verdict; and exits nonzero unless all criteria pass.
   - **Verify**: Run unit tests and a smoke execution using test doubles or a deliberately unavailable-runtime fixture to prove timeout, cleanup, report shape, and exit-code behavior. The authoritative live OpenCode/Ollama run is reserved for the post-review QA gate.
   - **Constraints**: Never run file-modification prompts against the Quoder working tree. Use an explicit temporary directory, validate the resolved path before use, and clean it up safely. Do not change OpenCode/Ollama configuration.
+  - **Completed evidence**: Added the opt-in `npm run verify:live` entry point, an OS-temporary disposable Git repository with validated cleanup boundaries, the two-session nonce/sentinel scenario, real Core V2 event and permission handling, exact file verification, cancellation fixture/process checks, deletion evidence, and the ordered nine-row verdict. Deterministic integration tests and `npm run verify:live:smoke` exercise report shape, nonzero unavailable-runtime behavior, finite timeout configuration, driver cleanup, temporary-environment cleanup, and conservative FAIL verdicts for either cleanup failure without invoking OpenCode or a model. `npm run typecheck`, `npm test -- --reporter=dot` (33/33), `npm run verify:live:smoke`, and `git diff --check` passed. The authoritative live scenario was not run and remains reserved for Group 7 QA.
 
 ## Group 5: Review gate
 
