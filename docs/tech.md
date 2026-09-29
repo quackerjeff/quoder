@@ -214,6 +214,13 @@ Although `Session3.create(parameters?)` is generated with an optional parameter,
 
 ## Dependency Choices
 
+Group 3 verification commands:
+
+```bash
+npm run typecheck
+npm test
+```
+
 Approved exact Group 2 development dependencies:
 
 ```bash

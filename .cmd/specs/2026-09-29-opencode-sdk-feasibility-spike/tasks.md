@@ -22,11 +22,12 @@ Spec: `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/spec.md`
 
 ## Group 3: Implement the probe core
 
-- [ ] Build the verified OpenCode integration boundary and capability runner | `src/opencode-adapter.ts`, `src/capabilities.ts`, `src/report.ts`, `package.json`, `tsconfig.json`
+- [x] Build the verified OpenCode integration boundary and capability runner | `src/opencode-adapter.ts`, `src/capabilities.ts`, `src/report.ts`, `package.json`, `tsconfig.json`
   - **Packages**: Use the exact OpenCode SDK/API and TypeScript/tooling versions verified in `docs/tech.md`.
   - **Accept**: The Group 2 tests pass; the implementation exposes only verified operations needed by the spike, applies finite timeouts, preserves structured diagnostic evidence, and attempts session deletion on success, failure, and cancellation.
   - **Verify**: Run the documented typecheck and unit-test commands from `docs/tech.md`.
   - **Constraints**: Do not add CLI/TUI application behavior or later-milestone features. Do not scrape terminal output when a verified structured event exists. Do not silently convert unsupported capabilities to PASS.
+  - **Completed evidence**: Implemented the pinned `@opencode-ai/sdk/v2` boundary for session creation, prompt admission, durable event streaming, one-time permission replies, interruption, idle waiting, projected messages, and the verified legacy-delete/Core-V2-404 compatibility assertion. Every request and stream has a finite abort timeout, failures retain structured operation/status/error-tag diagnostics, and the capability runner attempts reverse-order session cleanup on success, error, and cancellation. `npm run typecheck`, `npm test -- --reporter=dot` (27/27 passing), and `git diff --check` passed without invoking OpenCode or a model.
 
 ## Group 4: Implement live integration verification
 

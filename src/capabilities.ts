@@ -1,3 +1,5 @@
+import { isAbsolute, relative, resolve } from "node:path";
+
 export const CAPABILITY_NAMES = [
   "Fresh session creation",
   "Project directory",
@@ -57,56 +59,106 @@ export type IsolationClassification =
   | { readonly status: "PASS"; readonly reason: "no-prior-session" }
   | { readonly status: "FAIL"; readonly reason: "nonce-leaked" | "unexpected-response" };
 
-const group3NotImplemented = (contract: string): never => {
-  throw new Error(`Group 3 implementation absent: ${contract}`);
-};
-
-export function classifyEvent(_event: ProbeEvent): EventClassification {
-  return group3NotImplemented("classifyEvent");
+export function classifyEvent(event: ProbeEvent): EventClassification {
+  return {
+    structuredExecution: event.type === "tool.started",
+    permissionRequest: event.type === "permission.asked",
+    fixtureStarted: event.type === "fixture.started",
+    terminalIdle: event.type === "session.idle",
+    normalCompletion: event.type === "fixture.completed",
+  };
 }
 
-export function hasFreshSessionIDs(_sessionIDs: readonly string[]): boolean {
-  return group3NotImplemented("hasFreshSessionIDs");
+export function hasFreshSessionIDs(sessionIDs: readonly string[]): boolean {
+  return (
+    sessionIDs.length >= 2 &&
+    sessionIDs.every((sessionID) => sessionID.trim().length > 0) &&
+    new Set(sessionIDs).size === sessionIDs.length
+  );
 }
 
-export function hasFinalModelResponse(_evidence: FinalResponseEvidence): boolean {
-  return group3NotImplemented("hasFinalModelResponse");
+export function hasFinalModelResponse(evidence: FinalResponseEvidence): boolean {
+  return (
+    evidence.admittedInputID.length > 0 &&
+    evidence.admittedInputID === evidence.responseInputID &&
+    evidence.assistantText.trim().length > 0
+  );
 }
 
-export function hasExactHelloContent(_content: string): boolean {
-  return group3NotImplemented("hasExactHelloContent");
+export function hasExactHelloContent(content: string): boolean {
+  return content === "Hello from OpenCode" || content === "Hello from OpenCode\n";
 }
 
-export function isPathConfined(_repositoryRoot: string, _candidatePath: string): boolean {
-  return group3NotImplemented("isPathConfined");
+export function isPathConfined(repositoryRoot: string, candidatePath: string): boolean {
+  const root = resolve(repositoryRoot);
+  const candidate = resolve(candidatePath);
+  const pathFromRoot = relative(root, candidate);
+  return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot));
 }
 
 export function classifyIsolation(
-  _expectedNonce: string,
-  _response: string,
+  expectedNonce: string,
+  response: string,
 ): IsolationClassification {
-  return group3NotImplemented("classifyIsolation");
+  if (response.includes(expectedNonce)) {
+    return { status: "FAIL", reason: "nonce-leaked" };
+  }
+  return response === "NO_PRIOR_SESSION"
+    ? { status: "PASS", reason: "no-prior-session" }
+    : { status: "FAIL", reason: "unexpected-response" };
 }
 
-export function hasRealPermissionRequest(_events: readonly ProbeEvent[]): boolean {
-  return group3NotImplemented("hasRealPermissionRequest");
+export function hasRealPermissionRequest(events: readonly ProbeEvent[]): boolean {
+  return events.some(
+    (event) =>
+      classifyEvent(event).permissionRequest &&
+      typeof event.properties?.requestID === "string" &&
+      event.properties.requestID.length > 0,
+  );
 }
 
-export function cancellationPassed(_evidence: CancellationEvidence): boolean {
-  return group3NotImplemented("cancellationPassed");
+export function cancellationPassed(evidence: CancellationEvidence): boolean {
+  const ordered =
+    evidence.fixtureStartedAtSequence > 0 &&
+    evidence.fixtureStartedAtSequence < evidence.interruptRequestedAtSequence &&
+    evidence.interruptRequestedAtSequence < evidence.terminalIdleAtSequence;
+  const lateCompletion = evidence.events.some(
+    (event) =>
+      event.sequence > evidence.interruptRequestedAtSequence &&
+      classifyEvent(event).normalCompletion,
+  );
+  return ordered && evidence.fixtureTerminated && !lateCompletion;
 }
 
 export function sessionDeletionPassed(
-  _deleteAccepted: boolean,
-  _postDeleteLookupStatus: number,
+  deleteAccepted: boolean,
+  postDeleteLookupStatus: number,
 ): boolean {
-  return group3NotImplemented("sessionDeletionPassed");
+  return deleteAccepted && postDeleteLookupStatus === 404;
 }
 
 export async function withSessionCleanup<T>(
-  _cleanup: SessionCleanup,
-  _sessionIDs: readonly string[],
-  _operation: () => Promise<T>,
+  cleanup: SessionCleanup,
+  sessionIDs: readonly string[],
+  operation: () => Promise<T>,
 ): Promise<T> {
-  return group3NotImplemented("withSessionCleanup");
+  let operationError: unknown;
+  try {
+    return await operation();
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    const cleanupErrors: unknown[] = [];
+    for (const sessionID of [...sessionIDs].reverse()) {
+      try {
+        await cleanup.deleteSession(sessionID);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (cleanupErrors.length > 0 && operationError === undefined) {
+      throw new AggregateError(cleanupErrors, "Session cleanup failed");
+    }
+  }
 }

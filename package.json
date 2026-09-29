@@ -1,4 +1,9 @@
 {
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.33",
     "opencode-ai": "1.18.33"

@@ -10,18 +10,30 @@ export interface CapabilityReport {
   readonly verdict: CapabilityStatus;
 }
 
-const group3NotImplemented = (contract: string): never => {
-  throw new Error(`Group 3 implementation absent: ${contract}`);
-};
-
 export function buildCapabilityReport(
-  _results: ReadonlyMap<CapabilityName, CapabilityResult>,
+  results: ReadonlyMap<CapabilityName, CapabilityResult>,
 ): CapabilityReport {
-  return group3NotImplemented("buildCapabilityReport");
+  const orderedResults = CAPABILITY_NAMES.map((capability) => {
+    const result = results.get(capability);
+    if (result === undefined) {
+      throw new Error(`Missing required capability result: ${capability}`);
+    }
+    if (result.capability !== capability) {
+      throw new Error(`Capability result key does not match result: ${capability}`);
+    }
+    return result;
+  });
+  return {
+    results: orderedResults,
+    verdict: orderedResults.every(({ status }) => status === "PASS") ? "PASS" : "FAIL",
+  };
 }
 
-export function renderCapabilityReport(_report: CapabilityReport): string {
-  return group3NotImplemented("renderCapabilityReport");
+export function renderCapabilityReport(report: CapabilityReport): string {
+  return [
+    ...report.results.map(({ capability, status }) => `${capability}: ${status}`),
+    `Capability Verdict: ${report.verdict}`,
+  ].join("\n");
 }
 
 // This reference makes the required ordered matrix part of the runtime contract.
