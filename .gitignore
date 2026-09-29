@@ -1,0 +1,7 @@
+.cmd/specs/currentspec.md
+.DS_Store
+.vscode/
+.idea/
+.env
+.env.*
+*.log
