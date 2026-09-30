@@ -150,11 +150,22 @@ Spec: `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/spec.md`
 
 ## Group 7: QA gate
 
-- [ ] Validate the live OpenCode/Ollama feasibility scenario | `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/qa.md`
+- [x] Validate the live OpenCode/Ollama feasibility scenario | `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/qa.md`
   - **Packages**: None beyond the reviewed implementation.
   - **Accept**: QA runs `npm run verify:live` in the target environment and records its exit code, exact environment/version details, automated versus live checks, evidence for each of the nine PRD exit criteria, residual gaps, release confidence, a `Capability Verdict: PASS|FAIL`, and a separate QA `Verdict: PASS|FAIL` covering whether validation was executed reliably. QA may return PASS with a capability FAIL when all checks ran and the negative result is trustworthy.
   - **Verify**: Run `npm run verify:live` and record its output and exit code even when nonzero. Confirm `qa.md` contains each of the nine named capability rows with `PASS` or `FAIL`, exactly one `Capability Verdict: PASS|FAIL`, and exactly one QA `Verdict: PASS|FAIL`; `grep -i '^### Verdict: PASS' .cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/qa.md` must pass before documentation begins.
   - **Constraints**: A capability FAIL is a valid completed-spike outcome and proceeds only to Group 8 documentation; it blocks Milestone 1 and requires architecture reassessment. A QA Verdict FAIL means the validation itself is unreliable and must be corrected before proceeding. Do not reinterpret mocked results as live evidence.
+  - **Blocked cycle 1**: The authoritative `npm run verify:live` attempt returned no captured stdout or exit code before the execution wrapper was interrupted after 1162.2 seconds. Later process inspection found no surviving verifier or OpenCode server process, but the nine live capability outcomes and cleanup evidence are unavailable. QA Verdict is FAIL because validation reliability could not be established; see `qa.md`. Group 8 remains blocked.
+  - **Completed cycle 2**: The user-authorized authoritative `npm run verify:live` run completed reliably with exit code `1`, a durable stage journal, all nine capability rows, and verified cleanup. The authenticated server and first Core V2 session were created, but the initial model prompt reached its finite 120-second operation timeout while the configured Ollama service was unavailable. Capability Verdict is FAIL; QA Verdict is PASS because the negative result is complete and auditable. Milestone 1 remains blocked, and Group 8 may document the failed feasibility result. See `qa.md`.
+
+## Diagnostic Group 11: Durable live-run observability and deadline
+
+- [x] Make authoritative live validation diagnosable and finite before QA Cycle 2 | `src/live-probe.ts`, `src/live-observability.ts`, `scripts/verify-live.ts`, `tests/integration/live-probe.test.ts`, `docs/tech.md`
+  - **Packages**: None.
+  - **Accept**: `npm run verify:live` writes timestamped stage transitions durably to a known JSONL journal and mirrors them to stderr; the journal contains no credentials or raw provider/server diagnostics. A positive finite whole-run deadline covers environment creation, driver creation, and scenario execution. Expiry closes an available driver, cleans the disposable environment, emits a complete conservative nine-row FAIL report, and exits nonzero. The default deadline and journal path are documented and may be overridden for diagnostics.
+  - **Verify**: `npm run typecheck && npm test -- --reporter=dot && npm run verify:live:smoke && git diff --check`
+  - **Constraints**: Do not run the authoritative live OpenCode/Ollama scenario. Do not authorize or begin QA Cycle 2. Do not weaken capability predicates, permission enforcement, authentication, confinement, or cleanup behavior.
+  - **Completed evidence**: The live verifier now writes fixed, timestamped stage events synchronously to `.live-build/verify-live.journal.jsonl` and mirrors them to stderr. A 600,000 ms default whole-run deadline (overridable with `QUODER_LIVE_TIMEOUT_MS`) covers environment creation, driver creation, and scenario execution; expiry records the timeout, closes an available driver, follows normal cleanup, and produces the existing conservative nine-row FAIL report with a nonzero exit. Tests cover a permanently stalled driver, cleanup, the complete failure report, durable journal entries, and override validation. `npm run typecheck`, `npm test -- --reporter=dot` (65/65), `npm run verify:live:smoke`, and `git diff --check` passed on 2026-09-30. The authoritative live scenario and QA Cycle 2 were not run.
 
 ## Group 8: Documentation update
 

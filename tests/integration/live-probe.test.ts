@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -6,6 +6,10 @@ import type { OpencodeClient, V2Event } from "@opencode-ai/sdk/v2";
 import { describe, expect, it, vi } from "vitest";
 
 import { CAPABILITY_NAMES } from "../../src/capabilities.js";
+import {
+  createLiveRunJournal,
+  liveRunTimeoutFromEnvironment,
+} from "../../src/live-observability.js";
 import {
   LIVE_PROBE_TIMEOUT_MS,
   OpenCodeLiveDriver,
@@ -165,6 +169,51 @@ describe("live probe smoke behavior", () => {
   it("uses a finite live-operation timeout", () => {
     expect(LIVE_PROBE_TIMEOUT_MS).toBeGreaterThan(0);
     expect(Number.isFinite(LIVE_PROBE_TIMEOUT_MS)).toBe(true);
+  });
+
+  it("fails every capability, cleans up, and records progress at the end-to-end deadline", async () => {
+    const stages: string[] = [];
+    const driver: LiveProbeDriver = {
+      run: vi.fn(() => new Promise<LiveProbeEvidence>(() => undefined)),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const dependencies = dependenciesWith(driver);
+
+    const outcome = await runLiveProbe(dependencies, {
+      timeoutMs: 20,
+      onProgress: (stage) => stages.push(stage),
+    });
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.report.results).toHaveLength(9);
+    expect(outcome.report.results.every(({ status }) => status === "FAIL")).toBe(true);
+    expect(outcome.report.results[0]?.evidence[0]).toContain("end-to-end timeout of 20ms");
+    expect(stages).toContain("run.timeout");
+    expect(driver.close).toHaveBeenCalled();
+    expect(dependencies.removeEnvironment).toHaveBeenCalledWith(environment);
+  });
+
+  it("writes a durable timestamped journal and validates timeout overrides", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quoder-live-journal-test-"));
+    const path = join(root, "nested", "journal.jsonl");
+    const diagnostics: string[] = [];
+    try {
+      const journal = createLiveRunJournal(path, (line) => diagnostics.push(line));
+      journal.progress("permission.start");
+      journal.finish(1);
+      const entries = (await readFile(path, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(entries.map(({ event }: { event: string }) => event)).toEqual([
+        "process.start",
+        "stage.permission.start",
+        "process.finish.exit-1",
+      ]);
+      expect(entries.every(({ timestamp }: { timestamp: string }) => !Number.isNaN(Date.parse(timestamp)))).toBe(true);
+      expect(diagnostics).toHaveLength(3);
+      expect(liveRunTimeoutFromEnvironment("1250")).toBe(1250);
+      expect(() => liveRunTimeoutFromEnvironment("0")).toThrow(/positive finite/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

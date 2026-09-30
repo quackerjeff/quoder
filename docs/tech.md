@@ -249,6 +249,27 @@ Runtime dependencies are pinned exactly in `package.json`: `@opencode-ai/sdk@1.1
 - The provider configuration contains an inline authorization credential. It is not reproduced here. Rotate it and move it to an environment/secret mechanism before capturing live probe logs.
 - A sandbox may require localhost-bind permission and writable XDG data/state directories; that is an execution-environment concern, not an OpenCode API limitation.
 
+## Live Verification Diagnostics
+
+`npm run verify:live` records timestamped lifecycle and scenario-stage transitions in
+`.live-build/verify-live.journal.jsonl` and mirrors the same entries to stderr. The journal is
+rewritten for each invocation, is gitignored with the rest of `.live-build`, and deliberately
+contains only fixed stage names—never authorization headers, credentials, model content, or raw
+server diagnostics.
+
+The complete live run has a default 600,000 ms deadline. Override it only when diagnosing a
+specific environment:
+
+```bash
+QUODER_LIVE_TIMEOUT_MS=300000 \
+QUODER_LIVE_JOURNAL_PATH=/tmp/quoder-live.journal.jsonl \
+npm run verify:live
+```
+
+On deadline expiry, the verifier records `stage.run.timeout`, closes any available driver,
+attempts normal disposable-environment cleanup, prints a conservative nine-capability FAIL
+report, and exits nonzero.
+
 ## Open Verification Items
 
 1. Confirm exact `LocationRef` construction by TypeScript compilation.

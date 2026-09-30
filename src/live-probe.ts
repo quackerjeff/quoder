@@ -24,6 +24,7 @@ import { buildCapabilityReport, renderCapabilityReport, type CapabilityReport } 
 
 const execFileAsync = promisify(execFile);
 export const LIVE_PROBE_TIMEOUT_MS = 120_000;
+export const LIVE_PROBE_RUN_TIMEOUT_MS = 600_000;
 const SENTINEL = "NO_PRIOR_SESSION";
 const SERVER_USERNAME = "quoder";
 
@@ -55,8 +56,18 @@ export interface LiveProbeDriver {
 
 export interface LiveProbeDependencies {
   readonly createEnvironment: () => Promise<LiveProbeEnvironment>;
-  readonly createDriver: () => Promise<LiveProbeDriver>;
+  readonly createDriver: (options?: LiveProbeDriverOptions) => Promise<LiveProbeDriver>;
   readonly removeEnvironment: (environment: LiveProbeEnvironment) => Promise<void>;
+}
+
+export type LiveProbeProgress = (stage: string) => void;
+
+export interface LiveProbeDriverOptions {
+  readonly onProgress?: LiveProbeProgress;
+}
+
+export interface RunLiveProbeOptions extends LiveProbeDriverOptions {
+  readonly timeoutMs?: number;
 }
 
 export interface LiveProbeOutcome {
@@ -143,22 +154,49 @@ export function evaluateLiveEvidence(
 
 export async function runLiveProbe(
   dependencies: LiveProbeDependencies = defaultLiveProbeDependencies,
+  options: RunLiveProbeOptions = {},
 ): Promise<LiveProbeOutcome> {
   let environment: LiveProbeEnvironment | undefined;
   let driver: LiveProbeDriver | undefined;
   let report: CapabilityReport;
   const cleanupErrors: string[] = [];
+  const onProgress = options.onProgress ?? (() => undefined);
+  const timeoutMs = options.timeoutMs ?? LIVE_PROBE_RUN_TIMEOUT_MS;
+  let timeout: NodeJS.Timeout | undefined;
+  let rejectDeadline: ((reason: Error) => void) | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject;
+  });
   try {
-    environment = await dependencies.createEnvironment();
-    driver = await dependencies.createDriver();
-    report = evaluateLiveEvidence(await driver.run(environment), environment.repository);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("Live probe end-to-end timeout must be a positive finite number");
+    }
+    timeout = setTimeout(() => {
+      onProgress("run.timeout");
+      void driver?.close().catch(() => undefined);
+      rejectDeadline?.(new Error(`Live probe exceeded end-to-end timeout of ${timeoutMs}ms`));
+    }, timeoutMs);
+    onProgress("environment.create.start");
+    environment = await Promise.race([dependencies.createEnvironment(), deadline]);
+    onProgress("environment.create.complete");
+    onProgress("driver.create.start");
+    driver = await Promise.race([dependencies.createDriver({ onProgress }), deadline]);
+    onProgress("driver.create.complete");
+    const activeDriver = driver;
+    onProgress("run.start");
+    const evidence = await Promise.race([activeDriver.run(environment), deadline]);
+    onProgress("run.complete");
+    report = evaluateLiveEvidence(evidence, environment.repository);
   } catch (error) {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : "Unknown live probe failure";
     report = buildCapabilityReport(failResults(message));
   } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
     if (driver !== undefined) {
       try {
+        onProgress("driver.close.start");
         await driver.close();
+        onProgress("driver.close.complete");
       } catch (error) {
         cleanupErrors.push(
           `driver cleanup failed: ${error instanceof Error ? error.message : "unknown error"}`,
@@ -167,7 +205,9 @@ export async function runLiveProbe(
     }
     if (environment !== undefined) {
       try {
+        onProgress("environment.remove.start");
         await dependencies.removeEnvironment(environment);
+        onProgress("environment.remove.complete");
       } catch (error) {
         cleanupErrors.push(
           `environment cleanup failed: ${error instanceof Error ? error.message : "unknown error"}`,
@@ -431,10 +471,12 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
   readonly #closeServer: () => void;
   readonly #sessionIDs: string[] = [];
   readonly #deletedSessionIDs: string[] = [];
+  readonly #onProgress: LiveProbeProgress;
 
-  constructor(client: OpencodeClient, closeServer: () => void) {
+  constructor(client: OpencodeClient, closeServer: () => void, onProgress: LiveProbeProgress = () => undefined) {
     this.#adapter = new OpenCodeAdapter({ client, timeoutMs: LIVE_PROBE_TIMEOUT_MS });
     this.#closeServer = closeServer;
+    this.#onProgress = onProgress;
   }
 
   async run(environment: LiveProbeEnvironment): Promise<LiveProbeEvidence> {
@@ -447,9 +489,12 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
     let cancellationResult = false;
     let isolationResponse = "";
     try {
+      this.#onProgress("session.initial.create.start");
       const first = await this.#adapter.createSession({ directory: environment.repository });
       this.#sessionIDs.push(first.id);
+      this.#onProgress("session.initial.create.complete");
 
+      this.#onProgress("session.initial.prompt.start");
       const stream = await this.#adapter.events(first.id);
       const firstExecutionEvent = (async () => {
         try {
@@ -481,10 +526,16 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
       );
       finalResponse = correlatedResponse.text;
       responseInputID = correlatedResponse.inputID;
+      this.#onProgress("session.initial.prompt.complete");
 
+      this.#onProgress("permission.start");
       permissionRequestID = await this.#exercisePermission(first.id, environment.outside);
+      this.#onProgress("permission.complete");
+      this.#onProgress("cancellation.start");
       cancellationResult = await this.#exerciseCancellation(first.id, environment.repository);
+      this.#onProgress("cancellation.complete");
 
+      this.#onProgress("isolation.start");
       const isolationTransition = await createIsolationSessionAfterDeletion(
         this.#adapter,
         first.id,
@@ -502,7 +553,9 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
         await this.#adapter.messages(second.id),
         isolationInput.id,
       ).text;
+      this.#onProgress("isolation.complete");
     } finally {
+      this.#onProgress("sessions.cleanup.start");
       for (const sessionID of [...this.#sessionIDs].reverse()) {
         if (this.#deletedSessionIDs.includes(sessionID)) continue;
         try {
@@ -512,6 +565,7 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
           // Missing deletion is reflected in the capability report.
         }
       }
+      this.#onProgress("sessions.cleanup.complete");
     }
 
     const helloPath = join(environment.repository, "hello.txt");
@@ -789,6 +843,7 @@ export async function createAuthenticatedOpenCodeDriver(
   launch: (options: AuthenticatedServerOptions) => Promise<AuthenticatedServerLaunch> =
     launchAuthenticatedOpenCodeServer,
   clientFactory: typeof createOpencodeClient = createOpencodeClient,
+  options: LiveProbeDriverOptions = {},
 ): Promise<LiveProbeDriver> {
   const password = randomBytes(32).toString("base64url");
   const hosted = await launch({ username: SERVER_USERNAME, password });
@@ -797,7 +852,7 @@ export async function createAuthenticatedOpenCodeDriver(
       baseUrl: hosted.url,
       headers: { Authorization: basicAuthorizationHeader(SERVER_USERNAME, password) },
     });
-    return new OpenCodeLiveDriver(client, hosted.close);
+    return new OpenCodeLiveDriver(client, hosted.close, options.onProgress);
   } catch (error) {
     hosted.close();
     throw error;
@@ -806,6 +861,10 @@ export async function createAuthenticatedOpenCodeDriver(
 
 export const defaultLiveProbeDependencies: LiveProbeDependencies = {
   createEnvironment: createDisposableEnvironment,
-  createDriver: createAuthenticatedOpenCodeDriver,
+  createDriver: (options) => createAuthenticatedOpenCodeDriver(
+    launchAuthenticatedOpenCodeServer,
+    createOpencodeClient,
+    options,
+  ),
   removeEnvironment: removeDisposableEnvironment,
 };
