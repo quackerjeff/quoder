@@ -63,6 +63,8 @@ createOpencodeClient(config?: Config & {
 
 Sources: local `dist/v2/index.d.ts`, `client.d.ts`, and `server.d.ts`. `ServerOptions` accepts `hostname`, `port`, `signal`, `timeout`, and `config`. The official server documentation confirms an OpenAPI server and SSE transport.
 
+The pinned SDK helper does not expose a child-environment or authentication option. OpenCode `1.18.33` protects `serve` with HTTP Basic Auth when `OPENCODE_SERVER_PASSWORD` is set; `OPENCODE_SERVER_USERNAME` overrides the default username. An authenticated embedded launch must therefore start the project-local CLI with those variables only in the child environment and construct the SDK client with the matching `Authorization: Basic ...` header. Credentials must not be placed in command arguments, persisted configuration, or diagnostics. Sources: official OpenCode server authentication documentation and local inspection of `@opencode-ai/sdk@1.18.33` `dist/v2/server.js`, `dist/v2/client.js`, and `dist/v2/gen/client/types.gen.d.ts`.
+
 Local server command:
 
 ```bash

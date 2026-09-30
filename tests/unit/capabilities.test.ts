@@ -50,7 +50,8 @@ describe("local model invocation", () => {
 describe("probe event classification", () => {
   it("recognizes structured execution, permission, fixture-start, idle, and completion events", () => {
     expect(classifyEvent(event(1, "tool.started"))).toMatchObject({ structuredExecution: true });
-    expect(classifyEvent(event(2, "permission.asked"))).toMatchObject({ permissionRequest: true });
+    expect(classifyEvent(event(2, "permission.v2.asked"))).toMatchObject({ permissionRequest: true });
+    expect(classifyEvent(event(3, "permission.asked"))).toMatchObject({ permissionRequest: false });
     expect(classifyEvent(event(3, "fixture.started"))).toMatchObject({ fixtureStarted: true });
     expect(classifyEvent(event(4, "session.idle"))).toMatchObject({ terminalIdle: true });
     expect(classifyEvent(event(5, "fixture.completed"))).toMatchObject({ normalCompletion: true });
@@ -119,7 +120,7 @@ describe("session isolation", () => {
 
 describe("permission evidence", () => {
   it("requires a structured OpenCode permission-request event", () => {
-    expect(hasRealPermissionRequest([event(1, "permission.asked", { requestID: "permission-1" })])).toBe(
+    expect(hasRealPermissionRequest([event(1, "permission.v2.asked", { id: "permission-1" })])).toBe(
       true,
     );
     expect(hasRealPermissionRequest([event(1, "diagnostic.text", { text: "permission.asked" })])).toBe(

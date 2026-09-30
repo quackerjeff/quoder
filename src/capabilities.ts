@@ -62,7 +62,7 @@ export type IsolationClassification =
 export function classifyEvent(event: ProbeEvent): EventClassification {
   return {
     structuredExecution: event.type === "tool.started",
-    permissionRequest: event.type === "permission.asked",
+    permissionRequest: event.type === "permission.v2.asked",
     fixtureStarted: event.type === "fixture.started",
     terminalIdle: event.type === "session.idle",
     normalCompletion: event.type === "fixture.completed",
@@ -112,8 +112,8 @@ export function hasRealPermissionRequest(events: readonly ProbeEvent[]): boolean
   return events.some(
     (event) =>
       classifyEvent(event).permissionRequest &&
-      typeof event.properties?.requestID === "string" &&
-      event.properties.requestID.length > 0,
+      typeof event.properties?.id === "string" &&
+      event.properties.id.length > 0,
   );
 }
 
