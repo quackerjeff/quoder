@@ -18,9 +18,6 @@ import {
   LIVE_PROBE_TIMEOUT_MS,
   LIVE_MODEL,
   OpenCodeLiveDriver,
-  SERVER_TERMINATION_UNCONFIRMED_MESSAGE,
-  authenticatedServerProcessConfig,
-  basicAuthorizationHeader,
   cancellationFromObservedEvents,
   correlatePermissionEvidence,
   createAuthenticatedOpenCodeDriver,
@@ -33,19 +30,24 @@ import {
   cancellationPrompt,
   initialPrompt,
   sessionStreamEvent,
-  launchAuthenticatedOpenCodeServer,
   readConfinedRegularFile,
   runLiveProbe,
   settlePairedOperations,
-  terminateOwnedChild,
   terminateValidatedFixture,
-  verifyServerAuthentication,
-  type AuthenticatedServerLauncherDependencies,
   type LiveProbeDependencies,
   type LiveProbeDriver,
   type LiveProbeEvidence,
   type LiveProbeEnvironment,
 } from "../../src/live-probe.js";
+import {
+  SERVER_TERMINATION_UNCONFIRMED_MESSAGE,
+  authenticatedServerProcessConfig,
+  basicAuthorizationHeader,
+  launchAuthenticatedOpenCodeServer,
+  terminateOwnedChild,
+  verifyServerAuthentication,
+  type AuthenticatedServerLauncherDependencies,
+} from "../../src/opencode-server.js";
 
 type ClientMethod = (...args: never[]) => unknown;
 type Method<T extends ClientMethod> = T;

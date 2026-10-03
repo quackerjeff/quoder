@@ -1,12 +1,20 @@
 {
+  "name": "quoder",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "quoder": "dist/cli.js"
+  },
   "type": "module",
   "scripts": {
+    "build": "tsc --project tsconfig.build.json",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build:live": "tsc --project tsconfig.live.json",
     "verify:environment": "npm run build:live && node .live-build/scripts/verify-environment.js",
     "verify:live": "npm run build:live && node .live-build/scripts/verify-live.js",
-    "verify:live:smoke": "npm run build:live && node .live-build/scripts/smoke-live.js"
+    "verify:live:smoke": "npm run build:live && node .live-build/scripts/smoke-live.js",
+    "verify:harness": "npm run build && npm run build:live && node .live-build/scripts/verify-harness.js"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.33",

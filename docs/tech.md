@@ -159,6 +159,16 @@ The 1.18.33 `build` agent allows the model's `question` tool. A call raises `que
 - `OPENCODE_CONFIG_CONTENT={"permission":{"question":"deny"}}` in the server process does **not** prevent the block (verified live 2026-10-03).
 - `client.v2.session.question.reject({ sessionID, requestID })` returns 204, followed by `question.v2.rejected`. The question tool call fails and the turn ends with the session idle. The live probe's run-long event monitor rejects questions raised by its own sessions only. Rejecting a question is not a permission decision; `external_directory` still asks.
 
+### Rejected Requests And Interrupted Turns (verified 2026-10-03, `glm-4.7-flash:latest`)
+
+| Situation | Events | Final assistant message |
+| --- | --- | --- |
+| `permission.v2.asked` replied `reject` (here `external_directory`; event keys `{id, sessionID, action, resources, save, source}`) | `tool.called` → `tool.failed`; idle about 0.2 s later; no `step.ended` | Incomplete: no `finish`, no `time.completed`, a `tool:error` part |
+| `question.v2.asked` (`{id, sessionID, questions: [{question, header, options: [{label, description}]}], tool}`) rejected | `tool.called(question)` → `tool.failed`; idle | Incomplete, with a `tool:error` part |
+| `interrupt` during plain text generation | `step.failed`; idle within about 11 ms | `finish: "error"`, `time.completed` set, `error: { message: "Provider turn interrupted" }` |
+
+In every case the session becomes idle with an assistant message in the turn, but there is no successful final response. A client must report why the turn ended instead of treating the empty result as an answer.
+
 ### Permission Response
 
 ```ts
@@ -239,6 +249,29 @@ For `1.18.33`, the adapter may use this compatibility bridge, but it must keep d
 ### Session Creation Payload Caveat
 
 Although `Session3.create(parameters?)` is generated with an optional parameter, live calls with no argument or `{}` produced `InvalidRequestError: Expected object, got undefined` because the empty body was omitted. Supplying `{ agent: "build" }` succeeded. Group 2 must always send a non-empty creation payload and cover this 1.18.33 behavior in tests.
+
+## Quoder Harness (Milestone 1)
+
+Implemented in spec `2026-10-03-milestone-1-minimal-harness`; QA recorded `Milestone 1 Exit Criterion: MET` on 2026-10-03.
+
+**Shared OpenCode modules (NFR-1).**
+- `src/package-root.ts` resolves Quoder's own package root from the module's location (the nearest `package.json` named `quoder`), so the pinned `node_modules/.bin/opencode` and manifests never depend on `process.cwd()`.
+- `src/opencode-server.ts` is the authenticated launcher. It takes an optional `cwd` and exposes an optional `exited` promise.
+- `src/event-monitor.ts` is the run-long global-event monitor, with an own-session predicate, question, permission and end callbacks, and `confirmed`. The Milestone 0 probe and the preflight use these same modules.
+
+**Harness modules.**
+- `src/harness/project.ts`: the Git root, or the launch directory.
+- `src/harness/session-runner.ts`: one prompt, one session.
+- `src/harness/repl.ts`: the lifecycle.
+- `src/harness/format.ts` and `src/harness/terminal-text.ts`: output and sanitizing.
+- `src/cli.ts`: the `quoder` entry point. `npm run build` builds it to `dist/cli.js`.
+
+**Lifecycle contracts.**
+- **Server.** One server is launched per harness session, with the project root as its working directory, and is confirmed through `server.connected` before use. An unconfirmed monitor fails the start. A server is replaced before the next prompt after an unexpected exit, monitor loss, or a failed reject reply.
+- **Prompt.** Create a session bound to the model and project root, submit, and wait with **no fixed execution timeout**. Every API call is bounded at 30 s, and an idle session with no assistant message fails after 30 s. Classify the turn as answered, permission rejected, question rejected, cancelled, or failed. Interrupt and settle whenever the turn did not end idle, then delete and verify (404). Session IDs whose deletion is unverified are retried on the next server and at shutdown.
+- **Input.** One sequential loop consumes lines in order. EOF, `/exit`, and signals reach one memoized shutdown. An exit request during startup aborts the in-progress launch only; a server that is already up is never killed before session cleanup.
+- **Policy.** Milestone 1 never grants a permission: every `permission.v2.asked` for a Quoder session is replied `reject` and reported, and questions are rejected and shown. Requests raised by subagent (`task`) child sessions are not intercepted. Nothing is granted, but the turn may wait until Ctrl-C (recorded for Milestone 3).
+- **Trace.** `QUODER_TRACE_FILE` appends JSON lines containing fixed event names, session IDs, verified flags and outcome kinds only, never prompt or model text. `npm run verify:harness` relies on it.
 
 ## Dependency Choices
 

@@ -10,13 +10,16 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import { OpenCodeAdapter, finalAssistantResponseText } from "./opencode-adapter.js";
 import {
   LIVE_MODEL,
-  basicAuthorizationHeader,
   createDisposableEnvironment,
-  launchAuthenticatedOpenCodeServer,
   removeDisposableEnvironment,
-  type AuthenticatedServerLaunch,
   type LiveProbeEnvironment,
 } from "./live-probe.js";
+import {
+  basicAuthorizationHeader,
+  launchAuthenticatedOpenCodeServer,
+  type AuthenticatedServerLaunch,
+} from "./opencode-server.js";
+import { opencodeExecutablePath, packagePath } from "./package-root.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -430,13 +433,13 @@ export function createDefaultEnvironmentPreflightDependencies(): EnvironmentPref
 
   return {
     async verifyPinnedDependencies() {
-      const manifest = asRecord(JSON.parse(await readFile(resolve("package.json"), "utf8")));
+      const manifest = asRecord(JSON.parse(await readFile(packagePath("package.json"), "utf8")));
       const dependencies = asRecord(manifest.dependencies);
       const sdkManifest = asRecord(JSON.parse(
-        await readFile(resolve("node_modules", "@opencode-ai", "sdk", "package.json"), "utf8"),
+        await readFile(packagePath("node_modules", "@opencode-ai", "sdk", "package.json"), "utf8"),
       ));
       const cliManifest = asRecord(JSON.parse(
-        await readFile(resolve("node_modules", "opencode-ai", "package.json"), "utf8"),
+        await readFile(packagePath("node_modules", "opencode-ai", "package.json"), "utf8"),
       ));
       if (
         dependencies["@opencode-ai/sdk"] !== "1.18.33" ||
@@ -501,7 +504,7 @@ export function createDefaultEnvironmentPreflightDependencies(): EnvironmentPref
     },
 
     async discoverOpenCodeModel(signal) {
-      const executable = resolve("node_modules", ".bin", "opencode");
+      const executable = opencodeExecutablePath();
       const result = await execFileAsync(executable, ["models", "ollama", "--pure"], {
         signal,
         maxBuffer: 1024 * 1024,

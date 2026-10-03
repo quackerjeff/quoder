@@ -8,9 +8,9 @@ Keep this file concise, factual, and current.
 
 - Repository name: `quoder`
 - Service or application name: Quoder (working product name; PRD title: OpenCode Stateless Harness)
-- Primary language(s): TypeScript (proposed by the PRD's feasibility milestone)
+- Primary language(s): TypeScript (Node 24, ESM)
 - Primary framework(s): OpenCode SDK/API (`@opencode-ai/sdk@1.18.33`, Core V2) with project-local `opencode-ai@1.18.33`, pinned exactly
-- Deployable unit: Local command-line/TUI application
+- Deployable unit: the local `quoder` command-line harness (`dist/cli.js`, installed with `npm link`)
 
 ## Business Capability
 
@@ -77,7 +77,7 @@ Rules:
 ## Data and State
 
 Persistent state owned here:
-- Local harness state and execution-history files; exact location and schema remain open
+- None yet. Milestone 1 keeps no persistent harness state; harness context and execution history arrive in Milestones 5–6
 
 Important invariants:
 - Each submitted prompt uses a new OpenCode session.

@@ -1,16 +1,89 @@
 # Quoder
 
-Quoder is intended to provide a persistent developer-facing shell/TUI while each
-prompt runs in a fresh, disposable OpenCode session. The repository currently
-contains the Milestone 0 feasibility probe, not the production CLI/TUI.
+Quoder provides a persistent developer-facing shell while each prompt runs in a
+fresh, disposable OpenCode session. Milestone 1, the minimal `quoder` harness,
+is complete. The Milestone 0 feasibility probe remains as regression evidence.
+
+## Using Quoder (Milestone 1)
+
+Install the pinned dependencies, build, and put `quoder` on your `PATH`:
+
+```bash
+npm ci
+npm run build
+npm link
+```
+
+Run it from any project directory:
+
+```bash
+cd ~/Development/QuackTrack
+quoder
+```
+
+```text
+Quoder — QuackTrack (/Users/you/Development/QuackTrack)
+Model: ollama/glm-4.7-flash:latest
+Starting OpenCode server…
+Ready. Type /help for help.
+
+QuackTrack > Reply with a one-line summary of this repository.
+Starting fresh OpenCode session…
+…
+Completed in 3.1s.
+```
+
+How it behaves:
+
+- **Project.** The project is the Git repository root, or the launch directory
+  outside a repository. The prompt shows the project's name.
+- **One server, a fresh session per prompt.** Quoder starts one authenticated,
+  project-local OpenCode server and keeps it for the whole harness session. Each
+  prompt runs in a fresh session bound to the model. Afterwards the session is
+  deleted and its deletion verified.
+- **Model.** The default is `ollama/glm-4.7-flash:latest`. Override it with
+  `quoder --model provider/model`.
+- **Commands.** `/help`, and `/exit` or Ctrl-D to leave. Ctrl-C cancels a
+  running prompt (interrupt, settle, delete) and returns to the prompt; at an
+  idle prompt it leaves Quoder. SIGTERM and SIGHUP cancel, clean up, and exit
+  with 143 and 129.
+- **Output.** Model output is cleaned of terminal control sequences before it
+  is displayed.
+
+Known Milestone 1 limitations:
+
+- **No permissions are granted.** Any OpenCode permission request is rejected
+  and reported, and the model's interactive questions are rejected and shown so
+  you can answer in your next prompt. Interactive permission handling arrives
+  in Milestone 3.
+- **No streaming yet.** Only the final response is shown. Streaming and live
+  activity display arrive in Milestone 2.
+- **Server password.** Model-run shell commands can read the OpenCode server's
+  password. This is deferred to Milestone 3, before permission decisions are
+  forwarded. Other hardening items are listed in
+  `.cmd/specs/2026-10-03-milestone-1-minimal-harness/decisions.md`.
+- **Model nondeterminism.** The model does not always follow instructions
+  exactly.
+
+Live acceptance check (contacts the configured model):
+
+```bash
+npm run verify:harness
+```
+
+It runs the built CLI from a disposable project with two prompts. It verifies
+the exit criterion: one server, a distinct and verified-deleted session per
+prompt, a clean exit, and no residual server. QA recorded `Milestone 1 Exit
+Criterion: MET` on 2026-10-03.
 
 ## Milestone 0 status
 
 **Capability verdict: PASS. Milestone 0 is passed (authoritative
 `npm run verify:live`, 2026-10-03: all nine predicates PASS; see "Milestone 0
-Live Result — 2026-10-03 authoritative PASS" in `docs/tech.md`).** Milestone 1
-may begin. First, keep the OpenCode server's credentials out of model-run tool
-environments before Quoder forwards real permission decisions.
+Live Result — 2026-10-03 authoritative PASS" in `docs/tech.md`).** Milestone 1 is
+complete (see above). Before Quoder forwards real permission decisions
+(Milestone 3), keep the OpenCode server's credentials out of model-run tool
+environments.
 
 Earlier authoritative run, 2026-10-03, 8 of 9 PASS: Permission handling failed
 because of the permission-event subscription race, which has since been fixed.
