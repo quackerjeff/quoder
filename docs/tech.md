@@ -121,6 +121,8 @@ Wire contract: `GET /api/session/{sessionID}/event`. It replays durable events a
 
 Source: `Session3.events` and `V2SessionEventsData` in the local declarations. The broader generated event union includes permission, session, message, and tool lifecycle events, but implementation must narrow against the actual V2 per-session response union rather than assume all global/legacy events appear there.
 
+**Runtime item shape (verified live 2026-10-02/03).** The generated type declares each item as `{ id, event, data: string }`, but at runtime the 1.18.33 SDK yields parsed events `{ id, type, durable, data }`, with `data` as the payload object. Treat the parsed form as authoritative (`sessionStreamEvent`), and accept the declared string form only when it parses to an event. A consumer that `JSON.parse`s `data` never matches; this caused the 2026-10-02 authoritative run's first 120 s stall.
+
 ### Permission Request
 
 Core V2 uses ordered `permissions` rules with `action`, `resource`, and `effect`. Official V2 documentation states that an unmatched permission defaults to `ask`; the base policy also asks for external-directory and `.env` access.
@@ -140,6 +142,13 @@ client.v2.session.permission.create({
 Source: `Permission2.create` and route `POST /api/session/{sessionID}/permission` in the local declarations, plus the official V2 permissions defaults. The path must be purpose-created under the spike's temporary root. The probe must observe the real OpenCode pending request/event; a test double is not live evidence.
 
 Verified live against 1.18.33 on 2026-10-02, with no model call. `create` returned HTTP 200 with `{ id, effect: "ask" }` in about 0.8 s and **does not block** until a reply arrives. The global event stream (`client.v2.event.subscribe`) delivered `permission.v2.asked` with the same `id`, `action`, and `resources`. Permission events carry **no durable sequence** and cannot be replayed, and the SDK's SSE subscription connects on its first read. A consumer must therefore be reading before the event is published. The live probe begins reading immediately after dispatching `create`. The small remaining race was explicitly accepted (see the reassessment spec's `decisions.md`).
+
+### Interactive Questions
+
+The 1.18.33 `build` agent allows the model's `question` tool. A call raises `question.v2.asked` on the global stream (it is not a permission request) and stays `running` until answered, so an unattended session never goes idle. This caused the 2026-10-02 run's second 120 s stall.
+
+- `OPENCODE_CONFIG_CONTENT={"permission":{"question":"deny"}}` in the server process does **not** prevent the block (verified live 2026-10-03).
+- `client.v2.session.question.reject({ sessionID, requestID })` returns 204, followed by `question.v2.rejected`. The question tool call fails and the turn ends with the session idle. The live probe subscribes once to the global stream and rejects questions raised by its own sessions only. Rejecting a question is not a permission decision; `external_directory` still asks.
 
 ### Permission Response
 
@@ -336,6 +345,94 @@ feasibility attempt, restore and preflight the required Ollama/model service or
 reassess the architecture and its environment dependency in a separate spec.
 Passing unit tests and `npm run verify:live:smoke` do not substitute for this
 live evidence.
+
+## Milestone 0 Live Result — 2026-10-02 run
+
+After `Future Capability QA: GO`, the user authorized a fresh preflight and the
+authoritative run.
+
+- `npm run verify:environment`: all eight rows PASS, exit 0, about 5 s.
+- `npm run verify:live`: exit 1 after 241 s.
+  - All nine predicates FAIL. **Capability Verdict: FAIL.**
+  - Milestone 0 is not passed, and Milestone 1 remains blocked.
+  - The journal shows `session.initial.prompt.start` at 17:18:58.758Z and then
+    nothing until `sessions.cleanup.start` at 17:22:58.766Z. That is exactly
+    two 120 s operation timeouts in the initial-prompt stage. The run then
+    raised an error, so every predicate failed conservatively.
+  - Cleanup, driver close, and environment removal completed. No OpenCode
+    server, fixture, or temporary repository remained.
+
+Diagnosis so far:
+
+- **First 120 s (identified).** The live probe parses each session-stream item
+  with `JSON.parse(item.data)`, as the generated SDK type says
+  (`{ id, event, data: string }`). At runtime the 1.18.33 SDK yields
+  already-parsed event objects instead: `item.type`, `item.durable.seq`, and
+  `item.data` as the payload object (observed in the 2026-10-02 completion
+  diagnostic). The structured-event observation therefore never matched and
+  ran until the 120 s stream timeout. The driver test's fake stream followed
+  the generated type, so it did not catch this.
+- **Second 120 s (identified by sampling).** Four bounded scratch diagnostics
+  of the exact first prompt were run against the same model, outside the
+  repository and without `verify:live`. In one of the four, the model called
+  OpenCode's interactive **`question` tool**. The 1.18.33 `build` agent allows
+  this tool, it raises no permission event, and it stays `running` until
+  someone answers. The session therefore never becomes idle, and
+  `waitUntilIdle` exhausts its 120 s, which matches the live run.
+- **Model instruction-following (new risk).** In none of the four samples did
+  the model create `hello.txt`. In three, it answered in plain text that was
+  not the `TOKEN_STORED` sentinel (134–230 characters) and finished in about
+  2 s. The fourth is the `question` case above. In the earlier cancellation
+  diagnostic the same model did call `glob` and `bash`, so tool calling works,
+  but this prompt does not reliably cause a file write. Local model invocation
+  and File modification are therefore at risk even after the probe defects are
+  fixed.
+- The 1.18.33 default `build` policy, inspected in the bundle, is
+  `"*": "allow"`, with exceptions: `external_directory` asks, `.env` reads ask,
+  `doom_loop` asks, and plan transitions are denied. `question` is allowed for
+  `build`. Writing a file inside the repository does not ask.
+
+### Probe Prompts And Stage Isolation (spec 2026-10-03)
+
+The scenario prompts were selected by sampling against `ollama/qwen3-coder:30b`, with question rejection active:
+
+| Stage | Prompt | Samples |
+| --- | --- | --- |
+| Initial | Use the write tool to create `hello.txt` with exact content, remember the nonce, ask no questions, then reply exactly `TOKEN_STORED` | 5/5 |
+| Cancellation | Run `` `node fixture.mjs <token>` `` and wait for it to finish; do not run it in the background; ask no questions | 9/10 |
+| Isolation | Reply exactly `NO_PRIOR_SESSION` unless a prior nonce is known (then only the nonce); no tools; no questions | 5/5 |
+
+The residual cancellation failure is the model emitting its tool call as plain text (`<function=bash> … </tool_call>`), so no command runs. A more directive "Use the bash tool to run exactly…" wording made this happen 5/5 times. The failure is conservative: Cancellation FAIL, finitely bounded.
+
+QA (2026-10-03) independently re-sampled the prompts as implemented, importing them from the compiled module:
+
+| Stage | QA samples |
+| --- | --- |
+| Initial | 9/11 |
+| Cancellation | 13/15 |
+| Isolation | 6/6 valid |
+
+- The plain-text tool-call failure also appeared once in the initial stage.
+- One cancellation turn ended with no tool call and no text.
+- One initial sample called only `todowrite`.
+- A short upstream outage returned HTTP 502 on inference while `/v1/models` still answered. The affected isolation samples were excluded. This is why the full preflight, which checks inference, must run immediately before an authoritative run.
+- The estimated chance that all three model-dependent stages cooperate in a single run is about 0.7.
+
+The live driver now runs each stage after session creation (initial prompt, permission, cancellation, isolation) in isolation:
+
+- **Failures are journaled with a credential-safe cause.** A failed stage is journaled as `<stage>.failed.<adapter-operation>[.timeout]`, taken from the first adapter error found directly or through the `cause`/aggregated reasons of a paired-operation failure (for example `session.initial.prompt.failed.submit-prompt`). When no adapter error is involved (for example a permission-correlation mismatch), it is `<stage>.failed.error`. Error text is never journaled.
+- **Not-passed outcomes are journaled too.** A stage that completes without its evidence journals a distinct marker (`session.initial.prompt.not-completed`, `cancellation.not-passed`).
+- **The session is settled after every stage**, whether or not the stage threw: if it is still active, it is interrupted and waited to idle. Settling an idle session costs one status read.
+- **Later independent stages still run**, so a single run reports evidence for every predicate.
+- **Isolation needs the nonce.** It is skipped (`isolation.skipped`) when the first session never received the nonce.
+- **A dropped question guard is visible.** If the guard's global stream ends before the run stops it, `question.guard.ended` is journaled; later questions would then block their stage until its timeout.
+
+No failure becomes a PASS:
+
+- Project directory evidence now requires the model-produced `hello.txt`, read through the confined-path check, so it no longer passes on constant paths.
+- Session deletion can PASS with a single session created and deleted (isolation skipped), because every created session is still verified by the delete-plus-404 check (PRD requirement 11). Fresh session creation and Session isolation then FAIL.
+
+Residual risk: a run with several stalled stages can sum per-operation 120 s bounds past the 600 s whole-run deadline. The deadline still closes the server, cleans up, and fails all nine predicates conservatively, but per-predicate evidence for that run is lost.
 
 ## Remaining Live Verification Items
 

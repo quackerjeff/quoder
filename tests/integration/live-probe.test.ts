@@ -1,3 +1,4 @@
+import { OpenCodeAdapterError } from "../../src/opencode-adapter.js";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -25,7 +26,13 @@ import {
   createAuthenticatedOpenCodeDriver,
   createIsolationSessionAfterDeletion,
   evaluateLiveEvidence,
+  findAdapterError,
   fixtureToolCallID,
+  INITIAL_PROMPT_SENTINEL,
+  ISOLATION_PROMPT,
+  cancellationPrompt,
+  initialPrompt,
+  sessionStreamEvent,
   launchAuthenticatedOpenCodeServer,
   readConfinedRegularFile,
   runLiveProbe,
@@ -44,6 +51,16 @@ type ClientMethod = (...args: never[]) => unknown;
 type Method<T extends ClientMethod> = T;
 
 const response = (status = 200): Response => new Response(null, { status });
+
+async function* questionGuardEvents(
+  signal: AbortSignal,
+  events: readonly V2Event[] = [],
+): AsyncGenerator<V2Event, void, unknown> {
+  for (const event of events) yield event;
+  if (!signal.aborted) {
+    await new Promise<void>((resolveAbort) => signal.addEventListener("abort", () => resolveAbort(), { once: true }));
+  }
+}
 
 const result = <T>(data: T, status = 200) => ({
   data,
@@ -538,10 +555,12 @@ describe("permission evidence correlation", () => {
     } satisfies V2Event;
 
     async function* initialEvents() {
+      // The 1.18.33 SDK yields parsed events at runtime, not the generated `data: string` form.
       yield {
         id: "durable-1",
-        event: "session.next.step.started",
-        data: JSON.stringify({ type: "session.next.step.started", durable: { seq: 1 } }),
+        type: "session.next.step.started",
+        durable: { seq: 1 },
+        data: { sessionID: "session-1" },
       };
     }
     async function* permissionEvents() {
@@ -556,6 +575,7 @@ describe("permission evidence correlation", () => {
 
     const subscribe = vi
       .fn()
+      .mockImplementationOnce(async (options: { signal: AbortSignal }) => ({ stream: questionGuardEvents(options.signal) }))
       .mockResolvedValueOnce({ stream: permissionEvents() })
       .mockResolvedValueOnce({ stream: noCancellationEvents() });
     const transcripts: Record<string, unknown[]> = {
@@ -1144,6 +1164,18 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     readonly unrelatedFailureFirst?: boolean;
     readonly completionMarker?: boolean;
     readonly interruptFails?: boolean;
+    /** Question requests the model raises once the initial prompt is submitted. */
+    readonly questions?: readonly { readonly sessionID: string; readonly id: string }[];
+    readonly initialPromptFails?: boolean;
+    /** The cancellation turn keeps the session running until something interrupts it. */
+    readonly cancellationTurnStaysActive?: boolean;
+    /** The fake model writes the exact hello.txt during the initial prompt. */
+    readonly modelWritesHello?: boolean;
+    /** The first active-session poll never answers, so the initial idle wait times out. */
+    readonly firstActivePollHangs?: boolean;
+    /** The question guard's stream ends on its own instead of waiting for the driver to stop it. */
+    readonly guardStreamEndsEarly?: boolean;
+    readonly operationTimeoutMs?: number;
   }
 
   const runScenario = async ({
@@ -1152,6 +1184,13 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     unrelatedFailureFirst = false,
     completionMarker = false,
     interruptFails = false,
+    questions = [],
+    initialPromptFails = false,
+    cancellationTurnStaysActive = false,
+    modelWritesHello = false,
+    firstActivePollHangs = false,
+    guardStreamEndsEarly = false,
+    operationTimeoutMs,
   }: Scenario = {}) => {
     const root = await mkdtemp(join(tmpdir(), "quoder-cancellation-driver-test-"));
     const repository = join(root, "repository");
@@ -1169,19 +1208,34 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
       releaseInterrupt = resolveInterrupt;
     });
 
+    let sessionRunning = false;
+    let createdSessions = 0;
+    let releaseQuestions: () => void = () => undefined;
+    const questionsReleased = new Promise<void>((resolveRelease) => {
+      releaseQuestions = resolveRelease;
+    });
+    const questionReject = vi.fn().mockResolvedValue(result(undefined, 204));
     const prompt = vi.fn().mockImplementation(async (parameters: { prompt: { text: string } }) => {
       const token = /fixture\.mjs ([0-9a-f-]{36})/u.exec(parameters.prompt.text)?.[1];
+      if (parameters.prompt.text.includes("hello.txt")) {
+        releaseQuestions();
+        if (initialPromptFails) return failedResult({ _tag: "UnknownError", message: "prompt rejected" }, 500);
+        if (modelWritesHello) await writeFile(join(repository, "hello.txt"), "Hello from OpenCode", "utf8");
+      }
+      if (token !== undefined && cancellationTurnStaysActive) sessionRunning = true;
       if (token === undefined) {
-        return result({ data: { id: parameters.prompt.text.startsWith("Remember this nonce") ? "input-1" : "input-2" } });
+        return result({ data: { id: parameters.prompt.text.includes("hello.txt") ? "input-1" : "input-2" } });
       }
       fixtureToken = token;
       return result({ data: { id: "cancellation-input" } });
     });
     async function* initialEvents() {
+      // The 1.18.33 SDK yields parsed events at runtime, not the generated `data: string` form.
       yield {
         id: "durable-1",
-        event: "session.next.step.started",
-        data: JSON.stringify({ type: "session.next.step.started", durable: { seq: 1 } }),
+        type: "session.next.step.started",
+        durable: { seq: 1 },
+        data: { sessionID: "session-1" },
       };
     }
     async function* permissionEvents() {
@@ -1258,27 +1312,36 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     const client = {
       v2: {
         session: {
-          create: vi
-            .fn()
-            .mockResolvedValueOnce(result({ data: { id: "session-1" } }))
-            .mockResolvedValueOnce(result({ data: { id: "session-2" } })),
+          create: vi.fn().mockImplementation(async () => {
+            const id = `session-${++createdSessions}`;
+            order.push(`create:${id}`);
+            return result({ data: { id } });
+          }),
           prompt,
           events: vi.fn().mockResolvedValue({ stream: initialEvents() }),
           permission: {
             create: vi.fn().mockResolvedValue(result({ data: { id: "permission-1", effect: "ask" } })),
             reply: vi.fn().mockResolvedValue(result(undefined, 204)),
           },
+          question: { reject: questionReject },
           interrupt: vi.fn().mockImplementation(async () => {
             order.push("interrupt");
+            sessionRunning = false;
             pidFileExistedAtInterrupt = existsSync(pidPath);
             releaseInterrupt();
             return interruptFails
               ? failedResult({ _tag: "UnknownError", message: "interrupt failed" }, 500)
               : result(undefined, 204);
           }),
-          active: vi.fn().mockImplementation(async () => {
+          active: vi.fn().mockImplementation(async (options: { signal: AbortSignal }) => {
             order.push("active");
-            return result({ data: {} });
+            if (firstActivePollHangs && order.filter((entry) => entry === "active").length === 1) {
+              return new Promise((_resolve, reject) => {
+                options.signal.addEventListener("abort", () =>
+                  reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+              });
+            }
+            return result({ data: sessionRunning ? { "session-1": { type: "running" } } : {} });
           }),
           messages: vi.fn().mockImplementation(async (parameters: { sessionID: string }) =>
             result({ data: transcripts[parameters.sessionID] ?? [], cursor: {} }),
@@ -1288,6 +1351,17 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
         event: {
           subscribe: vi
             .fn()
+            .mockImplementationOnce(async (options: { signal: AbortSignal }) => ({
+              stream: (async function* () {
+                if (guardStreamEndsEarly) return;
+                await questionsReleased;
+                yield* questionGuardEvents(
+                  options.signal,
+                  questions.map(({ sessionID, id }) =>
+                    ({ id: `question-event-${id}`, type: "question.v2.asked", data: { id, sessionID } }) as unknown as V2Event),
+                );
+              })(),
+            }))
             .mockResolvedValueOnce({ stream: permissionEvents() })
             .mockResolvedValueOnce({ stream: cancellationEvents() }),
         },
@@ -1295,13 +1369,18 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
       session: { delete: vi.fn().mockResolvedValue(result(true)) },
     } as unknown as OpencodeClient;
 
-    const driver = new OpenCodeLiveDriver(client, vi.fn());
+    const driver = new OpenCodeLiveDriver(
+      client,
+      vi.fn(),
+      (stage) => order.push(`progress:${stage}`),
+      operationTimeoutMs === undefined ? {} : { operationTimeoutMs },
+    );
     try {
       const outcome = await driver.run({ root, repository, outside }).then(
         (evidence) => ({ evidence, error: undefined }),
         (error: Error) => ({ evidence: undefined, error }),
       );
-      return { ...outcome, order, cancellationStreamClosed, pidFileExistedAtInterrupt };
+      return { ...outcome, order, cancellationStreamClosed, pidFileExistedAtInterrupt, questionReject, repository };
     } finally {
       await driver.close();
       await rm(root, { recursive: true, force: true });
@@ -1313,6 +1392,7 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
 
     expect(evidence?.cancellationPassed).toBe(true);
     expect(evidence?.finalResponse).toBe("TOKEN_STORED");
+    expect(evidence?.structuredEventObserved).toBe(true);
     const interruptAt = order.indexOf("interrupt");
     const terminalAt = order.indexOf("emit:failed:call-fixture");
     expect(pidFileExistedAtInterrupt).toBe(true);
@@ -1354,11 +1434,164 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     expect(cancellationStreamClosed).toBe(true);
   });
 
-  it("propagates an interrupt failure after closing the stream", async () => {
+  it("rejects questions raised by its own sessions and ignores other sessions' questions", async () => {
+    const { evidence, questionReject } = await runScenario({
+      questions: [
+        { sessionID: "session-1", id: "question-1" },
+        { sessionID: "session-unrelated", id: "question-2" },
+      ],
+    });
+
+    expect(evidence?.cancellationPassed).toBe(true);
+    expect(questionReject).toHaveBeenCalledOnce();
+    expect(questionReject).toHaveBeenCalledWith(
+      { sessionID: "session-1", requestID: "question-1" },
+      { signal: expect.any(AbortSignal) },
+    );
+  });
+
+  it("continues past a failed initial prompt without turning missing evidence into a PASS", async () => {
+    const { evidence, error, repository } = await runScenario({ initialPromptFails: true });
+
+    expect(error).toBeUndefined();
+    expect(evidence?.admittedInputID).toBe("");
+    expect(evidence?.permissionRequestID).toBe("permission-1");
+    expect(evidence?.cancellationPassed).toBe(true);
+    // Isolation needs a first session that received the nonce, so it is skipped.
+    expect(evidence?.sessionIDs).toEqual(["session-1"]);
+    expect(evidence?.isolationResponse).toBe("");
+    expect(evidence?.projectPaths).toEqual([]);
+
+    const report = evaluateLiveEvidence(evidence!, repository);
+    const status = Object.fromEntries(report.results.map((r) => [r.capability, r.status]));
+    expect(status).toEqual({
+      "Fresh session creation": "FAIL",
+      "Project directory": "FAIL",
+      "Local model invocation": "FAIL",
+      "Streaming events": "FAIL",
+      "Permission handling": "PASS",
+      "File modification": "FAIL",
+      Cancellation: "PASS",
+      "Session deletion": "PASS",
+      "Session isolation": "FAIL",
+    });
+    expect(report.verdict).toBe("FAIL");
+  });
+
+  it("settles a session left running by a cancellation that failed without throwing", async () => {
+    const { evidence, order } = await runScenario({ fixtureCall: false, cancellationTurnStaysActive: true });
+
+    expect(evidence?.cancellationPassed).toBe(false);
+    const notPassed = order.indexOf("progress:cancellation.not-passed");
+    const settleInterrupt = order.indexOf("interrupt", notPassed);
+    const isolationCreate = order.indexOf("create:session-2");
+    expect(notPassed).toBeGreaterThan(-1);
+    expect(settleInterrupt).toBeGreaterThan(notPassed);
+    // The settle waits for idle (an `active` read after the interrupt) before isolation begins.
+    expect(order.indexOf("active", settleInterrupt)).toBeLessThan(isolationCreate);
+    expect(isolationCreate).toBeGreaterThan(settleInterrupt);
+    expect(evidence?.isolationResponse).toBe("NO_PRIOR_SESSION");
+  });
+
+  it("reports all nine predicates PASS when every stage produces its evidence", async () => {
+    const { evidence, repository, order } = await runScenario({ modelWritesHello: true });
+
+    expect(evidence?.projectPaths).toEqual([repository, join(repository, "hello.txt")]);
+    expect(order.filter((entry) => entry.includes(".failed") || entry.includes("not-passed"))).toEqual([]);
+    expect(order).not.toContain("progress:question.guard.ended");
+    const report = evaluateLiveEvidence(evidence!, repository);
+    expect(report.results.filter((r) => r.status !== "PASS").map((r) => r.capability)).toEqual([]);
+    expect(report.verdict).toBe("PASS");
+  });
+
+  it("journals the adapter operation of a paired-operation failure, not a generic error", async () => {
+    const { order } = await runScenario({ initialPromptFails: true });
+
+    expect(order).toContain("progress:session.initial.prompt.failed.submit-prompt");
+    expect(order).not.toContain("progress:session.initial.prompt.failed.error");
+  });
+
+  it("journals a direct adapter timeout with its operation and timeout flag", async () => {
+    const { order, evidence } = await runScenario({
+      firstActivePollHangs: true,
+      fixtureCall: false,
+      operationTimeoutMs: 300,
+    });
+
+    expect(order).toContain("progress:session.initial.prompt.failed.wait-for-session.timeout");
+    expect(evidence?.finalResponse).toBe("");
+  });
+
+  it("journals a question guard that ends before the driver stops it", async () => {
+    const { order, evidence } = await runScenario({ guardStreamEndsEarly: true });
+
+    expect(order).toContain("progress:question.guard.ended");
+    expect(evidence?.cancellationPassed).toBe(true);
+  });
+
+  it("records an interrupt failure as missing cancellation evidence and continues to isolation", async () => {
     const { evidence, error, cancellationStreamClosed } = await runScenario({ interruptFails: true });
 
-    expect(evidence).toBeUndefined();
-    expect(error?.message).toContain("interrupt session");
+    expect(error).toBeUndefined();
+    expect(evidence?.cancellationPassed).toBe(false);
+    expect(evidence?.isolationResponse).toBe("NO_PRIOR_SESSION");
+    expect(evidence?.sessionIDs).toEqual(["session-1", "session-2"]);
     expect(cancellationStreamClosed).toBe(true);
+  });
+});
+
+describe("live probe reliability (spec 2026-10-03)", () => {
+  it("parses session-stream items in the verified runtime form and the declared string form", () => {
+    const runtime = { id: "e1", type: "session.next.step.started", durable: { seq: 3 }, data: { sessionID: "s" } };
+    expect(sessionStreamEvent(runtime)).toMatchObject({ type: "session.next.step.started", durable: { seq: 3 } });
+    expect(
+      sessionStreamEvent({ id: "e1", event: "message", data: JSON.stringify({ type: "session.next.step.started" }) }),
+    ).toMatchObject({ type: "session.next.step.started" });
+    expect(sessionStreamEvent({ id: "e1", event: "message", data: "not json" })).toBeUndefined();
+    expect(sessionStreamEvent({ id: "e1", data: { type: 7 } })).toBeUndefined();
+    expect(sessionStreamEvent(undefined)).toBeUndefined();
+  });
+
+  it("uses the sampled prompts with exact sentinels and the per-run token and nonce", () => {
+    const initial = initialPrompt("nonce-123");
+    expect(initial).toContain("write tool");
+    expect(initial).toContain("hello.txt");
+    expect(initial).toContain("exactly: Hello from OpenCode");
+    expect(initial).toContain("nonce-123");
+    expect(initial).toContain(`reply with exactly ${INITIAL_PROMPT_SENTINEL} and nothing else`);
+    expect(initial).toContain("Do not ask any questions");
+    expect(cancellationPrompt("token-9")).toBe(
+      "Run `node fixture.mjs token-9` and wait for it to finish. Do not run it in the background. Do not ask any questions.",
+    );
+    expect(ISOLATION_PROMPT).toContain("Reply with exactly NO_PRIOR_SESSION and nothing else");
+    expect(ISOLATION_PROMPT).toContain("Do not use any tools and do not ask any questions");
+  });
+});
+
+describe("stage failure classification", () => {
+  const adapterError = (operation: string, timedOut = false) =>
+    new OpenCodeAdapterError({ operation, message: "server text that must not be journaled", ...(timedOut ? { timedOut } : {}) });
+
+  it("finds the adapter error directly, through a cause, or through aggregated reasons", async () => {
+    const direct = adapterError("wait for session", true);
+    expect(findAdapterError(direct)).toBe(direct);
+    expect(findAdapterError(new Error("wrapped", { cause: direct }))).toBe(direct);
+
+    const paired = await settlePairedOperations(
+      "first",
+      Promise.reject(new Error("plain failure")),
+      "second",
+      Promise.reject(adapterError("submit prompt")),
+    ).catch((error: unknown) => error);
+    expect(paired).toBeInstanceOf(Error);
+    expect(findAdapterError(paired)?.diagnostic.operation).toBe("submit prompt");
+  });
+
+  it("returns undefined for non-adapter failures and bounds its search depth", () => {
+    expect(findAdapterError(new Error("correlation mismatch"))).toBeUndefined();
+    expect(findAdapterError("not an error")).toBeUndefined();
+    let deep: unknown = adapterError("submit prompt");
+    for (let i = 0; i < 6; i++) deep = new Error("wrapper", { cause: deep });
+    expect(findAdapterError(deep)).toBeUndefined();
   });
 });

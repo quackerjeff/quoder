@@ -6,8 +6,30 @@ contains the Milestone 0 feasibility probe, not the production CLI/TUI.
 
 ## Milestone 0 status
 
-**Capability verdict: FAIL (last authoritative run, 2026-09-30). Milestone 1
-remains blocked.**
+**Capability verdict: FAIL (latest authoritative run, 2026-10-02). Milestone 1
+remains blocked.** The 2026-10-02 run followed a passing preflight but stalled
+in its first prompt stage. See "Milestone 0 Live Result — 2026-10-02 run" in
+`docs/tech.md`.
+
+**Probe reliability fixes: done. Authoritative Run: GO (conditional,
+2026-10-03).** The `2026-10-03-live-probe-reliability` spec made these changes:
+
+- **Stream parsing.** Session-stream events are parsed in the runtime shape the
+  SDK actually yields.
+- **Questions.** The model's interactive `question` tool no longer blocks
+  unattended sessions: the probe rejects questions raised by its own sessions.
+- **Prompts.** The scenario prompts were tuned by sampling the configured model.
+- **Stage isolation.** Each stage after session creation now runs in
+  isolation, so one run reports evidence for all nine predicates. A failed stage
+  is journaled with a credential-safe cause, and absent evidence is never
+  reported as a PASS.
+
+The general, security, and QA gates passed. Model nondeterminism remains: the
+model occasionally writes a tool call as plain text instead of calling the tool.
+QA estimates about a 0.7 chance that all three model-dependent stages cooperate
+in a single run, so a failure caused only by that may justify a rerun. Run
+`npm run verify:environment` immediately before any authorized
+`npm run verify:live`.
 
 **Environment Readiness: PASS. Future Capability QA: GO (2026-10-02).** The
 environment and architecture reassessment

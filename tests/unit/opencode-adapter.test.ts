@@ -37,6 +37,7 @@ interface FakeMethods {
   get: ReturnType<typeof vi.fn>;
   globalEvents: ReturnType<typeof vi.fn>;
   deleteSession: ReturnType<typeof vi.fn>;
+  rejectQuestion: ReturnType<typeof vi.fn>;
 }
 
 const fakeClient = (): { client: OpencodeClient; methods: FakeMethods } => {
@@ -52,6 +53,7 @@ const fakeClient = (): { client: OpencodeClient; methods: FakeMethods } => {
     get: vi.fn(),
     globalEvents: vi.fn(),
     deleteSession: vi.fn(),
+    rejectQuestion: vi.fn(),
   };
 
   const client = {
@@ -72,6 +74,9 @@ const fakeClient = (): { client: OpencodeClient; methods: FakeMethods } => {
         active: methods.active as Method<OpencodeClient["v2"]["session"]["active"]>,
         messages: methods.messages as Method<OpencodeClient["v2"]["session"]["messages"]>,
         get: methods.get as Method<OpencodeClient["v2"]["session"]["get"]>,
+        question: {
+          reject: methods.rejectQuestion as Method<OpencodeClient["v2"]["session"]["question"]["reject"]>,
+        },
       },
       event: {
         subscribe: methods.globalEvents as Method<OpencodeClient["v2"]["event"]["subscribe"]>,
@@ -482,5 +487,86 @@ describe("Core V2 completion without the unimplemented 1.18.33 session.wait", ()
     expect(hasAssistantResponseAfter(messages, "input-1")).toBe(true);
     expect(hasAssistantResponseAfter(messages, "input-2")).toBe(false);
     expect(hasAssistantResponseAfter(messages, "missing")).toBe(false);
+  });
+});
+
+describe("question rejection and long-lived global streams", () => {
+  async function* pendingUntilAborted(signal: AbortSignal) {
+    if (!signal.aborted) {
+      await new Promise<void>((resolveAbort) => signal.addEventListener("abort", () => resolveAbort(), { once: true }));
+    }
+  }
+
+  it("rejects a pending question through the Core V2 question API", async () => {
+    const { client, methods } = fakeClient();
+    methods.rejectQuestion.mockResolvedValue(result(undefined, 204));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await adapter.rejectQuestion("session-1", "question-1");
+
+    expect(methods.rejectQuestion).toHaveBeenCalledWith(
+      { sessionID: "session-1", requestID: "question-1" },
+      { signal: expect.any(AbortSignal) },
+    );
+  });
+
+  it("surfaces a failed question rejection with its diagnostic", async () => {
+    const { client, methods } = fakeClient();
+    methods.rejectQuestion.mockResolvedValue(failedResult({ _tag: "NotFoundError", message: "gone" }, 404));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await expect(adapter.rejectQuestion("session-1", "question-1")).rejects.toMatchObject({
+      diagnostic: { operation: "reject question request", status: 404 },
+    });
+  });
+
+  it("ends a global stream when the caller's signal aborts, even with a read pending", async () => {
+    const { client, methods } = fakeClient();
+    methods.globalEvents.mockImplementation(async (options: { signal: AbortSignal }) => ({
+      stream: pendingUntilAborted(options.signal),
+    }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 60_000 });
+    const caller = new AbortController();
+    const removeListener = vi.spyOn(caller.signal, "removeEventListener");
+
+    const stream = await adapter.globalEvents({ signal: caller.signal });
+    const read = stream.next();
+    caller.abort();
+
+    await expect(read).resolves.toMatchObject({ done: true });
+    const inner = methods.globalEvents.mock.calls[0]?.[0].signal as AbortSignal;
+    expect(inner.aborted).toBe(true);
+    expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("aborts at once for an already-aborted caller signal", async () => {
+    const { client, methods } = fakeClient();
+    methods.globalEvents.mockImplementation(async (options: { signal: AbortSignal }) => ({
+      stream: pendingUntilAborted(options.signal),
+    }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 60_000 });
+
+    const stream = await adapter.globalEvents({ signal: AbortSignal.abort() });
+
+    await expect(stream.next()).resolves.toMatchObject({ done: true });
+  });
+
+  it("bounds a global stream by its own timeout instead of the adapter default", async () => {
+    vi.useFakeTimers();
+    const { client, methods } = fakeClient();
+    methods.globalEvents.mockImplementation(async (options: { signal: AbortSignal }) => ({
+      stream: pendingUntilAborted(options.signal),
+    }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 10 });
+
+    const stream = await adapter.globalEvents({ timeoutMs: 1_000 });
+    const read = stream.next();
+    const inner = methods.globalEvents.mock.calls[0]?.[0].signal as AbortSignal;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(inner.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(500);
+
+    await expect(read).resolves.toMatchObject({ done: true });
+    expect(inner.aborted).toBe(true);
   });
 });

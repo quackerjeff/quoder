@@ -193,9 +193,18 @@ export class OpenCodeAdapter {
     }
   }
 
-  async globalEvents(): Promise<AsyncGenerator<V2Event, void, unknown>> {
+  /**
+   * Subscribes to the global event stream. `timeoutMs` bounds the subscription (default: the
+   * adapter timeout); aborting `signal` ends it early, even while a read is pending.
+   */
+  async globalEvents(
+    options: { readonly timeoutMs?: number; readonly signal?: AbortSignal } = {},
+  ): Promise<AsyncGenerator<V2Event, void, unknown>> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.#timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? this.#timeoutMs);
+    const abort = () => controller.abort();
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) controller.abort();
     try {
       const result = await this.#client.v2.event.subscribe({
         signal: controller.signal,
@@ -207,11 +216,13 @@ export class OpenCodeAdapter {
           yield* stream;
         } finally {
           clearTimeout(timeout);
+          options.signal?.removeEventListener("abort", abort);
           controller.abort();
         }
       })();
     } catch (cause) {
       clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abort);
       throw this.#toError("subscribe to global events", cause);
     }
   }
@@ -239,6 +250,13 @@ export class OpenCodeAdapter {
   ): Promise<void> {
     await this.#request("reply to permission request", (signal) =>
       this.#client.v2.session.permission.reply({ sessionID, requestID, reply }, { signal }),
+    );
+  }
+
+  /** Rejects a pending interactive question so an unattended session cannot block on it. */
+  async rejectQuestion(sessionID: string, requestID: string): Promise<void> {
+    await this.#request("reject question request", (signal) =>
+      this.#client.v2.session.question.reject({ sessionID, requestID }, { signal }),
     );
   }
 

@@ -19,7 +19,7 @@ import {
   type CapabilityResult,
   type ProbeEvent,
 } from "./capabilities.js";
-import { OpenCodeAdapter, finalAssistantResponseText } from "./opencode-adapter.js";
+import { OpenCodeAdapter, OpenCodeAdapterError, finalAssistantResponseText } from "./opencode-adapter.js";
 import { buildCapabilityReport, renderCapabilityReport, type CapabilityReport } from "./report.js";
 
 const execFileAsync = promisify(execFile);
@@ -117,7 +117,7 @@ export function evaluateLiveEvidence(
         admittedInputID: evidence.admittedInputID,
         responseInputID: evidence.responseInputID,
         assistantText: evidence.finalResponse,
-      }) && evidence.finalResponse === "TOKEN_STORED",
+      }) && evidence.finalResponse === INITIAL_PROMPT_SENTINEL,
       "received exact TOKEN_STORED response correlated to the admitted input",
     ),
   );
@@ -280,17 +280,45 @@ type DurableEvent = {
   readonly data?: Readonly<Record<string, unknown>>;
 };
 
-const parseDurableEvent = (data: string): DurableEvent | undefined => {
+const asDurableEvent = (value: unknown): DurableEvent | undefined =>
+  typeof value === "object" && value !== null && typeof Reflect.get(value, "type") === "string"
+    ? (value as DurableEvent)
+    : undefined;
+
+/**
+ * At runtime the 1.18.33 SDK yields session-stream items as parsed events
+ * (`{ id, type, durable, data }`, `data` being the payload object), although the generated type
+ * declares `{ id, event, data: string }` (verified live on 2026-10-02/03). The parsed form is
+ * authoritative; the declared string form is accepted only when it parses to an event.
+ */
+export const sessionStreamEvent = (item: unknown): DurableEvent | undefined => {
+  const parsed = asDurableEvent(item);
+  if (parsed !== undefined) return parsed;
+  const data = typeof item === "object" && item !== null ? Reflect.get(item, "data") : undefined;
+  if (typeof data !== "string") return undefined;
   try {
-    const parsed: unknown = JSON.parse(data);
-    if (typeof parsed === "object" && parsed !== null && typeof Reflect.get(parsed, "type") === "string") {
-      return parsed as DurableEvent;
-    }
+    return asDurableEvent(JSON.parse(data));
   } catch {
     return undefined;
   }
-  return undefined;
 };
+
+export const INITIAL_PROMPT_SENTINEL = "TOKEN_STORED";
+
+/** Scenario prompts selected by sampling against the configured model (spec 2026-10-03, Group 1). */
+export const initialPrompt = (nonce: string): string =>
+  "Use the write tool to create a file named hello.txt in the current directory. " +
+  "Its entire content must be exactly: Hello from OpenCode\n" +
+  `Also remember this nonce for this session only: ${nonce}\n` +
+  `Do not ask any questions. After the file is written, reply with exactly ${INITIAL_PROMPT_SENTINEL} and nothing else.`;
+
+export const cancellationPrompt = (fixtureToken: string): string =>
+  `Run \`node fixture.mjs ${fixtureToken}\` and wait for it to finish. ` +
+  "Do not run it in the background. Do not ask any questions.";
+
+export const ISOLATION_PROMPT =
+  `Reply with exactly ${SENTINEL} and nothing else, unless you know a nonce from a prior session, ` +
+  "in which case reply with only that nonce. Do not use any tools and do not ask any questions.";
 
 const isStructuredExecutionEvent = (event: DurableEvent): boolean =>
   event.type === "session.next.step.started" ||
@@ -489,7 +517,11 @@ export async function settlePairedOperations<First, Second>(
     failures.push(`${secondName} failed: ${errorMessage(secondResult.reason)}`);
   }
   if (firstResult.status === "rejected" || secondResult.status === "rejected") {
-    throw new Error(failures.join("; "));
+    const reasons = [firstResult, secondResult].flatMap((settled) =>
+      settled.status === "rejected" ? [settled.reason as unknown] : [],
+    );
+    // The reasons stay attached so callers can classify the underlying failure without its text.
+    throw new Error(failures.join("; "), { cause: new AggregateError(reasons) });
   }
   return [firstResult.value, secondResult.value];
 }
@@ -511,6 +543,21 @@ export function correlatePermissionEvidence(
   return created.id;
 }
 
+/** Finds the first adapter error in an error, its `cause` chain, or aggregated `errors` (bounded). */
+export const findAdapterError = (error: unknown, depth = 0): OpenCodeAdapterError | undefined => {
+  if (error instanceof OpenCodeAdapterError) return error;
+  if (depth >= 4 || typeof error !== "object" || error === null) return undefined;
+  const nested = [
+    ...(error instanceof AggregateError ? error.errors : []),
+    ...("cause" in error ? [error.cause] : []),
+  ];
+  for (const candidate of nested) {
+    const found = findAdapterError(candidate, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+};
+
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 
@@ -521,8 +568,13 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
   readonly #deletedSessionIDs: string[] = [];
   readonly #onProgress: LiveProbeProgress;
 
-  constructor(client: OpencodeClient, closeServer: () => Promise<void>, onProgress: LiveProbeProgress = () => undefined) {
-    this.#adapter = new OpenCodeAdapter({ client, timeoutMs: LIVE_PROBE_TIMEOUT_MS });
+  constructor(
+    client: OpencodeClient,
+    closeServer: () => Promise<void>,
+    onProgress: LiveProbeProgress = () => undefined,
+    options: { readonly operationTimeoutMs?: number } = {},
+  ) {
+    this.#adapter = new OpenCodeAdapter({ client, timeoutMs: options.operationTimeoutMs ?? LIVE_PROBE_TIMEOUT_MS });
     this.#closeServer = closeServer;
     this.#onProgress = onProgress;
   }
@@ -536,7 +588,9 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
     let permissionRequestID: string | undefined;
     let cancellationResult = false;
     let isolationResponse = "";
+    const questionGuard = await this.#startQuestionGuard();
     try {
+      // Every later stage needs the first session, so a creation failure ends the scenario.
       this.#onProgress("session.initial.create.start");
       const first = await this.#adapter.createSession({
         directory: environment.repository,
@@ -545,67 +599,77 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
       this.#sessionIDs.push(first.id);
       this.#onProgress("session.initial.create.complete");
 
-      this.#onProgress("session.initial.prompt.start");
-      const stream = await this.#adapter.events(first.id);
-      const firstExecutionEvent = (async () => {
-        try {
-          for await (const item of stream) {
-            const event = parseDurableEvent(item.data);
-            if (event !== undefined && isStructuredExecutionEvent(event)) return true;
+      // Later independent stages still run after a failed stage, so one run yields evidence for
+      // every predicate; a failed stage only leaves its own evidence absent (FAIL).
+      const initialCompleted = await this.#stage("session.initial.prompt", async () => {
+        const stream = await this.#adapter.events(first.id);
+        const firstExecutionEvent = (async () => {
+          try {
+            for await (const item of stream) {
+              const event = sessionStreamEvent(item);
+              if (event !== undefined && isStructuredExecutionEvent(event)) return true;
+            }
+            return false;
+          } finally {
+            await stream.return(undefined);
           }
-          return false;
-        } finally {
-          await stream.return(undefined);
-        }
-      })();
-      const promptSubmission = this.#adapter.prompt(
-        first.id,
-        `Remember this nonce only in this session: ${nonce}. Create hello.txt in the current repository with exactly: Hello from OpenCode. Then reply TOKEN_STORED.`,
-      );
-      const [observedStructuredEvent, admitted] = await settlePairedOperations(
-        "initial structured-event observation",
-        firstExecutionEvent,
-        "initial prompt submission",
-        promptSubmission,
-      );
-      structuredEventObserved = observedStructuredEvent;
-      admittedInputID = admitted.id;
-      await this.#adapter.waitUntilIdle(first.id, { afterInputID: admittedInputID });
-      const correlatedResponse = correlatedAssistantResponse(
-        await this.#adapter.messages(first.id),
-        admittedInputID,
-      );
-      finalResponse = correlatedResponse.text;
-      responseInputID = correlatedResponse.inputID;
-      this.#onProgress("session.initial.prompt.complete");
+        })();
+        const promptSubmission = this.#adapter.prompt(first.id, initialPrompt(nonce));
+        const [observedStructuredEvent, admitted] = await settlePairedOperations(
+          "initial structured-event observation",
+          firstExecutionEvent,
+          "initial prompt submission",
+          promptSubmission,
+        );
+        structuredEventObserved = observedStructuredEvent;
+        admittedInputID = admitted.id;
+        await this.#adapter.waitUntilIdle(first.id, { afterInputID: admittedInputID });
+        const correlatedResponse = correlatedAssistantResponse(
+          await this.#adapter.messages(first.id),
+          admittedInputID,
+        );
+        finalResponse = correlatedResponse.text;
+        responseInputID = correlatedResponse.inputID;
+      });
+      // Stages can fail without throwing (for example a cancellation returning false), so the
+      // first session is settled after every stage; settling an idle session is one status read.
+      if (!initialCompleted) this.#onProgress("session.initial.prompt.not-completed");
+      await this.#settleSession(first.id);
 
-      this.#onProgress("permission.start");
-      permissionRequestID = await this.#exercisePermission(first.id, environment.outside);
-      this.#onProgress("permission.complete");
-      this.#onProgress("cancellation.start");
-      cancellationResult = await this.#exerciseCancellation(first.id, environment.repository);
-      this.#onProgress("cancellation.complete");
+      await this.#stage("permission", async () => {
+        permissionRequestID = await this.#exercisePermission(first.id, environment.outside);
+      });
+      await this.#settleSession(first.id);
 
-      this.#onProgress("isolation.start");
-      const isolationTransition = await createIsolationSessionAfterDeletion(
-        this.#adapter,
-        first.id,
-        environment.repository,
-      );
-      this.#deletedSessionIDs.push(isolationTransition.deletedSessionID);
-      const second = { id: isolationTransition.id };
-      this.#sessionIDs.push(second.id);
-      const isolationInput = await this.#adapter.prompt(
-        second.id,
-        `If you know a nonce from any prior session, output that nonce. Otherwise output exactly ${SENTINEL} and nothing else.`,
-      );
-      await this.#adapter.waitUntilIdle(second.id, { afterInputID: isolationInput.id });
-      isolationResponse = correlatedAssistantResponse(
-        await this.#adapter.messages(second.id),
-        isolationInput.id,
-      ).text;
-      this.#onProgress("isolation.complete");
+      await this.#stage("cancellation", async () => {
+        cancellationResult = await this.#exerciseCancellation(first.id, environment.repository);
+        if (!cancellationResult) this.#onProgress("cancellation.not-passed");
+      });
+      await this.#settleSession(first.id);
+
+      // Isolation is meaningful only if the first session actually received the nonce.
+      if (admittedInputID === "") {
+        this.#onProgress("isolation.skipped");
+      } else {
+        await this.#stage("isolation", async () => {
+          const isolationTransition = await createIsolationSessionAfterDeletion(
+            this.#adapter,
+            first.id,
+            environment.repository,
+          );
+          this.#deletedSessionIDs.push(isolationTransition.deletedSessionID);
+          const second = { id: isolationTransition.id };
+          this.#sessionIDs.push(second.id);
+          const isolationInput = await this.#adapter.prompt(second.id, ISOLATION_PROMPT);
+          await this.#adapter.waitUntilIdle(second.id, { afterInputID: isolationInput.id });
+          isolationResponse = correlatedAssistantResponse(
+            await this.#adapter.messages(second.id),
+            isolationInput.id,
+          ).text;
+        });
+      }
     } finally {
+      await questionGuard.stop();
       this.#onProgress("sessions.cleanup.start");
       for (const sessionID of [...this.#sessionIDs].reverse()) {
         if (this.#deletedSessionIDs.includes(sessionID)) continue;
@@ -620,22 +684,92 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
     }
 
     const helloPath = join(environment.repository, "hello.txt");
+    // Only a model-produced file read through the confined-path check is project-directory evidence.
     const helloContent = await readConfinedRegularFile(environment.repository, helloPath).catch(
-      () => "",
+      () => undefined,
     );
     return {
       sessionIDs: this.#sessionIDs,
-      projectPaths: [environment.repository, helloPath],
+      projectPaths: helloContent === undefined ? [] : [environment.repository, helloPath],
       finalResponse,
       admittedInputID,
       responseInputID,
       structuredEventObserved,
       ...(permissionRequestID === undefined ? {} : { permissionRequestID }),
-      helloContent,
+      helloContent: helloContent ?? "",
       cancellationPassed: cancellationResult,
       deletedSessionIDs: this.#deletedSessionIDs,
       isolationResponse,
       nonce,
+    };
+  }
+
+  /**
+   * Runs one scenario stage, recording failure instead of aborting. The journal names the failing
+   * adapter operation and whether it timed out, never error text, so it stays credential-safe.
+   */
+  async #stage(name: string, body: () => Promise<void>): Promise<boolean> {
+    this.#onProgress(`${name}.start`);
+    try {
+      await body();
+      this.#onProgress(`${name}.complete`);
+      return true;
+    } catch (error) {
+      const adapterError = findAdapterError(error);
+      const cause = adapterError === undefined
+        ? "error"
+        : `${adapterError.diagnostic.operation.replaceAll(" ", "-")}${adapterError.diagnostic.timedOut === true ? ".timeout" : ""}`;
+      this.#onProgress(`${name}.failed.${cause}`);
+      return false;
+    }
+  }
+
+  /** Best-effort: stop any run a failed stage left active so the next stage starts from idle. */
+  async #settleSession(sessionID: string): Promise<void> {
+    try {
+      if (await this.#adapter.isActive(sessionID)) {
+        await this.#adapter.interrupt(sessionID);
+        await this.#adapter.waitUntilIdle(sessionID);
+      }
+    } catch {
+      this.#onProgress("session.settle.failed");
+    }
+  }
+
+  /**
+   * The 1.18.33 `build` agent allows the interactive `question` tool, which blocks until answered
+   * and is not a permission request. Unattended scenario sessions reject every question they raise
+   * (verified live on 2026-10-03); this is not a permission decision.
+   */
+  async #startQuestionGuard(): Promise<{ stop(): Promise<void> }> {
+    const controller = new AbortController();
+    const stream = await this.#adapter.globalEvents({
+      timeoutMs: LIVE_PROBE_RUN_TIMEOUT_MS,
+      signal: controller.signal,
+    });
+    const guard = (async () => {
+      for await (const event of stream) {
+        if (event.type !== "question.v2.asked") continue;
+        const sessionID = eventSessionID(event);
+        const requestID = Reflect.get(event.data, "id");
+        if (sessionID === undefined || typeof requestID !== "string") continue;
+        if (!this.#sessionIDs.includes(sessionID)) continue;
+        this.#onProgress("question.rejected");
+        await this.#adapter.rejectQuestion(sessionID, requestID).catch(() => {
+          this.#onProgress("question.reject.failed");
+        });
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        // Without a guard, a later question would block its stage until that stage's timeout.
+        if (!controller.signal.aborted) this.#onProgress("question.guard.ended");
+      });
+    return {
+      stop: async () => {
+        controller.abort();
+        await guard;
+      },
     };
   }
 
@@ -710,10 +844,7 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
       }
     };
     try {
-      await this.#adapter.prompt(
-        sessionID,
-        `Run \`node fixture.mjs ${fixtureToken}\` and wait for it to finish. Do not run it in the background.`,
-      );
+      await this.#adapter.prompt(sessionID, cancellationPrompt(fixtureToken));
       let callID: string | undefined;
       try {
         for (let event = await nextEvent(); event !== undefined; event = await nextEvent()) {
