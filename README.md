@@ -6,13 +6,29 @@ contains the Milestone 0 feasibility probe, not the production CLI/TUI.
 
 ## Milestone 0 status
 
-**Capability verdict: FAIL (latest authoritative run, 2026-10-02). Milestone 1
-remains blocked.** The 2026-10-02 run followed a passing preflight but stalled
+**Capability verdict: PASS. Milestone 0 is passed (authoritative
+`npm run verify:live`, 2026-10-03: all nine predicates PASS; see "Milestone 0
+Live Result — 2026-10-03 authoritative PASS" in `docs/tech.md`).** Milestone 1
+may begin. First, keep the OpenCode server's credentials out of model-run tool
+environments before Quoder forwards real permission decisions.
+
+Earlier authoritative run, 2026-10-03, 8 of 9 PASS: Permission handling failed
+because of the permission-event subscription race, which has since been fixed.
+
+Earlier run, 2026-10-02: The 2026-10-02 run followed a passing preflight but stalled
 in its first prompt stage. See "Milestone 0 Live Result — 2026-10-02 run" in
 `docs/tech.md`.
 
-**Probe reliability fixes: done. Authoritative Run: GO (conditional,
-2026-10-03).** The `2026-10-03-live-probe-reliability` spec made these changes:
+**Permission-event race: fixed. Authoritative Run: GO (2026-10-03).** The
+`2026-10-03-permission-event-race` spec replaced the permission stage's late,
+per-stage subscription with the run-long event monitor. That subscription is
+confirmed connected (`server.connected`) before any session exists, and it
+records `permission.v2.asked` for the probe's own sessions. Against the real
+server, with no model calls, QA observed 27/27 events with the new design and
+0/27 with the old late-reader design, which explains the 2026-10-03 Permission
+handling FAIL. The general, security, and QA gates passed.
+
+**Probe reliability fixes: done (2026-10-03).** The `2026-10-03-live-probe-reliability` spec made these changes:
 
 - **Stream parsing.** Session-stream events are parsed in the runtime shape the
   SDK actually yields.

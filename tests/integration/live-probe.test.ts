@@ -52,15 +52,41 @@ type Method<T extends ClientMethod> = T;
 
 const response = (status = 200): Response => new Response(null, { status });
 
-async function* questionGuardEvents(
-  signal: AbortSignal,
-  events: readonly V2Event[] = [],
-): AsyncGenerator<V2Event, void, unknown> {
-  for (const event of events) yield event;
-  if (!signal.aborted) {
-    await new Promise<void>((resolveAbort) => signal.addEventListener("abort", () => resolveAbort(), { once: true }));
-  }
-}
+/**
+ * A fake v2 global stream that behaves like the 1.18.33 SDK and server: it is not connected until
+ * its first read (events published earlier are lost, as non-durable events are), it then sends
+ * `server.connected` first, and it delivers later events until the driver aborts or `end()`.
+ */
+const eventChannel = () => {
+  const queue: V2Event[] = [];
+  let wake: (() => void) | undefined;
+  let connected = false;
+  let closed = false;
+  return {
+    push(event: V2Event): void {
+      if (!connected) return;
+      queue.push(event);
+      wake?.();
+    },
+    end(): void {
+      closed = true;
+      wake?.();
+    },
+    async *stream(signal: AbortSignal): AsyncGenerator<V2Event, void, unknown> {
+      connected = true;
+      yield { id: "connected", type: "server.connected", data: {} } as unknown as V2Event;
+      for (;;) {
+        while (queue.length > 0) yield queue.shift()!;
+        if (signal.aborted || closed) return;
+        await new Promise<void>((resolveWake) => {
+          wake = resolveWake;
+          signal.addEventListener("abort", () => resolveWake(), { once: true });
+        });
+        wake = undefined;
+      }
+    },
+  };
+};
 
 const result = <T>(data: T, status = 200) => ({
   data,
@@ -419,29 +445,29 @@ describe("paired live-operation settlement", () => {
     );
   });
 
-  it("retains both the permission stream and request diagnostics when both reject", async () => {
+  it("retains both diagnostics when an event observation and its request both reject", async () => {
     await expect(
       settlePairedOperations(
-        "permission event observation",
+        "event observation",
         Promise.reject(new Error("event stream aborted")),
-        "permission request",
-        Promise.reject(new Error("create permission timed out")),
+        "request",
+        Promise.reject(new Error("request timed out")),
       ),
     ).rejects.toThrow(
-      "permission event observation failed: Error: event stream aborted; permission request failed: Error: create permission timed out",
+      "event observation failed: Error: event stream aborted; request failed: Error: request timed out",
     );
   });
 
-  it("preserves a permission request rejection when the event stream ends without a match", async () => {
+  it("preserves a request rejection when the paired event observation ends without a match", async () => {
     await expect(
       settlePairedOperations(
-        "permission event observation",
+        "event observation",
         Promise.resolve(undefined),
-        "permission request",
+        "request",
         Promise.reject(new Error("request rejected after stream end")),
       ),
     ).rejects.toThrow(
-      "permission request failed: Error: request rejected after stream end",
+      "request failed: Error: request rejected after stream end",
     );
   });
 
@@ -521,7 +547,13 @@ describe("permission evidence correlation", () => {
       .mockResolvedValueOnce(result({ data: { id: "input-1" } }))
       .mockResolvedValueOnce(result({ data: { id: "cancellation-input" } }))
       .mockResolvedValueOnce(result({ data: { id: "input-2" } }));
+    const monitorChannel = eventChannel();
     const permissionCreate = vi.fn().mockImplementation(async () => {
+      // The warm server publishes the non-durable asked events before `create` responds.
+      operations.push("emitted:legacy");
+      monitorChannel.push(legacyEvent);
+      operations.push("emitted:core-v2");
+      monitorChannel.push(coreV2Event);
       operations.push("created:permission-1:ask");
       return result({ data: { id: "permission-1", effect: "ask" } });
     });
@@ -563,20 +595,13 @@ describe("permission evidence correlation", () => {
         data: { sessionID: "session-1" },
       };
     }
-    async function* permissionEvents() {
-      operations.push("emitted:legacy");
-      yield legacyEvent;
-      operations.push("emitted:core-v2");
-      yield coreV2Event;
-    }
     async function* noCancellationEvents() {
       return;
     }
 
     const subscribe = vi
       .fn()
-      .mockImplementationOnce(async (options: { signal: AbortSignal }) => ({ stream: questionGuardEvents(options.signal) }))
-      .mockResolvedValueOnce({ stream: permissionEvents() })
+      .mockImplementationOnce(async (options: { signal: AbortSignal }) => ({ stream: monitorChannel.stream(options.signal) }))
       .mockResolvedValueOnce({ stream: noCancellationEvents() });
     const transcripts: Record<string, unknown[]> = {
       // OpenCode 1.18.33 appends one assistant message per model step; the final one is the result.
@@ -694,11 +719,14 @@ describe("permission evidence correlation", () => {
       );
       expect(active).toHaveBeenCalled();
       expect(operations).toEqual([
-        "created:permission-1:ask",
         "emitted:legacy",
         "emitted:core-v2",
+        "created:permission-1:ask",
         "replied:permission-1",
       ]);
+      // Only the run-long monitor and the cancellation stage subscribe; the permission stage opens
+      // no late subscription that could miss a non-durable event.
+      expect(subscribe).toHaveBeenCalledTimes(2);
     } finally {
       await driver.close();
       await rm(root, { recursive: true, force: true });
@@ -1173,8 +1201,12 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     readonly modelWritesHello?: boolean;
     /** The first active-session poll never answers, so the initial idle wait times out. */
     readonly firstActivePollHangs?: boolean;
-    /** The question guard's stream ends on its own instead of waiting for the driver to stop it. */
-    readonly guardStreamEndsEarly?: boolean;
+    /** The run-long monitor's stream ends on its own instead of waiting for the driver to stop it. */
+    readonly monitorStreamEndsEarly?: boolean;
+    /** The monitor's stream ends while the permission stage is waiting for its event. */
+    readonly monitorEndsDuringPermissionWait?: boolean;
+    /** When and how the server publishes `permission.v2.asked` relative to `permission.create`. */
+    readonly permissionEvent?: "beforeCreate" | "afterCreate" | "none" | "otherSession" | "mismatchedId";
     readonly operationTimeoutMs?: number;
   }
 
@@ -1189,7 +1221,9 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     cancellationTurnStaysActive = false,
     modelWritesHello = false,
     firstActivePollHangs = false,
-    guardStreamEndsEarly = false,
+    monitorStreamEndsEarly = false,
+    monitorEndsDuringPermissionWait = false,
+    permissionEvent = "beforeCreate",
     operationTimeoutMs,
   }: Scenario = {}) => {
     const root = await mkdtemp(join(tmpdir(), "quoder-cancellation-driver-test-"));
@@ -1238,13 +1272,25 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
         data: { sessionID: "session-1" },
       };
     }
-    async function* permissionEvents() {
-      yield {
-        id: "permission-event",
+    const monitorChannel = eventChannel();
+    const permissionAsked = (sessionID: string, id: string) =>
+      ({
+        id: `permission-event-${id}`,
         type: "permission.v2.asked",
-        data: { id: "permission-1", sessionID: "session-1", action: "external_directory", resources: [outside], save: [] },
-      } as unknown as V2Event;
-    }
+        data: { id, sessionID, action: "external_directory", resources: [outside], save: [] },
+      }) as unknown as V2Event;
+    const publishPermission = () => {
+      if (permissionEvent === "otherSession") monitorChannel.push(permissionAsked("session-unrelated", "permission-1"));
+      if (permissionEvent === "mismatchedId") monitorChannel.push(permissionAsked("session-1", "permission-other"));
+      if (permissionEvent === "beforeCreate" || permissionEvent === "afterCreate") {
+        order.push("emit:permission.v2.asked");
+        monitorChannel.push(permissionAsked("session-1", "permission-1"));
+      }
+    };
+    const permissionReply = vi.fn().mockImplementation(async () => {
+      order.push("permission-reply");
+      return result(undefined, 204);
+    });
     async function* cancellationEvents() {
       try {
         yield delta();
@@ -1320,8 +1366,14 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
           prompt,
           events: vi.fn().mockResolvedValue({ stream: initialEvents() }),
           permission: {
-            create: vi.fn().mockResolvedValue(result({ data: { id: "permission-1", effect: "ask" } })),
-            reply: vi.fn().mockResolvedValue(result(undefined, 204)),
+            create: vi.fn().mockImplementation(async () => {
+              if (monitorEndsDuringPermissionWait) setTimeout(() => monitorChannel.end(), 20);
+              else if (permissionEvent !== "afterCreate") publishPermission();
+              else setTimeout(publishPermission, 20);
+              order.push("permission-created");
+              return result({ data: { id: "permission-1", effect: "ask" } });
+            }),
+            reply: permissionReply,
           },
           question: { reject: questionReject },
           interrupt: vi.fn().mockImplementation(async () => {
@@ -1351,18 +1403,21 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
         event: {
           subscribe: vi
             .fn()
-            .mockImplementationOnce(async (options: { signal: AbortSignal }) => ({
-              stream: (async function* () {
-                if (guardStreamEndsEarly) return;
-                await questionsReleased;
-                yield* questionGuardEvents(
-                  options.signal,
-                  questions.map(({ sessionID, id }) =>
-                    ({ id: `question-event-${id}`, type: "question.v2.asked", data: { id, sessionID } }) as unknown as V2Event),
-                );
-              })(),
-            }))
-            .mockResolvedValueOnce({ stream: permissionEvents() })
+            .mockImplementationOnce(async (options: { signal: AbortSignal }) => {
+              order.push("subscribe:monitor");
+              void questionsReleased.then(() => {
+                for (const { sessionID, id } of questions) {
+                  monitorChannel.push(
+                    ({ id: `question-event-${id}`, type: "question.v2.asked", data: { id, sessionID } }) as unknown as V2Event,
+                  );
+                }
+              });
+              return {
+                stream: monitorStreamEndsEarly
+                  ? (async function* (): AsyncGenerator<V2Event, void, unknown> {})()
+                  : monitorChannel.stream(options.signal),
+              };
+            })
             .mockResolvedValueOnce({ stream: cancellationEvents() }),
         },
       },
@@ -1380,7 +1435,7 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
         (evidence) => ({ evidence, error: undefined }),
         (error: Error) => ({ evidence: undefined, error }),
       );
-      return { ...outcome, order, cancellationStreamClosed, pidFileExistedAtInterrupt, questionReject, repository };
+      return { ...outcome, order, cancellationStreamClosed, pidFileExistedAtInterrupt, questionReject, permissionReply, repository };
     } finally {
       await driver.close();
       await rm(root, { recursive: true, force: true });
@@ -1497,8 +1552,14 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     const { evidence, repository, order } = await runScenario({ modelWritesHello: true });
 
     expect(evidence?.projectPaths).toEqual([repository, join(repository, "hello.txt")]);
-    expect(order.filter((entry) => entry.includes(".failed") || entry.includes("not-passed"))).toEqual([]);
-    expect(order).not.toContain("progress:question.guard.ended");
+    expect(
+      order.filter((entry) =>
+        [".failed", "not-passed", "not-observed", "not-completed", "unconfirmed"].some((marker) => entry.includes(marker))),
+    ).toEqual([]);
+    // The monitor is subscribed, and confirmed connected, before any session or request exists.
+    expect(order.indexOf("subscribe:monitor")).toBeGreaterThan(-1);
+    expect(order.indexOf("subscribe:monitor")).toBeLessThan(order.indexOf("create:session-1"));
+    expect(order).not.toContain("progress:event.monitor.ended");
     const report = evaluateLiveEvidence(evidence!, repository);
     expect(report.results.filter((r) => r.status !== "PASS").map((r) => r.capability)).toEqual([]);
     expect(report.verdict).toBe("PASS");
@@ -1522,11 +1583,60 @@ describe("cancellation orchestration against the verified 1.18.33 event contract
     expect(evidence?.finalResponse).toBe("");
   });
 
-  it("journals a question guard that ends before the driver stops it", async () => {
-    const { order, evidence } = await runScenario({ guardStreamEndsEarly: true });
+  it("journals an event monitor that ends early, and then fails permission instead of waiting", async () => {
+    const { order, evidence, permissionReply } = await runScenario({ monitorStreamEndsEarly: true });
 
-    expect(order).toContain("progress:question.guard.ended");
+    expect(order).toContain("progress:event.monitor.unconfirmed");
+    expect(order).toContain("progress:event.monitor.ended");
+    expect(order).toContain("progress:permission.not-observed.monitor-ended");
+    expect(evidence?.permissionRequestID).toBeUndefined();
+    expect(permissionReply).not.toHaveBeenCalled();
     expect(evidence?.cancellationPassed).toBe(true);
+  });
+
+  it.each(["beforeCreate", "afterCreate"] as const)(
+    "observes the permission request published %s through the run-long monitor",
+    async (permissionEvent) => {
+      const { evidence, order, permissionReply } = await runScenario({ permissionEvent });
+
+      expect(evidence?.permissionRequestID).toBe("permission-1");
+      expect(permissionReply).toHaveBeenCalledOnce();
+      expect(permissionReply).toHaveBeenCalledWith(
+        { sessionID: "session-1", requestID: "permission-1", reply: "once" },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(order.indexOf("permission-reply")).toBeGreaterThan(order.indexOf("emit:permission.v2.asked"));
+    },
+  );
+
+  it.each(["none", "otherSession", "mismatchedId"] as const)(
+    "fails permission handling within its bound when the matching event is %s",
+    async (permissionEvent) => {
+      const { evidence, permissionReply, order } = await runScenario({
+        permissionEvent,
+        fixtureCall: false,
+        operationTimeoutMs: 300,
+      });
+
+      expect(evidence?.permissionRequestID).toBeUndefined();
+      expect(permissionReply).not.toHaveBeenCalled();
+      expect(order).toContain("progress:permission.not-observed.timeout");
+    },
+  );
+
+  it("fails permission promptly when the monitor ends during the wait", async () => {
+    const started = Date.now();
+    // The default 120 s operation bound applies, so only the monitor's end can settle the wait.
+    const { evidence, order, permissionReply } = await runScenario({
+      monitorEndsDuringPermissionWait: true,
+      fixtureCall: false,
+    });
+
+    expect(evidence?.permissionRequestID).toBeUndefined();
+    expect(permissionReply).not.toHaveBeenCalled();
+    expect(order).toContain("progress:permission.not-observed.monitor-ended");
+    expect(order).toContain("progress:event.monitor.ended");
+    expect(Date.now() - started).toBeLessThan(3_000);
   });
 
   it("records an interrupt failure as missing cancellation evidence and continues to isolation", async () => {

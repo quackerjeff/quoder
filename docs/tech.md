@@ -141,14 +141,23 @@ client.v2.session.permission.create({
 
 Source: `Permission2.create` and route `POST /api/session/{sessionID}/permission` in the local declarations, plus the official V2 permissions defaults. The path must be purpose-created under the spike's temporary root. The probe must observe the real OpenCode pending request/event; a test double is not live evidence.
 
-Verified live against 1.18.33 on 2026-10-02, with no model call. `create` returned HTTP 200 with `{ id, effect: "ask" }` in about 0.8 s and **does not block** until a reply arrives. The global event stream (`client.v2.event.subscribe`) delivered `permission.v2.asked` with the same `id`, `action`, and `resources`. Permission events carry **no durable sequence** and cannot be replayed, and the SDK's SSE subscription connects on its first read. A consumer must therefore be reading before the event is published. The live probe begins reading immediately after dispatching `create`. The small remaining race was explicitly accepted (see the reassessment spec's `decisions.md`).
+Verified live against 1.18.33 on 2026-10-02, with no model call. `create` returned HTTP 200 with `{ id, effect: "ask" }` in about 0.8 s and **does not block** until a reply arrives. The global event stream (`client.v2.event.subscribe`) delivered `permission.v2.asked` with the same `id`, `action`, and `resources`. Permission events carry **no durable sequence** and cannot be replayed, and the SDK's SSE subscription connects on its first read. A consumer must therefore already be connected before the event is published. The original probe subscribed per stage and read only after dispatching `create`. That race, first accepted as a residual risk, occurred in the 2026-10-03 authoritative run and failed Permission handling. The live probe now observes `permission.v2.asked` through its **run-long event monitor**: one global subscription opened at run start and connected for the whole run. It records asked permissions for the probe's own sessions, even when they arrive before `create` returns. The permission stage waits, within the operation bound, for the recorded event with exactly the created request's ID, then replies `once`. Before any session exists, the monitor waits up to 10 s for the server's `server.connected` frame. That frame is verified live as the first frame of every v2 global subscription, arriving within milliseconds. If it does not arrive, the monitor journals `event.monitor.unconfirmed` and the run continues.
+
+QA (2026-10-03, real server, no model calls, every request answered `reject`) compared the two designs over 27 permission creates:
+
+| Design | Events observed |
+| --- | --- |
+| Pre-connected monitor (current) | 27/27 |
+| Late first read after `create` (former) | 0/27 |
+
+On a warm server, `create` returns in about 2.5 ms and the event follows about 0.1 ms later. A late reader connects 1–8 ms after `create`, by which time the event is gone.
 
 ### Interactive Questions
 
 The 1.18.33 `build` agent allows the model's `question` tool. A call raises `question.v2.asked` on the global stream (it is not a permission request) and stays `running` until answered, so an unattended session never goes idle. This caused the 2026-10-02 run's second 120 s stall.
 
 - `OPENCODE_CONFIG_CONTENT={"permission":{"question":"deny"}}` in the server process does **not** prevent the block (verified live 2026-10-03).
-- `client.v2.session.question.reject({ sessionID, requestID })` returns 204, followed by `question.v2.rejected`. The question tool call fails and the turn ends with the session idle. The live probe subscribes once to the global stream and rejects questions raised by its own sessions only. Rejecting a question is not a permission decision; `external_directory` still asks.
+- `client.v2.session.question.reject({ sessionID, requestID })` returns 204, followed by `question.v2.rejected`. The question tool call fails and the turn ends with the session idle. The live probe's run-long event monitor rejects questions raised by its own sessions only. Rejecting a question is not a permission decision; `external_directory` still asks.
 
 ### Permission Response
 
@@ -346,6 +355,78 @@ reassess the architecture and its environment dependency in a separate spec.
 Passing unit tests and `npm run verify:live:smoke` do not substitute for this
 live evidence.
 
+## Milestone 0 Live Result — 2026-10-03 authoritative PASS
+
+After the `2026-10-03-permission-event-race` fix and `Authoritative Run: GO`,
+the user authorized a fresh preflight and the authoritative run.
+
+- `npm run verify:environment`: all eight rows PASS, exit 0.
+- `npm run verify:live` (journal times UTC): exit 0, with the scenario itself
+  completing in about 5 s.
+
+| Capability | Result |
+| --- | --- |
+| Fresh session creation | PASS |
+| Project directory | PASS |
+| Local model invocation | PASS |
+| Streaming events | PASS |
+| Permission handling | PASS |
+| File modification | PASS |
+| Cancellation | PASS |
+| Session deletion | PASS |
+| Session isolation | PASS |
+
+**Capability Verdict: PASS. Milestone 0 is passed.**
+
+- Stage timings: initial prompt 3.2 s; permission 13 ms (the run-long monitor
+  had already recorded the event); cancellation 0.7 s; isolation 0.5 s.
+- The journal contains no `.failed`, `not-passed`, `not-observed`,
+  `not-completed`, `unconfirmed`, `skipped`, or `question.*` markers.
+- Cleanup was complete: no residual OpenCode server, fixture, or temporary
+  repository.
+
+Tested environment: macOS 26.7 (arm64), Node `v24.18.1`, npm `12.0.2`,
+project-local `opencode-ai@1.18.33` and `@opencode-ai/sdk@1.18.33`, model
+`ollama/qwen3-coder:30b` via the remote authenticated OpenAI-compatible
+endpoint, run from inside the user's LAN.
+
+Known limitations carried into Milestone 1:
+
+- **Server credentials.** Model-run shell commands inherit the OpenCode
+  server's credentials. They must be withheld from tool environments before
+  Quoder forwards real permission decisions (see "Environment Notes").
+- **Model nondeterminism.** QA estimated about 0.7 joint cooperation per run
+  for the scenario prompts.
+- **Version-specific contracts.** The `wait` stub, the stream shape, and the
+  question tool are specific to OpenCode 1.18.33 and must be re-verified on
+  every upgrade.
+
+## Milestone 0 Live Result — 2026-10-03 run (8 of 9)
+
+After the `2026-10-03-live-probe-reliability` fixes and a conditional
+`Authoritative Run: GO`, the user authorized a fresh preflight and the
+authoritative run.
+
+- `npm run verify:environment`: all eight rows PASS, exit 0.
+- `npm run verify:live`: exit 1 after 126 s.
+  - **8 of 9 predicates PASS**: Fresh session creation, Project directory, Local
+    model invocation, Streaming events, File modification, Cancellation, Session
+    deletion, and Session isolation.
+  - **Permission handling: FAIL.** Capability Verdict: FAIL. Milestone 0 is not
+    passed, and Milestone 1 remains blocked.
+  - Cleanup was complete, with no residual server, fixture, or temporary
+    repository.
+- Timeline: the initial prompt stage completed in 2.5 s. The `permission` stage
+  ran from 10:44:34.264Z to 10:46:34.271Z, exactly the 120 s stream bound, and
+  journaled `complete` with no `.failed` entry. `permission.create` therefore
+  succeeded, but the stage's global subscription never observed
+  `permission.v2.asked`. Cancellation and isolation then passed.
+- Classification: this is the previously **accepted permission-event
+  subscription race**, now observed. `permission.v2.asked` is not durable and
+  cannot be replayed. The SDK's SSE subscription connects lazily on its first
+  read, which happens only after `create` is dispatched. With a warm server, the
+  event was evidently published before that subscription connected.
+
 ## Milestone 0 Live Result — 2026-10-02 run
 
 After `Future Capability QA: GO`, the user authorized a fresh preflight and the
@@ -421,11 +502,11 @@ QA (2026-10-03) independently re-sampled the prompts as implemented, importing t
 The live driver now runs each stage after session creation (initial prompt, permission, cancellation, isolation) in isolation:
 
 - **Failures are journaled with a credential-safe cause.** A failed stage is journaled as `<stage>.failed.<adapter-operation>[.timeout]`, taken from the first adapter error found directly or through the `cause`/aggregated reasons of a paired-operation failure (for example `session.initial.prompt.failed.submit-prompt`). When no adapter error is involved (for example a permission-correlation mismatch), it is `<stage>.failed.error`. Error text is never journaled.
-- **Not-passed outcomes are journaled too.** A stage that completes without its evidence journals a distinct marker (`session.initial.prompt.not-completed`, `cancellation.not-passed`).
+- **Not-passed outcomes are journaled too.** A stage that completes without its evidence journals a distinct marker: `session.initial.prompt.not-completed`, `permission.not-observed.timeout`, `permission.not-observed.monitor-ended`, or `cancellation.not-passed`.
 - **The session is settled after every stage**, whether or not the stage threw: if it is still active, it is interrupted and waited to idle. Settling an idle session costs one status read.
 - **Later independent stages still run**, so a single run reports evidence for every predicate.
 - **Isolation needs the nonce.** It is skipped (`isolation.skipped`) when the first session never received the nonce.
-- **A dropped question guard is visible.** If the guard's global stream ends before the run stops it, `question.guard.ended` is journaled; later questions would then block their stage until its timeout.
+- **A dropped event monitor is visible.** If the monitor's global stream ends before the run stops it, `event.monitor.ended` is journaled. Later questions would then block their stage until its timeout, and later asked permissions would go unobserved, so Permission handling FAILs within its bound.
 
 No failure becomes a PASS:
 
@@ -455,9 +536,18 @@ instructions exactly:
 - replying `NO_PRIOR_SESSION` in the isolation session.
 
 Run `npm run verify:environment` immediately beforehand. If Permission handling
-fails with no observed `permission.v2.asked` event, investigate the accepted
-subscription race first. Re-verify the legacy-delete/Core-V2 compatibility
-bridge and the `wait`/`active` contracts whenever OpenCode is upgraded.
+fails, read the journal:
+
+- `permission.failed.<operation>` means the create or reply request failed.
+- `permission.not-observed.timeout` means the run-long monitor saw no matching
+  `permission.v2.asked` within the bound.
+- `permission.not-observed.monitor-ended` or `event.monitor.ended` means the
+  monitor's subscription dropped.
+- `event.monitor.unconfirmed` means the server never confirmed the monitor's
+  subscription.
+
+Re-verify the legacy-delete/Core-V2 compatibility bridge and the
+`wait`/`active` contracts whenever OpenCode is upgraded.
 
 ## Environment Reassessment — Group 1 Diagnosis
 

@@ -561,12 +561,23 @@ export const findAdapterError = (error: unknown, depth = 0): OpenCodeAdapterErro
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 
+export const EVENT_MONITOR_CONNECT_TIMEOUT_MS = 10_000;
+
+type PermissionObservation = "observed" | "timeout" | "monitor-ended";
+
+interface RunEventMonitor {
+  /** Settles once this session's `permission.v2.asked` for `requestID` is observed, or not. */
+  waitForPermissionAsked(sessionID: string, requestID: string, timeoutMs: number): Promise<PermissionObservation>;
+  stop(): Promise<void>;
+}
+
 export class OpenCodeLiveDriver implements LiveProbeDriver {
   readonly #adapter: OpenCodeAdapter;
   readonly #closeServer: () => Promise<void>;
   readonly #sessionIDs: string[] = [];
   readonly #deletedSessionIDs: string[] = [];
   readonly #onProgress: LiveProbeProgress;
+  readonly #operationTimeoutMs: number;
 
   constructor(
     client: OpencodeClient,
@@ -574,7 +585,8 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
     onProgress: LiveProbeProgress = () => undefined,
     options: { readonly operationTimeoutMs?: number } = {},
   ) {
-    this.#adapter = new OpenCodeAdapter({ client, timeoutMs: options.operationTimeoutMs ?? LIVE_PROBE_TIMEOUT_MS });
+    this.#operationTimeoutMs = options.operationTimeoutMs ?? LIVE_PROBE_TIMEOUT_MS;
+    this.#adapter = new OpenCodeAdapter({ client, timeoutMs: this.#operationTimeoutMs });
     this.#closeServer = closeServer;
     this.#onProgress = onProgress;
   }
@@ -588,7 +600,7 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
     let permissionRequestID: string | undefined;
     let cancellationResult = false;
     let isolationResponse = "";
-    const questionGuard = await this.#startQuestionGuard();
+    const eventMonitor = await this.#startEventMonitor();
     try {
       // Every later stage needs the first session, so a creation failure ends the scenario.
       this.#onProgress("session.initial.create.start");
@@ -637,7 +649,7 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
       await this.#settleSession(first.id);
 
       await this.#stage("permission", async () => {
-        permissionRequestID = await this.#exercisePermission(first.id, environment.outside);
+        permissionRequestID = await this.#exercisePermission(eventMonitor, first.id, environment.outside);
       });
       await this.#settleSession(first.id);
 
@@ -669,7 +681,7 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
         });
       }
     } finally {
-      await questionGuard.stop();
+      await eventMonitor.stop();
       this.#onProgress("sessions.cleanup.start");
       for (const sessionID of [...this.#sessionIDs].reverse()) {
         if (this.#deletedSessionIDs.includes(sessionID)) continue;
@@ -737,85 +749,124 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
   }
 
   /**
-   * The 1.18.33 `build` agent allows the interactive `question` tool, which blocks until answered
-   * and is not a permission request. Unattended scenario sessions reject every question they raise
-   * (verified live on 2026-10-03); this is not a permission decision.
+   * One global subscription, opened at run start and connected for the whole run, observes the
+   * probe's own sessions:
+   * - The 1.18.33 `build` agent allows the interactive `question` tool, which blocks until
+   *   answered and is not a permission request. Unattended scenario sessions reject every question
+   *   they raise (verified live on 2026-10-03); this is not a permission decision.
+   * - `permission.v2.asked` is not durable and a late subscriber misses it (observed in the
+   *   2026-10-03 authoritative run), so asked permissions are recorded here, before any request
+   *   exists, and the permission stage waits on the record.
    */
-  async #startQuestionGuard(): Promise<{ stop(): Promise<void> }> {
+  async #startEventMonitor(): Promise<RunEventMonitor> {
     const controller = new AbortController();
     const stream = await this.#adapter.globalEvents({
       timeoutMs: LIVE_PROBE_RUN_TIMEOUT_MS,
       signal: controller.signal,
     });
-    const guard = (async () => {
+    const askedPermissions = new Set<string>();
+    const waiters = new Set<() => void>();
+    const pendingRejections = new Set<Promise<void>>();
+    let ended = false;
+    let confirmConnected: () => void = () => undefined;
+    const connected = new Promise<void>((resolveConnected) => {
+      confirmConnected = resolveConnected;
+    });
+    const permissionKey = (sessionID: string, requestID: string): string => `${sessionID}\u0000${requestID}`;
+    const monitor = (async () => {
       for await (const event of stream) {
-        if (event.type !== "question.v2.asked") continue;
+        // The 1.18.33 server sends `server.connected` first, once the subscription is registered.
+        if (event.type === "server.connected") {
+          confirmConnected();
+          continue;
+        }
+        if (event.type !== "question.v2.asked" && event.type !== "permission.v2.asked") continue;
         const sessionID = eventSessionID(event);
         const requestID = Reflect.get(event.data, "id");
         if (sessionID === undefined || typeof requestID !== "string") continue;
         if (!this.#sessionIDs.includes(sessionID)) continue;
+        if (event.type === "permission.v2.asked") {
+          askedPermissions.add(permissionKey(sessionID, requestID));
+          for (const wake of waiters) wake();
+          continue;
+        }
+        // Rejections run concurrently so a slow one cannot delay recording a permission event.
         this.#onProgress("question.rejected");
-        await this.#adapter.rejectQuestion(sessionID, requestID).catch(() => {
+        const rejection = this.#adapter.rejectQuestion(sessionID, requestID).catch(() => {
           this.#onProgress("question.reject.failed");
         });
+        pendingRejections.add(rejection);
+        void rejection.finally(() => pendingRejections.delete(rejection));
       }
     })()
       .catch(() => undefined)
       .finally(() => {
-        // Without a guard, a later question would block its stage until that stage's timeout.
-        if (!controller.signal.aborted) this.#onProgress("question.guard.ended");
+        ended = true;
+        confirmConnected();
+        for (const wake of waiters) wake();
+        // Without the monitor, later questions block and asked permissions go unobserved.
+        if (!controller.signal.aborted) this.#onProgress("event.monitor.ended");
       });
+    // The SDK connects lazily on the first read, which the loop above has already issued; waiting
+    // for the server's confirmation makes the subscription provably live before any request exists.
+    let connectTimer: NodeJS.Timeout | undefined;
+    const confirmed = await Promise.race([
+      connected.then(() => !ended),
+      new Promise<boolean>((resolveTimeout) => {
+        connectTimer = setTimeout(() => resolveTimeout(false), EVENT_MONITOR_CONNECT_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(connectTimer);
+    if (!confirmed) this.#onProgress("event.monitor.unconfirmed");
     return {
+      waitForPermissionAsked: (sessionID, requestID, timeoutMs) => {
+        const key = permissionKey(sessionID, requestID);
+        if (askedPermissions.has(key)) return Promise.resolve("observed");
+        if (ended) return Promise.resolve("monitor-ended");
+        return new Promise<PermissionObservation>((resolveObservation) => {
+          const finish = (observation: PermissionObservation) => {
+            clearTimeout(timer);
+            waiters.delete(wake);
+            resolveObservation(observation);
+          };
+          const wake = () => {
+            if (askedPermissions.has(key)) finish("observed");
+            else if (ended) finish("monitor-ended");
+          };
+          const timer = setTimeout(() => finish("timeout"), timeoutMs);
+          waiters.add(wake);
+        });
+      },
       stop: async () => {
         controller.abort();
-        await guard;
+        await monitor;
+        await Promise.allSettled([...pendingRejections]);
       },
     };
   }
 
-  async #exercisePermission(sessionID: string, outside: string): Promise<string | undefined> {
-    const stream = await this.#adapter.globalEvents();
-    const request = this.#adapter
-      .createPermission({
-        sessionID,
-        action: "external_directory",
-        resources: [outside],
-        agent: "build",
-      })
-      .then((created) => {
-        correlatePermissionEvidence({ id: created.id }, created);
-        return created;
-      });
-    const pendingEvent = this.#findPermissionEvent(stream, sessionID, request);
-    const [event, created] = await settlePairedOperations(
-      "permission event observation",
-      pendingEvent,
-      "permission request",
-      request,
-    );
-    if (event === undefined) return undefined;
-    const requestID = correlatePermissionEvidence(event, created);
-    await this.#adapter.replyPermission(sessionID, requestID, "once");
-    return requestID;
-  }
-
-  async #findPermissionEvent(
-    stream: AsyncGenerator<V2Event, void, unknown>,
+  async #exercisePermission(
+    monitor: RunEventMonitor,
     sessionID: string,
-    createdRequest: Promise<{ id: string; effect: string }>,
-  ): Promise<{ id: string } | undefined> {
-    try {
-      for await (const event of stream) {
-        if (event.type === "permission.v2.asked" && event.data.sessionID === sessionID) {
-          const created = await createdRequest;
-          if (event.data.id !== created.id) continue;
-          return { id: event.data.id };
-        }
-      }
+    outside: string,
+  ): Promise<string | undefined> {
+    const created = await this.#adapter.createPermission({
+      sessionID,
+      action: "external_directory",
+      resources: [outside],
+      agent: "build",
+    });
+    // Rejects anything but a real pending `ask`.
+    correlatePermissionEvidence({ id: created.id }, created);
+    // The event may have been recorded before `create` returned; only this session's event with
+    // exactly the created request ID is accepted.
+    const observation = await monitor.waitForPermissionAsked(sessionID, created.id, this.#operationTimeoutMs);
+    if (observation !== "observed") {
+      this.#onProgress(`permission.not-observed.${observation}`);
       return undefined;
-    } finally {
-      await stream.return(undefined);
     }
+    await this.#adapter.replyPermission(sessionID, created.id, "once");
+    return created.id;
   }
 
   async #exerciseCancellation(sessionID: string, repository: string): Promise<boolean> {
