@@ -48,12 +48,11 @@ describe("local model invocation", () => {
 });
 
 describe("probe event classification", () => {
-  it("recognizes structured execution, permission, fixture-start, idle, and completion events", () => {
+  it("recognizes structured execution, permission, fixture-start, and completion events", () => {
     expect(classifyEvent(event(1, "tool.started"))).toMatchObject({ structuredExecution: true });
     expect(classifyEvent(event(2, "permission.v2.asked"))).toMatchObject({ permissionRequest: true });
     expect(classifyEvent(event(3, "permission.asked"))).toMatchObject({ permissionRequest: false });
     expect(classifyEvent(event(3, "fixture.started"))).toMatchObject({ fixtureStarted: true });
-    expect(classifyEvent(event(4, "session.idle"))).toMatchObject({ terminalIdle: true });
     expect(classifyEvent(event(5, "fixture.completed"))).toMatchObject({ normalCompletion: true });
   });
 
@@ -62,7 +61,6 @@ describe("probe event classification", () => {
       structuredExecution: false,
       permissionRequest: false,
       fixtureStarted: false,
-      terminalIdle: false,
       normalCompletion: false,
     });
   });
@@ -130,24 +128,24 @@ describe("permission evidence", () => {
 });
 
 describe("cancellation evidence", () => {
-  it("passes after start, interrupt, terminal idle, process termination, and no late completion", () => {
+  it("passes after start, interrupt, interrupted-tool terminal event, process termination, and no late completion", () => {
     expect(
       cancellationPassed({
         fixtureStartedAtSequence: 2,
         interruptRequestedAtSequence: 3,
-        terminalIdleAtSequence: 5,
+        terminalAtSequence: 5,
         fixtureTerminated: true,
-        events: [event(2, "fixture.started"), event(5, "session.idle")],
+        events: [event(2, "session.next.tool.called"), event(5, "session.next.tool.failed")],
       }),
     ).toBe(true);
   });
 
-  it("fails without an observed start, terminal idle, or terminated fixture", () => {
+  it("fails without an observed start, terminal event, or terminated fixture", () => {
     expect(
       cancellationPassed({
         fixtureStartedAtSequence: 0,
         interruptRequestedAtSequence: 3,
-        terminalIdleAtSequence: 0,
+        terminalAtSequence: 0,
         fixtureTerminated: false,
         events: [],
       }),
@@ -159,9 +157,13 @@ describe("cancellation evidence", () => {
       cancellationPassed({
         fixtureStartedAtSequence: 2,
         interruptRequestedAtSequence: 3,
-        terminalIdleAtSequence: 5,
+        terminalAtSequence: 5,
         fixtureTerminated: true,
-        events: [event(2, "fixture.started"), event(4, "fixture.completed"), event(5, "session.idle")],
+        events: [
+          event(2, "session.next.tool.called"),
+          event(4, "fixture.completed"),
+          event(5, "session.next.tool.failed"),
+        ],
       }),
     ).toBe(false);
   });

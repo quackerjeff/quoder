@@ -9,7 +9,7 @@ Keep this file concise, factual, and current.
 - Repository name: `quoder`
 - Service or application name: Quoder (working product name; PRD title: OpenCode Stateless Harness)
 - Primary language(s): TypeScript (proposed by the PRD's feasibility milestone)
-- Primary framework(s): OpenCode SDK/API; exact package and version require verification
+- Primary framework(s): OpenCode SDK/API (`@opencode-ai/sdk@1.18.33`, Core V2) with project-local `opencode-ai@1.18.33`, pinned exactly
 - Deployable unit: Local command-line/TUI application
 
 ## Business Capability
@@ -41,11 +41,12 @@ Systems this repo depends on:
 
 - OpenCode SDK/API
   - purpose: Create, drive, observe, cancel, and delete isolated OpenCode sessions
-  - contract location: To be verified and recorded in `docs/tech.md`
+  - contract location: `docs/tech.md` (verified for 1.18.33; some generated Core V2 operations, such as `session.wait`, are server-side stubs in that version)
   - failure impact: Quoder cannot execute developer prompts
-- Ollama and an OpenCode-configured local model
-  - purpose: Local LLM inference used by OpenCode
-  - contract location: Developer's local OpenCode/Ollama configuration
+- An OpenCode-configured model provider
+  - purpose: LLM inference used by OpenCode
+  - current topology: provider `ollama` via `@ai-sdk/openai-compatible`, backed by a remote, authenticated HTTPS OpenAI-compatible endpoint (not localhost Ollama); feasibility runs bind `ollama/qwen3-coder:30b` explicitly
+  - contract location: Developer's user-level OpenCode configuration; readiness is checked by `npm run verify:environment`
   - failure impact: OpenCode sessions cannot complete model work
 - Git
   - purpose: Resolve project identity and capture repository state before and after executions
@@ -65,7 +66,7 @@ Systems or teams that depend on this repo:
 Source-of-truth contracts for this repo:
 
 - Product requirements: `docs/requirements.md`
-- Verified OpenCode integration patterns: `docs/tech.md` (not yet researched)
+- Verified OpenCode integration patterns: `docs/tech.md`
 - Harness state and execution-record schemas: not yet designed
 
 Rules:
@@ -96,7 +97,8 @@ Deployment notes:
 ## Operational Risks
 
 Known failure modes or sensitive areas:
-- Required OpenCode SDK capabilities and version-specific contracts are not yet verified.
+- OpenCode Core V2 contracts are verified only for the pinned 1.18.33. The full nine-capability feasibility still awaits an authoritative, user-authorized `npm run verify:live`.
+- In 1.18.33, model-run shell commands inherit the OpenCode server's credentials. They must be withheld before Quoder forwards real permission decisions (Milestone 1).
 - Session cleanup failures could retain unwanted model context or orphan resources.
 - Permission forwarding errors could weaken user control or block valid work.
 - Crashes or non-atomic state writes could corrupt harness history or preferences.

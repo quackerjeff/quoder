@@ -139,6 +139,8 @@ client.v2.session.permission.create({
 
 Source: `Permission2.create` and route `POST /api/session/{sessionID}/permission` in the local declarations, plus the official V2 permissions defaults. The path must be purpose-created under the spike's temporary root. The probe must observe the real OpenCode pending request/event; a test double is not live evidence.
 
+Verified live against 1.18.33 on 2026-10-02, with no model call. `create` returned HTTP 200 with `{ id, effect: "ask" }` in about 0.8 s and **does not block** until a reply arrives. The global event stream (`client.v2.event.subscribe`) delivered `permission.v2.asked` with the same `id`, `action`, and `resources`. Permission events carry **no durable sequence** and cannot be replayed, and the SDK's SSE subscription connects on its first read. A consumer must therefore be reading before the event is published. The live probe begins reading immediately after dispatching `create`. The small remaining race was explicitly accepted (see the reassessment spec's `decisions.md`).
+
 ### Permission Response
 
 ```ts
@@ -152,7 +154,7 @@ client.v2.session.permission.reply({
 
 Wire contract: `POST /api/session/{sessionID}/permission/{requestID}/reply`, returning HTTP 204.
 
-Sources: `Permission2.reply` and `V2SessionPermissionReplyData`/responses in the local declarations. Use one-time approval; do not persist an `always` rule.
+Sources: `Permission2.reply` and `V2SessionPermissionReplyData`/responses in the local declarations. Use one-time approval; do not persist an `always` rule. Verified live on 2026-10-02: `reply: "once"` returned HTTP 204, followed by a `permission.v2.replied` event (`reply=once`).
 
 ### Cancellation
 
@@ -164,26 +166,32 @@ client.v2.session.interrupt({ sessionID: string });
 
 Wire contract: `POST /api/session/{sessionID}/interrupt`. It interrupts execution owned by the current OpenCode process; idle interruption is a no-op.
 
-Version-specific ordering and pass predicate:
+Version-specific ordering and pass predicate, verified live against 1.18.33 on 2026-10-02:
 
-1. Observe a durable event proving the long-running fixture started.
+1. Observe the durable `session.next.tool.called` event whose `tool` is `bash` and whose `input.command` contains the fixture's random token; record its `callID`. The fixture's PID file confirms the process started. OpenCode 1.18.33 emits no `session.next.shell.started` event for model-run commands, and the bash call did not raise a permission request under the default policy.
 2. Call `client.v2.session.interrupt({ sessionID })` and require success.
-3. Call `client.v2.session.wait({ sessionID })`; it waits for idle and returns HTTP 204.
-4. Confirm no normal successful fixture-completion event occurs after interruption and the fixture process is gone.
+3. Observe the durable `session.next.tool.failed` event for the same `callID` after the interrupt (live error: `Tool execution interrupted`). `session.next.step.ended` was observed next, but it is not required. Durable sequences are dense per session, and the interrupt request is not an event, so it is placed strictly between the last durable event read before it and the next one. A `tool.failed` at N+1 directly after the fixture's `tool.called` at N is therefore post-interrupt. Its `timestamp` must not precede the local interrupt request, because events queued before the interrupt can be read after it. Then confirm idle by polling `GET /api/session/active` until the session is no longer listed. No `session.idle` event is emitted. Read the start and terminal events from one global stream with explicit `next()` calls: leaving a `for await` loop early closes the stream.
+4. Confirm the fixture process is gone (OpenCode terminated it), that no `session.next.tool.success` exists for that `callID`, and that no fixture-completion marker exists.
 
-Sources: `Session3.interrupt`, `Session3.wait`, and corresponding generated wire types. The declarations do not promise a distinct terminal `cancelled` event, so tests must not invent one.
+Sources: `Session3.interrupt`, `Session3.active`, the corresponding generated wire types, and the 2026-10-02 bounded live diagnostic recorded in the reassessment spec's `decisions.md`. The declarations do not promise a distinct terminal `cancelled` event, so tests must not invent one.
 
 ### Final Result
 
 Core V2 separates admission from completion:
 
 - `client.v2.session.prompt(...)` returns `SessionInputAdmitted`.
-- `client.v2.session.wait(...)` waits for idle.
-- `client.v2.session.messages(...)` retrieves projected messages.
+- `client.v2.session.active()` (`GET /api/session/active`) returns a map keyed by the IDs of running sessions (`{ type: "running" }`).
+- `client.v2.session.messages({ sessionID, order: "asc" })` retrieves projected messages oldest-first. **The default order is newest-first**, so correlation must request `asc`.
 - `client.v2.session.message(...)` retrieves one projected message.
-- `client.v2.session.history(...)` and `.events(...)` provide durable evidence.
+- `client.v2.session.history(...)` and `.events(...)` provide durable evidence. Streaming `session.next.text.delta` events carry no durable sequence.
 
-Sources: the corresponding `Session3` signatures and V2 wire types in the local declarations. The final result is the final projected assistant message after `wait`, correlated to the admitted input. Prompt admission alone is not success.
+**`client.v2.session.wait(...)` is not implemented in 1.18.33.** It is generated in the SDK, but the bundled server handler looks up the session and then always fails with `Session.OperationUnavailableError({ operation: "wait" })`, returned as HTTP 503 `ServiceUnavailableError` "Session wait is not available yet". `compact`, `shell`, and `skill` are stubbed the same way. Do not call `wait`.
+
+Verified completion contract (live, 2026-10-02): after admission the session appears in `active` at once and emits durable `session.next.prompted`, `session.next.step.started`, `session.next.text.started`, `session.next.text.ended`, and `session.next.step.ended`, with tool events between steps. The session stays listed between steps and leaves `active` when the run finishes. `OpenCodeAdapter.waitUntilIdle` polls `active` within its finite deadline. For a prompt it also requires an assistant message after the admitted input in the ascending list, so a run that has not yet been scheduled cannot be mistaken for completion. In the 1.18.33 bundle, admission synchronously registers the run before the HTTP response, and the session stays registered until every step drains.
+
+OpenCode 1.18.33 appends **one assistant message per model step**. When a step starts, the projector completes the previous assistant message and appends a new one. A turn that uses tools therefore holds several assistant messages, for example a tool-call step followed by a final text step. The final result is the turn's **last** assistant message: after the admitted input and before the next user input in the ascending list, with `time.completed` set (`finalAssistantResponseText`). Earlier step messages are intermediate and never the result. Prompt admission alone is not success.
+
+Sources: the corresponding `Session3` signatures and V2 wire types in the local declarations, inspection of the 1.18.33 server bundle, and the bounded live diagnostics recorded in the reassessment spec's `decisions.md`. Re-verify on every OpenCode upgrade, and switch to a native `wait` when one is implemented.
 
 ### Session Deletion — Verified Compatibility Bridge
 
@@ -245,7 +253,8 @@ Runtime dependencies are pinned exactly in `package.json`: `@opencode-ai/sdk@1.1
 ## Environment Notes
 
 - Local CLI invocation: `npx --no-install opencode`.
-- The user-level OpenCode config has no explicit permission policy. Official Core V2 defaults are the documented basis for the `external_directory` ask trigger; live verification is still required.
+- The user-level OpenCode config has no explicit permission policy. Under it, the `external_directory` trigger returned `effect: "ask"` live on 2026-10-02. A model-run `bash` command and the `glob` tool executed without a permission request.
+- **Known limitation for Milestone 1:** in 1.18.33, OpenCode's shell tool inherits the server process environment, so model-run commands can read `OPENCODE_SERVER_PASSWORD` and call the local authenticated server API, including permission replies. The feasibility probe gains no privilege from this, because it already grants `bash` and answers its own request. Before Quoder forwards real user permission decisions, it must keep server credentials out of tool environments, for example with a `shell.env` plugin hook or an upstream fix.
 - The provider configuration contains an inline authorization credential. It is not reproduced here. Rotate it and move it to an environment/secret mechanism before capturing live probe logs.
 - A sandbox may require localhost-bind permission and writable XDG data/state directories; that is an execution-environment concern, not an OpenCode API limitation.
 
@@ -270,13 +279,190 @@ On deadline expiry, the verifier records `stage.run.timeout`, closes any availab
 attempts normal disposable-environment cleanup, prints a conservative nine-capability FAIL
 report, and exits nonzero.
 
-## Open Verification Items
+## Milestone 0 Live Result
 
-1. Confirm exact `LocationRef` construction by TypeScript compilation.
-2. Confirm the one-time `PermissionV2Reply` literal through compilation.
-3. Confirm V2 event union and cursor handling through compiled tests.
-4. Execute the permission trigger against the real server without changing saved policy.
-5. Re-verify the legacy-delete/Core-V2 compatibility bridge whenever OpenCode is upgraded.
+QA Cycle 2 ran the authoritative `npm run verify:live` command on 2026-09-30
+with the following environment:
+
+| Component | Tested value |
+| --- | --- |
+| Platform | macOS 26.7 (Build 25G229), arm64 |
+| Node | `v24.18.1` |
+| npm | `12.0.2` |
+| OpenCode CLI | project-local `opencode-ai@1.18.33` |
+| OpenCode SDK | project-local `@opencode-ai/sdk@1.18.33` |
+| Ollama service | Unavailable immediately before the run |
+
+The command exited `1` after 120.9 seconds. It created the disposable
+environment, launched and authenticated the project-local OpenCode server, and
+created the first Core V2 session. The initial prompt did not complete before
+its 120-second operation timeout. The journal then recorded session cleanup,
+driver close, environment removal, and the nonzero process exit. Post-run
+inspection found no residual verifier, OpenCode server, cancellation fixture,
+or generated temporary repository.
+
+Authoritative command:
+
+```bash
+npm run verify:live
+```
+
+Observed capability matrix:
+
+| Capability | Result | Evidence limitation |
+| --- | --- | --- |
+| Fresh session creation | FAIL | One Core V2 session was created; the second unique session was not reached. |
+| Project directory | FAIL | No completed model file activity proved repository confinement. |
+| Local model invocation | FAIL | The initial prompt timed out while the Ollama service was unavailable. |
+| Streaming events | FAIL | No qualifying structured execution event was observed before timeout. |
+| Permission handling | FAIL | The Core V2 permission request/reply stage was not reached. |
+| File modification | FAIL | No verified `hello.txt` containing `Hello from OpenCode` was produced. |
+| Cancellation | FAIL | Fixture start, interrupt, idle, termination, and no-late-completion validation were not reached. |
+| Session deletion | FAIL | Cleanup completed, but normal deletion of both required sessions plus Core V2 404 checks was not proven. |
+| Session isolation | FAIL | The second session and exact `NO_PRIOR_SESSION` exchange were not reached. |
+
+**Capability Verdict: FAIL.** The nine predicates are conjunctive and remain
+failed when their complete live evidence is absent. Most predicates were not
+reached; this result must not be interpreted as proof that their underlying SDK
+operations inherently fail.
+
+**QA Verdict: PASS.** The validation mechanism ran reliably, terminated in
+finite time, retained an auditable stage record, emitted the complete matrix,
+and cleaned up. This validates the quality of the negative result, not the
+feasibility of Quoder's disposable-session architecture.
+
+Milestone 0 did not pass and Milestone 1 remains blocked. Before another live
+feasibility attempt, restore and preflight the required Ollama/model service or
+reassess the architecture and its environment dependency in a separate spec.
+Passing unit tests and `npm run verify:live:smoke` do not substitute for this
+live evidence.
+
+## Remaining Live Verification Items
+
+The environment reassessment (2026-10-02) verified each underlying mechanism
+live against the pinned 1.18.33 server, in bounded scratch diagnostics:
+
+- model completion through `session/active`, and ascending final-response
+  correlation;
+- the permission create/asked/reply round-trip;
+- the interrupted-tool cancellation sequence;
+- session deletion during cleanup.
+
+None of these is capability evidence. All nine predicates above still have to
+pass together in one explicitly authorized `npm run verify:live` run against
+the configured model. That run additionally depends on the model following
+instructions exactly:
+
+- writing `hello.txt` and replying `TOKEN_STORED`;
+- running the fixture once, in the foreground;
+- replying `NO_PRIOR_SESSION` in the isolation session.
+
+Run `npm run verify:environment` immediately beforehand. If Permission handling
+fails with no observed `permission.v2.asked` event, investigate the accepted
+subscription race first. Re-verify the legacy-delete/Core-V2 compatibility
+bridge and the `wait`/`active` contracts whenever OpenCode is upgraded.
+
+## Environment Reassessment — Group 1 Diagnosis
+
+Collected on 2026-09-30 (completed at `2026-09-30T23:10:43Z`) without changing
+the service, models, user configuration, or pinned packages.
+
+The active OpenCode configuration defines provider `ollama` through
+`@ai-sdk/openai-compatible`, using a remote HTTPS OpenAI-compatible endpoint at
+`llm.quackerjack.com/v1`. Authorization is supplied by an inline header; its
+value was neither printed nor persisted. The provider declares six models,
+including `qwen3-coder:30b`. Historical OpenCode state also identifies
+`ollama/qwen3-coder:30b` as a previously selected model. Endpoint ownership and
+the product's eventual default model remain decisions for Group 2; this group
+tested the currently configured provider and model without treating localhost
+Ollama availability as authoritative.
+
+| Layer | Bound | Exit | Result | Evidence |
+| --- | --- | --- | --- | --- |
+| Versions | Command completion | 0 | PASS | Node `v24.18.1`, npm `12.0.2`, Ollama client `0.34.0`, `opencode-ai@1.18.33`, and `@opencode-ai/sdk@1.18.33`. The local Ollama client reported no localhost service, but localhost is not the configured provider endpoint. |
+| Remote endpoint and model discovery | 10 seconds | 0 | PASS | Authenticated `GET /v1/models` returned HTTP 200 in 295 ms, reported seven models, and included `qwen3-coder:30b`. |
+| Direct inference | 45 seconds | 0 | PASS | Authenticated `POST /v1/chat/completions` using `qwen3-coder:30b` returned HTTP 200 and exact `ENVIRONMENT_READY` in 16,370 ms. An earlier attempt was excluded as inconclusive because its command wrapper stopped capturing before the request's own deadline. |
+| Project-local OpenCode discovery | Command completion | 0 | PASS | `npx --no-install opencode models ollama --pure` listed the configured models, including `ollama/qwen3-coder:30b`. |
+| Project-local OpenCode inference | 45 seconds per adapter operation | 1 | FAIL | An authenticated disposable OpenCode server created a Core V2 session explicitly targeting `ollama/qwen3-coder:30b` and admitted the sentinel prompt, but `session.wait` returned HTTP 503 `ServiceUnavailableError`; total time was 1,548 ms. |
+| Cleanup | Bounded adapter deletion and synchronous server close | 0 | PASS | The diagnostic deleted the session through the verified compatibility bridge, closed the server, removed the disposable repository, and completed cleanup in 1,679 ms. A post-run process check found no matching OpenCode server or diagnostic process. |
+
+The first explicit-model attempt used the invalid field name `modelID` instead
+of the verified Core V2 `ModelRef.id`; it failed session validation in 670 ms,
+cleaned up in 676 ms, and is excluded from provider compatibility evidence.
+
+Group 1/2 taxonomy classification (**superseded on 2026-10-02**, see "Reassessment
+Outcome" below): **Integration incompatibility**. Equivalent
+direct inference succeeds while the pinned project-local OpenCode integration
+fails. This classification does not yet distinguish an OpenCode/provider
+configuration mismatch from a defect or version incompatibility inside the
+pinned integration boundary; Group 2 must make that architectural distinction.
+The result is `Future Capability QA: NO-GO` until a reviewed correction and
+deterministic preflight pass. No Milestone 0 capability changed to PASS.
+
+Group 2 repeated the explicit-model OpenCode check in the unrestricted target
+environment, ruling out sandbox networking as the cause: `session.wait` again
+returned HTTP 503 in 1,775 ms and cleanup completed in 1,884 ms. A one-second
+runner-registration delay produced the same 503 in 2,396 ms. A separate
+30-second correlated-message poll observed no assistant response and cleaned up
+in 31,864 ms. Explicit model binding is therefore necessary to eliminate the
+prior ambient-default mismatch but is not sufficient to make the pinned
+integration ready.
+
+The approved smallest reversible correction is to bind model-executing sessions
+to `{ providerID: "ollama", id: "qwen3-coder:30b" }` and add the layered
+`npm run verify:environment` preflight. User provider configuration and exact
+package pins remain unchanged because direct inference passes and no alternate
+package version has verified compatibility evidence. Security review applies.
+
+### Environment Preflight Implementation
+
+Group 3 added `npm run verify:environment`. It reads only the approved provider
+shape, validates both declared and installed OpenCode `1.18.33` pins, performs
+bounded discovery and sentinel inference, launches an authenticated disposable
+OpenCode server, and always emits these eight credential-safe rows in order:
+
+1. `Pinned dependencies`
+2. `Provider configuration`
+3. `Endpoint reachability`
+4. `Model discovery`
+5. `Direct inference`
+6. `OpenCode model discovery`
+7. `OpenCode inference`
+8. `Cleanup`
+
+The command uses 10-second discovery deadlines, 60-second inference deadlines,
+and a 180-second whole-run deadline. It exits zero only when all rows pass and
+prints exactly one `Environment Readiness: PASS|FAIL` verdict. Diagnostics use
+fixed evidence text; raw configuration, authorization values, model content,
+and server diagnostics are not rendered.
+
+The target-environment verification on 2026-09-30 produced PASS for every row
+except `OpenCode inference`, so the command exited 1 with
+`Environment Readiness: FAIL`.
+
+### Reassessment Outcome
+
+On 2026-10-02 the `OpenCode inference` failure was traced to Quoder's use of
+Core V2, not to the provider, the model, or OpenCode's execution:
+
+- `session.wait` is an unconditional 503 stub in 1.18.33. See "Final Result"
+  for the bundle evidence and the replacement completion contract.
+- The earlier 30-second poll most likely missed the reply because messages
+  default to newest-first.
+- Model execution itself completed in about 2 s.
+
+After the corrections, the authenticated disposable OpenCode run returns the
+exact sentinel. The real preflight passed all eight rows with exit 0 on every
+run on 2026-10-02: QA Cycle 1 recorded 5 of 5 runs at about 5 s each, with no
+residue. Seven synthetic failure-path runs used temporary configurations, each
+exited 1 with the correct failing row, and all output was structurally free of
+credentials.
+
+The general review (Cycle 7), the security review (Cycle 1), and QA (Cycle 1)
+all passed. The recommendation is **`Future Capability QA: GO`**. This does not
+pass Milestone 0, does not authorize Milestone 1, and does not authorize
+`npm run verify:live`, which requires explicit user authorization. The
+capability verdict above remains FAIL until that run.
 
 ## Group 1 Verification Checklist
 

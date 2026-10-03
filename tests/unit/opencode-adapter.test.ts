@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   OpenCodeAdapter,
   OpenCodeAdapterError,
+  finalAssistantResponseText,
+  hasAssistantResponseAfter,
 } from "../../src/opencode-adapter.js";
 
 type ClientMethod = (...args: never[]) => unknown;
@@ -30,7 +32,7 @@ interface FakeMethods {
   createPermission: ReturnType<typeof vi.fn>;
   replyPermission: ReturnType<typeof vi.fn>;
   interrupt: ReturnType<typeof vi.fn>;
-  wait: ReturnType<typeof vi.fn>;
+  active: ReturnType<typeof vi.fn>;
   messages: ReturnType<typeof vi.fn>;
   get: ReturnType<typeof vi.fn>;
   globalEvents: ReturnType<typeof vi.fn>;
@@ -45,7 +47,7 @@ const fakeClient = (): { client: OpencodeClient; methods: FakeMethods } => {
     createPermission: vi.fn(),
     replyPermission: vi.fn(),
     interrupt: vi.fn(),
-    wait: vi.fn(),
+    active: vi.fn(),
     messages: vi.fn(),
     get: vi.fn(),
     globalEvents: vi.fn(),
@@ -67,7 +69,7 @@ const fakeClient = (): { client: OpencodeClient; methods: FakeMethods } => {
           >,
         },
         interrupt: methods.interrupt as Method<OpencodeClient["v2"]["session"]["interrupt"]>,
-        wait: methods.wait as Method<OpencodeClient["v2"]["session"]["wait"]>,
+        active: methods.active as Method<OpencodeClient["v2"]["session"]["active"]>,
         messages: methods.messages as Method<OpencodeClient["v2"]["session"]["messages"]>,
         get: methods.get as Method<OpencodeClient["v2"]["session"]["get"]>,
       },
@@ -296,5 +298,189 @@ describe("version-scoped session deletion bridge", () => {
         message: "Core V2 lookup did not confirm deletion",
       },
     });
+  });
+});
+
+describe("Core V2 completion without the unimplemented 1.18.33 session.wait", () => {
+  const transcript = (...messages: unknown[]) => result({ data: messages, cursor: {} });
+  const user = (id: string) => ({ id, type: "user", time: { created: 1 }, text: "prompt" });
+  const assistant = (id: string) => ({
+    id,
+    type: "assistant",
+    time: { created: 2 },
+    agent: "build",
+    model: { providerID: "ollama", id: "model" },
+    content: [{ type: "text", id: `${id}-text`, text: "done" }],
+  });
+  const running = (sessionID: string) => result({ data: { [sessionID]: { type: "running" } } });
+  const idle = () => result({ data: {} });
+
+  it("requests messages in ascending order", async () => {
+    const { client, methods } = fakeClient();
+    methods.messages.mockResolvedValue(transcript());
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await adapter.messages("session-1");
+
+    expect(methods.messages).toHaveBeenCalledWith(
+      { sessionID: "session-1", order: "asc" },
+      { signal: expect.any(AbortSignal) },
+    );
+  });
+
+  it("never calls session.wait and completes once the session leaves the active set", async () => {
+    const { client, methods } = fakeClient();
+    methods.active
+      .mockResolvedValueOnce(running("session-1"))
+      .mockResolvedValueOnce(running("session-1"))
+      .mockResolvedValue(idle());
+    methods.messages.mockResolvedValue(transcript(user("input-1"), assistant("assistant-1")));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 1_000, idlePollIntervalMs: 1 });
+
+    await expect(adapter.waitUntilIdle("session-1", { afterInputID: "input-1" })).resolves.toBeUndefined();
+
+    expect(methods.active).toHaveBeenCalledTimes(3);
+    expect(methods.active).toHaveBeenCalledWith({ signal: expect.any(AbortSignal) });
+    expect(Reflect.get(client.v2.session, "wait")).toBeUndefined();
+  });
+
+  it("ignores other running sessions", async () => {
+    const { client, methods } = fakeClient();
+    methods.active.mockResolvedValue(running("session-other"));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100, idlePollIntervalMs: 1 });
+
+    await expect(adapter.waitUntilIdle("session-1")).resolves.toBeUndefined();
+  });
+
+  it("does not treat an inactive session without a response to the admitted input as complete", async () => {
+    vi.useFakeTimers();
+    const { client, methods } = fakeClient();
+    methods.active.mockResolvedValue(idle());
+    methods.messages
+      .mockResolvedValueOnce(transcript(user("input-1")))
+      .mockResolvedValueOnce(transcript(user("input-1"), assistant("assistant-old"), user("input-2")))
+      .mockResolvedValue(transcript(user("input-1"), assistant("assistant-1")));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 1_000, idlePollIntervalMs: 10 });
+
+    const completion = adapter.waitUntilIdle("session-1", { afterInputID: "input-2" });
+    const outcome = completion.then(() => "resolved", (error: Error) => error);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(outcome).resolves.toMatchObject({
+      diagnostic: { operation: "wait for session", message: "timed out after 1000ms" },
+    });
+  });
+
+  it("fails finitely when the session is still running at the deadline", async () => {
+    vi.useFakeTimers();
+    const { client, methods } = fakeClient();
+    methods.active.mockResolvedValue(running("session-1"));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100, idlePollIntervalMs: 10 });
+
+    const outcome = adapter.waitUntilIdle("session-1").then(() => "resolved", (error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+
+    const error = await outcome;
+    expect(error).toBeInstanceOf(OpenCodeAdapterError);
+    expect(error).toMatchObject({ diagnostic: { operation: "wait for session" } });
+    expect(methods.active.mock.calls.length).toBeGreaterThan(1);
+    expect(methods.messages).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a failed active-session request with its diagnostic", async () => {
+    const { client, methods } = fakeClient();
+    methods.active.mockResolvedValue(failedResult({ _tag: "UnauthorizedError", message: "denied" }, 401));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100, idlePollIntervalMs: 1 });
+
+    await expect(adapter.waitUntilIdle("session-1")).rejects.toMatchObject({
+      diagnostic: { operation: "list active sessions", status: 401, errorTag: "UnauthorizedError" },
+    });
+  });
+
+  it("bounds each poll request by the remaining wait deadline", async () => {
+    vi.useFakeTimers();
+    const { client, methods } = fakeClient();
+    methods.active.mockImplementation(
+      (options: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          options.signal.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          );
+        }),
+    );
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100, idlePollIntervalMs: 10 });
+
+    const outcome = adapter.waitUntilIdle("session-1").then(() => "resolved", (error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+
+    await expect(outcome).resolves.toMatchObject({
+      diagnostic: { operation: "wait for session", message: "timed out after 100ms" },
+      cause: { diagnostic: { operation: "list active sessions" } },
+    });
+  });
+
+  it("takes the turn's last completed assistant message as the final response", () => {
+    const step = (id: string, text: string, completed: number | undefined) => ({
+      ...assistant(id),
+      time: completed === undefined ? { created: 2 } : { created: 2, completed },
+      content: [{ type: "text", id: `${id}-text`, text }],
+    });
+    const multiStep = {
+      data: [user("input-1"), step("tool-step", "Creating the file.", 3), step("final", " TOKEN_STORED ", 4), user("input-2")],
+      cursor: {},
+    } as unknown as Parameters<typeof finalAssistantResponseText>[0];
+    const incompleteFinal = {
+      data: [user("input-1"), step("tool-step", "TOKEN_STORED", 3), step("final", "TOKEN", undefined)],
+      cursor: {},
+    } as unknown as Parameters<typeof finalAssistantResponseText>[0];
+
+    expect(finalAssistantResponseText(multiStep, "input-1")).toBe("TOKEN_STORED");
+    expect(finalAssistantResponseText(multiStep, "input-2")).toBeUndefined();
+    expect(finalAssistantResponseText(multiStep, "missing")).toBeUndefined();
+    expect(finalAssistantResponseText(incompleteFinal, "input-1")).toBeUndefined();
+  });
+
+  it("does not accept a final step that failed as the final response", () => {
+    const failedStep = (extra: Record<string, unknown>) => ({
+      data: [
+        user("input-1"),
+        {
+          ...assistant("final"),
+          time: { created: 2, completed: 3 },
+          content: [{ type: "text", id: "final-text", text: "TOKEN_STORED" }],
+          ...extra,
+        },
+      ],
+      cursor: {},
+    }) as unknown as Parameters<typeof finalAssistantResponseText>[0];
+
+    expect(finalAssistantResponseText(failedStep({ finish: "error" }), "input-1")).toBeUndefined();
+    expect(
+      finalAssistantResponseText(failedStep({ error: { type: "unknown", message: "failed" } }), "input-1"),
+    ).toBeUndefined();
+    expect(finalAssistantResponseText(failedStep({ finish: "stop" }), "input-1")).toBe("TOKEN_STORED");
+  });
+
+  it("maps only structured poll timeouts to the wait timeout", async () => {
+    const { client, methods } = fakeClient();
+    methods.active.mockResolvedValue(
+      failedResult({ _tag: "UnknownError", message: "timed out upstream" }, 500),
+    );
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100, idlePollIntervalMs: 1 });
+
+    await expect(adapter.waitUntilIdle("session-1")).rejects.toMatchObject({
+      diagnostic: { operation: "list active sessions", status: 500, message: "timed out upstream" },
+    });
+  });
+
+  it("correlates an assistant response only within the admitted input's turn", () => {
+    const messages = {
+      data: [user("input-1"), assistant("assistant-1"), user("input-2")],
+      cursor: {},
+    } as unknown as Parameters<typeof hasAssistantResponseAfter>[0];
+
+    expect(hasAssistantResponseAfter(messages, "input-1")).toBe(true);
+    expect(hasAssistantResponseAfter(messages, "input-2")).toBe(false);
+    expect(hasAssistantResponseAfter(messages, "missing")).toBe(false);
   });
 });

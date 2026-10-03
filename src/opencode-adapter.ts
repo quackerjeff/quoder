@@ -11,12 +11,14 @@ import {
 } from "@opencode-ai/sdk/v2";
 
 export const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
+export const DEFAULT_IDLE_POLL_INTERVAL_MS = 250;
 
 export interface AdapterDiagnostic {
   readonly operation: string;
   readonly status?: number;
   readonly errorTag?: string;
   readonly message: string;
+  readonly timedOut?: boolean;
 }
 
 export class OpenCodeAdapterError extends Error {
@@ -32,7 +34,18 @@ export class OpenCodeAdapterError extends Error {
 export interface OpenCodeAdapterOptions {
   readonly baseUrl?: string;
   readonly timeoutMs?: number;
+  readonly idlePollIntervalMs?: number;
   readonly client?: OpencodeClient;
+}
+
+export interface WaitUntilIdleOptions {
+  /**
+   * When set, idle also requires an assistant message after this admitted input, so a
+   * session whose run has not yet been scheduled is never mistaken for a completed one.
+   * Omit it only when execution is already known to have started, for example after an
+   * interrupted tool's terminal event has been observed.
+   */
+  readonly afterInputID?: string;
 }
 
 export interface CreateSessionOptions {
@@ -60,6 +73,52 @@ const errorTag = (error: unknown): string | undefined => {
   return typeof value === "string" ? value : undefined;
 };
 
+type AssistantMessage = Extract<SessionMessagesResponse["data"][number], { type: "assistant" }>;
+
+/**
+ * Assistant messages in the admitted input's turn: after that user input in the ascending
+ * list and before any later user input. OpenCode 1.18.33 appends one per model step.
+ */
+const assistantMessagesInTurn = (
+  messages: SessionMessagesResponse,
+  admittedInputID: string,
+): AssistantMessage[] => {
+  const inputIndex = messages.data.findIndex(
+    (message) => message.type === "user" && message.id === admittedInputID,
+  );
+  if (inputIndex < 0) return [];
+  const turn: AssistantMessage[] = [];
+  for (const message of messages.data.slice(inputIndex + 1)) {
+    if (message.type === "user") break;
+    if (message.type === "assistant") turn.push(message);
+  }
+  return turn;
+};
+
+export const hasAssistantResponseAfter = (
+  messages: SessionMessagesResponse,
+  admittedInputID: string,
+): boolean => assistantMessagesInTurn(messages, admittedInputID).length > 0;
+
+/**
+ * The turn's final result: the text of its last assistant message, which must have completed
+ * without error. Earlier step messages (for example tool calls) are intermediate and never the result.
+ */
+export const finalAssistantResponseText = (
+  messages: SessionMessagesResponse,
+  admittedInputID: string,
+): string | undefined => {
+  const final = assistantMessagesInTurn(messages, admittedInputID).at(-1);
+  if (final?.time.completed === undefined || final.finish === "error" || final.error !== undefined) {
+    return undefined;
+  }
+  return final.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("")
+    .trim();
+};
+
 const safeErrorMessage = (error: unknown): string => {
   if (error instanceof Error) return error.message;
   if (typeof error === "object" && error !== null) {
@@ -72,6 +131,7 @@ const safeErrorMessage = (error: unknown): string => {
 export class OpenCodeAdapter {
   readonly #client: OpencodeClient;
   readonly #timeoutMs: number;
+  readonly #idlePollIntervalMs: number;
 
   constructor(options: OpenCodeAdapterOptions = {}) {
     this.#client =
@@ -79,6 +139,10 @@ export class OpenCodeAdapter {
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS;
     if (!Number.isFinite(this.#timeoutMs) || this.#timeoutMs <= 0) {
       throw new RangeError("timeoutMs must be a positive finite number");
+    }
+    this.#idlePollIntervalMs = options.idlePollIntervalMs ?? DEFAULT_IDLE_POLL_INTERVAL_MS;
+    if (!Number.isFinite(this.#idlePollIntervalMs) || this.#idlePollIntervalMs <= 0) {
+      throw new RangeError("idlePollIntervalMs must be a positive finite number");
     }
   }
 
@@ -184,15 +248,53 @@ export class OpenCodeAdapter {
     );
   }
 
-  async waitUntilIdle(sessionID: string): Promise<void> {
-    await this.#request("wait for session", (signal) =>
-      this.#client.v2.session.wait({ sessionID }, { signal }),
+  async isActive(sessionID: string, timeoutMs = this.#timeoutMs): Promise<boolean> {
+    const result = await this.#request(
+      "list active sessions",
+      (signal) => this.#client.v2.session.active({ signal }),
+      timeoutMs,
     );
+    return Object.hasOwn(this.#requiredData<{ data: Record<string, unknown> }>(result).data, sessionID);
   }
 
-  async messages(sessionID: string): Promise<SessionMessagesResponse> {
-    const result = await this.#request("list session messages", (signal) =>
-      this.#client.v2.session.messages({ sessionID }, { signal }),
+  /**
+   * OpenCode 1.18.33 stubs Core V2 `session.wait` as an unconditional 503, so idle is
+   * observed by polling the supported active-session route within this adapter's deadline.
+   */
+  async waitUntilIdle(sessionID: string, options: WaitUntilIdleOptions = {}): Promise<void> {
+    const deadline = Date.now() + this.#timeoutMs;
+    const timedOut = (cause?: unknown) => new OpenCodeAdapterError(
+      { operation: "wait for session", message: `timed out after ${this.#timeoutMs}ms`, timedOut: true },
+      cause === undefined ? undefined : { cause },
+    );
+    for (;;) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      try {
+        if (!(await this.isActive(sessionID, remainingMs))) {
+          if (options.afterInputID === undefined) return;
+          const messages = await this.messages(sessionID, Math.max(1, deadline - Date.now()));
+          if (hasAssistantResponseAfter(messages, options.afterInputID)) return;
+        }
+      } catch (error) {
+        // Each poll is bounded by the remaining wait, so a poll timeout is the wait's own deadline.
+        if (error instanceof OpenCodeAdapterError && error.diagnostic.timedOut === true) {
+          throw timedOut(error);
+        }
+        throw error;
+      }
+      const delayMs = Math.min(this.#idlePollIntervalMs, deadline - Date.now());
+      if (delayMs <= 0) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+    throw timedOut();
+  }
+
+  async messages(sessionID: string, timeoutMs = this.#timeoutMs): Promise<SessionMessagesResponse> {
+    const result = await this.#request(
+      "list session messages",
+      (signal) => this.#client.v2.session.messages({ sessionID, order: "asc" }, { signal }),
+      timeoutMs,
     );
     return this.#requiredData<SessionMessagesResponse>(result);
   }
@@ -226,10 +328,11 @@ export class OpenCodeAdapter {
   async #request<T extends ApiResult<unknown>>(
     operation: string,
     request: (signal: AbortSignal) => Promise<T>,
+    timeoutMs = this.#timeoutMs,
   ): Promise<T> {
-    const result = await this.#requestAllowingError(operation, request);
+    const result = await this.#requestAllowingError(operation, request, timeoutMs);
     if (!result.response.ok || result.error !== undefined) {
-      throw this.#toError(operation, result.error, result.response.status);
+      throw this.#toError(operation, result.error, result.response.status, timeoutMs);
     }
     return result;
   }
@@ -237,13 +340,14 @@ export class OpenCodeAdapter {
   async #requestAllowingError<T extends ApiResult<unknown>>(
     operation: string,
     request: (signal: AbortSignal) => Promise<T>,
+    timeoutMs = this.#timeoutMs,
   ): Promise<T> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.#timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await request(controller.signal);
     } catch (cause) {
-      throw this.#toError(operation, cause);
+      throw this.#toError(operation, cause, undefined, timeoutMs);
     } finally {
       clearTimeout(timeout);
     }
@@ -260,7 +364,12 @@ export class OpenCodeAdapter {
     return result.data;
   }
 
-  #toError(operation: string, cause: unknown, status?: number): OpenCodeAdapterError {
+  #toError(
+    operation: string,
+    cause: unknown,
+    status?: number,
+    timeoutMs = this.#timeoutMs,
+  ): OpenCodeAdapterError {
     const timedOut = cause instanceof Error && cause.name === "AbortError";
     const causeErrorTag = errorTag(cause);
     return new OpenCodeAdapterError(
@@ -268,7 +377,8 @@ export class OpenCodeAdapter {
         operation,
         ...(status === undefined ? {} : { status }),
         ...(causeErrorTag === undefined ? {} : { errorTag: causeErrorTag }),
-        message: timedOut ? `timed out after ${this.#timeoutMs}ms` : safeErrorMessage(cause),
+        message: timedOut ? `timed out after ${timeoutMs}ms` : safeErrorMessage(cause),
+        ...(timedOut ? { timedOut: true } : {}),
       },
       { cause },
     );

@@ -1,4 +1,7 @@
+import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,7 +15,9 @@ import {
 } from "../../src/live-observability.js";
 import {
   LIVE_PROBE_TIMEOUT_MS,
+  LIVE_MODEL,
   OpenCodeLiveDriver,
+  SERVER_TERMINATION_UNCONFIRMED_MESSAGE,
   authenticatedServerProcessConfig,
   basicAuthorizationHeader,
   cancellationFromObservedEvents,
@@ -20,11 +25,15 @@ import {
   createAuthenticatedOpenCodeDriver,
   createIsolationSessionAfterDeletion,
   evaluateLiveEvidence,
+  fixtureToolCallID,
+  launchAuthenticatedOpenCodeServer,
   readConfinedRegularFile,
   runLiveProbe,
   settlePairedOperations,
+  terminateOwnedChild,
   terminateValidatedFixture,
   verifyServerAuthentication,
+  type AuthenticatedServerLauncherDependencies,
   type LiveProbeDependencies,
   type LiveProbeDriver,
   type LiveProbeEvidence,
@@ -35,6 +44,7 @@ type ClientMethod = (...args: never[]) => unknown;
 type Method<T extends ClientMethod> = T;
 
 const response = (status = 200): Response => new Response(null, { status });
+
 const result = <T>(data: T, status = 200) => ({
   data,
   error: undefined,
@@ -234,16 +244,94 @@ describe("live evidence integrity", () => {
       createIsolationSessionAfterDeletion(adapter, "session-1", environment.repository),
     ).resolves.toEqual({ id: "session-2", deletedSessionID: "session-1" });
     expect(operations).toEqual(["delete:session-1", "create:session-2"]);
+    expect(adapter.createSession).toHaveBeenCalledWith({
+      directory: environment.repository,
+      model: LIVE_MODEL,
+    });
   });
 
-  it("rejects cancellation when an observed completion occurs after interruption", () => {
+  const toolEvent = (
+    sequence: number,
+    type: string,
+    callID: string,
+    extra: Record<string, unknown> = {},
+  ) => ({ sequence, type, sessionID: "session-1", properties: { callID, ...extra } });
+  const fixtureCall = (sequence: number, callID = "call-fixture", command = "node fixture.mjs token-1") =>
+    toolEvent(sequence, "session.next.tool.called", callID, { tool: "bash", input: { command } });
+
+  it("identifies only the bash tool call that runs the tokenized fixture", () => {
+    expect(fixtureToolCallID(fixtureCall(7), "token-1")).toBe("call-fixture");
+    expect(fixtureToolCallID(fixtureCall(7, "call-other", "node fixture.mjs other"), "token-1")).toBeUndefined();
+    expect(
+      fixtureToolCallID(
+        toolEvent(7, "session.next.tool.called", "call-glob", { tool: "glob", input: { pattern: "token-1" } }),
+        "token-1",
+      ),
+    ).toBeUndefined();
+    expect(
+      fixtureToolCallID(toolEvent(7, "session.next.tool.success", "call-fixture", { tool: "bash" }), "token-1"),
+    ).toBeUndefined();
+  });
+
+  const interruptAt = 1_000;
+  const interrupted = (sequence: number, callID = "call-fixture", timestamp = interruptAt + 5) =>
+    toolEvent(sequence, "session.next.tool.failed", callID, {
+      timestamp,
+      error: { type: "unknown", message: "Tool execution interrupted" },
+    });
+
+  it("passes cancellation on the verified 1.18.33 interrupted-tool sequence", () => {
     const observedEvents = [
-      { sequence: 2, type: "session.next.shell.started", sessionID: "session-1" },
-      { sequence: 5, type: "session.idle", sessionID: "session-1" },
+      fixtureCall(15),
+      interrupted(16),
+      { sequence: 17, type: "session.next.step.ended", sessionID: "session-1" },
+    ];
+    const withInterveningEvent = [
+      fixtureCall(15),
+      { sequence: 16, type: "session.next.text.ended", sessionID: "session-1" },
+      interrupted(17),
     ];
 
-    expect(cancellationFromObservedEvents(observedEvents, 3, true, false)).toBe(true);
-    expect(cancellationFromObservedEvents(observedEvents, 3, true, true)).toBe(false);
+    // Dense sequences: the terminal failure directly follows the last event read before the interrupt.
+    expect(cancellationFromObservedEvents(observedEvents, "call-fixture", 15, interruptAt, true, false)).toBe(true);
+    expect(cancellationFromObservedEvents(withInterveningEvent, "call-fixture", 15, interruptAt, true, false)).toBe(true);
+  });
+
+  it("rejects cancellation when the fixture call completes normally at any point", () => {
+    const markerOnly = [fixtureCall(15), interrupted(17)];
+    const successAfter = [fixtureCall(15), toolEvent(17, "session.next.tool.success", "call-fixture")];
+    const successBefore = [
+      fixtureCall(15),
+      toolEvent(16, "session.next.tool.success", "call-fixture"),
+      interrupted(18),
+    ];
+
+    expect(cancellationFromObservedEvents(markerOnly, "call-fixture", 16, interruptAt, true, true)).toBe(false);
+    expect(cancellationFromObservedEvents(successAfter, "call-fixture", 16, interruptAt, true, false)).toBe(false);
+    expect(cancellationFromObservedEvents(successBefore, "call-fixture", 17, interruptAt, true, false)).toBe(false);
+  });
+
+  it("rejects cancellation without correlated, correctly ordered interruption evidence", () => {
+    const unrelatedFailure = [fixtureCall(15), interrupted(16, "call-other")];
+    // Read before the interrupt was requested, so it cannot be the interrupt's effect.
+    const failureReadBeforeInterrupt = [fixtureCall(15), interrupted(16)];
+    // Read after the interrupt but produced before it (an already-queued event).
+    const failureTimestampedBeforeInterrupt = [fixtureCall(15), interrupted(16, "call-fixture", interruptAt - 1)];
+    const failureWithoutTimestamp = [fixtureCall(15), toolEvent(16, "session.next.tool.failed", "call-fixture")];
+    const verified = [fixtureCall(15), interrupted(16)];
+
+    expect(cancellationFromObservedEvents(unrelatedFailure, "call-fixture", 15, interruptAt, true, false)).toBe(false);
+    expect(
+      cancellationFromObservedEvents(failureReadBeforeInterrupt, "call-fixture", 16, interruptAt, true, false),
+    ).toBe(false);
+    expect(
+      cancellationFromObservedEvents(failureTimestampedBeforeInterrupt, "call-fixture", 15, interruptAt, true, false),
+    ).toBe(false);
+    expect(
+      cancellationFromObservedEvents(failureWithoutTimestamp, "call-fixture", 15, interruptAt, true, false),
+    ).toBe(false);
+    expect(cancellationFromObservedEvents(verified, "call-other", 15, interruptAt, true, false)).toBe(false);
+    expect(cancellationFromObservedEvents(verified, "call-fixture", 15, interruptAt, false, false)).toBe(false);
   });
 
   it("requires exact response text correlated to the admitted input", () => {
@@ -470,40 +558,47 @@ describe("permission evidence correlation", () => {
       .fn()
       .mockResolvedValueOnce({ stream: permissionEvents() })
       .mockResolvedValueOnce({ stream: noCancellationEvents() });
-    const messages = vi
-      .fn()
-      .mockResolvedValueOnce(
-        result({
-          data: [
-            { id: "input-1", type: "user", time: { created: 1 }, text: "prompt" },
-            {
-              id: "assistant-1",
-              type: "assistant",
-              time: { created: 2 },
-              agent: "build",
-              model: { providerID: "ollama", id: "model" },
-              content: [{ type: "text", id: "text-1", text: "TOKEN_STORED" }],
-            },
+    const transcripts: Record<string, unknown[]> = {
+      // OpenCode 1.18.33 appends one assistant message per model step; the final one is the result.
+      "session-1": [
+        { id: "input-1", type: "user", time: { created: 1 }, text: "prompt" },
+        {
+          id: "assistant-1-tool-step",
+          type: "assistant",
+          time: { created: 2, completed: 3 },
+          agent: "build",
+          model: { providerID: "ollama", id: "model" },
+          finish: "tool-calls",
+          content: [
+            { type: "text", id: "text-1a", text: "I'll create the file." },
+            { type: "tool", id: "tool-1", tool: "write", state: { status: "completed" } },
           ],
-          cursor: {},
-        }),
-      )
-      .mockResolvedValueOnce(
-        result({
-          data: [
-            { id: "input-2", type: "user", time: { created: 3 }, text: "prompt" },
-            {
-              id: "assistant-2",
-              type: "assistant",
-              time: { created: 4 },
-              agent: "build",
-              model: { providerID: "ollama", id: "model" },
-              content: [{ type: "text", id: "text-2", text: "NO_PRIOR_SESSION" }],
-            },
-          ],
-          cursor: {},
-        }),
-      );
+        },
+        {
+          id: "assistant-1",
+          type: "assistant",
+          time: { created: 4, completed: 5 },
+          agent: "build",
+          model: { providerID: "ollama", id: "model" },
+          content: [{ type: "text", id: "text-1", text: "TOKEN_STORED" }],
+        },
+      ],
+      "session-2": [
+        { id: "input-2", type: "user", time: { created: 3 }, text: "prompt" },
+        {
+          id: "assistant-2",
+          type: "assistant",
+          time: { created: 4, completed: 5 },
+          agent: "build",
+          model: { providerID: "ollama", id: "model" },
+          content: [{ type: "text", id: "text-2", text: "NO_PRIOR_SESSION" }],
+        },
+      ],
+    };
+    const messages = vi.fn().mockImplementation(async (parameters: { sessionID: string }) =>
+      result({ data: transcripts[parameters.sessionID] ?? [], cursor: {} }),
+    );
+    const active = vi.fn().mockResolvedValue(result({ data: {} }));
     const deleteSession = vi.fn().mockResolvedValue(result(true));
     const get = vi
       .fn()
@@ -526,9 +621,7 @@ describe("permission evidence correlation", () => {
             >,
           },
           interrupt: vi.fn() as Method<OpencodeClient["v2"]["session"]["interrupt"]>,
-          wait: vi.fn().mockResolvedValue(result(undefined, 204)) as Method<
-            OpencodeClient["v2"]["session"]["wait"]
-          >,
+          active: active as Method<OpencodeClient["v2"]["session"]["active"]>,
           messages: messages as Method<OpencodeClient["v2"]["session"]["messages"]>,
           get: get as Method<OpencodeClient["v2"]["session"]["get"]>,
         },
@@ -555,6 +648,31 @@ describe("permission evidence correlation", () => {
         { sessionID: "session-1", requestID: "permission-1", reply: "once" },
         { signal: expect.any(AbortSignal) },
       );
+      expect(create).toHaveBeenNthCalledWith(
+        1,
+        {
+          agent: "build",
+          location: { directory: repository },
+          model: LIVE_MODEL,
+        },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(create).toHaveBeenNthCalledWith(
+        2,
+        {
+          agent: "build",
+          location: { directory: repository },
+          model: LIVE_MODEL,
+        },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(evidence.finalResponse).toBe("TOKEN_STORED");
+      expect(evidence.isolationResponse).toBe("NO_PRIOR_SESSION");
+      expect(messages).toHaveBeenCalledWith(
+        { sessionID: "session-1", order: "asc" },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(active).toHaveBeenCalled();
       expect(operations).toEqual([
         "created:permission-1:ask",
         "emitted:legacy",
@@ -569,6 +687,49 @@ describe("permission evidence correlation", () => {
 });
 
 describe("security hardening", () => {
+  it("awaits delayed owned-child exit after SIGTERM", async () => {
+    class FakeChild extends EventEmitter {
+      exitCode: number | null = null;
+      signalCode: NodeJS.Signals | null = null;
+      readonly signals: NodeJS.Signals[] = [];
+      kill(signal: NodeJS.Signals): boolean {
+        this.signals.push(signal);
+        if (signal === "SIGTERM") {
+          setTimeout(() => {
+            this.signalCode = signal;
+            this.emit("exit");
+          }, 5);
+        }
+        return true;
+      }
+    }
+    const child = new FakeChild();
+
+    await terminateOwnedChild(child, 25);
+
+    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(child.signalCode).toBe("SIGTERM");
+  });
+
+  it("fails finitely when an owned child ignores SIGTERM and SIGKILL", async () => {
+    class FakeChild extends EventEmitter {
+      exitCode: number | null = null;
+      signalCode: NodeJS.Signals | null = null;
+      readonly signals: NodeJS.Signals[] = [];
+      kill(signal: NodeJS.Signals): boolean {
+        this.signals.push(signal);
+        return true;
+      }
+    }
+    const child = new FakeChild();
+    const started = Date.now();
+
+    await expect(terminateOwnedChild(child, 5)).rejects.toThrow("did not terminate");
+
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(Date.now() - started).toBeLessThan(100);
+  });
+
   it("generates child-only server credentials and a matching Basic authorization value", async () => {
     const inheritedUsername = process.env.OPENCODE_SERVER_USERNAME;
     const inheritedPassword = process.env.OPENCODE_SERVER_PASSWORD;
@@ -703,5 +864,501 @@ describe("security hardening", () => {
       }),
     ).rejects.toThrow("Refusing to terminate an unvalidated fixture process");
     expect(rejectTerminate).not.toHaveBeenCalled();
+  });
+});
+
+describe("authenticated server startup lifecycle", () => {
+  class FakeServerChild extends EventEmitter {
+    exitCode: number | null = null;
+    signalCode: NodeJS.Signals | null = null;
+    readonly stdout = new EventEmitter();
+    readonly stderr = new EventEmitter();
+    readonly signals: NodeJS.Signals[] = [];
+
+    constructor(private readonly exitDelayAfterSignalMs?: number) {
+      super();
+    }
+
+    kill(signal: NodeJS.Signals): boolean {
+      this.signals.push(signal);
+      if (this.exitDelayAfterSignalMs !== undefined && this.signals.length === 1) {
+        setTimeout(() => this.exit(null, signal), this.exitDelayAfterSignalMs);
+      }
+      return true;
+    }
+
+    exit(code: number | null, signal: NodeJS.Signals | null): void {
+      this.exitCode = code;
+      this.signalCode = signal;
+      this.emit("exit", code, signal);
+    }
+
+    get exited(): boolean {
+      return this.exitCode !== null || this.signalCode !== null;
+    }
+
+    listen(line: string): void {
+      this.stdout.emit("data", Buffer.from(`${line}\n`, "utf8"));
+    }
+  }
+
+  const launcher = (
+    child: FakeServerChild,
+    overrides: Partial<AuthenticatedServerLauncherDependencies> = {},
+  ): AuthenticatedServerLauncherDependencies => ({
+    spawnServer: () => child,
+    verifyAuthentication: async () => undefined,
+    startupTimeoutMs: 1_000,
+    terminationTimeoutMs: 50,
+    ...overrides,
+  });
+
+  // Captures whether the owned child had exited at the instant the caller observed the outcome.
+  const observe = (launch: Promise<unknown>, child: FakeServerChild) => launch.then(
+    () => ({ status: "fulfilled" as const, message: "", exitedWhenObserved: child.exited }),
+    (error: Error) => ({ status: "rejected" as const, message: error.message, exitedWhenObserved: child.exited }),
+  );
+
+  const watchUnhandledRejections = () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    return async () => {
+      await new Promise((resolveTick) => setTimeout(resolveTick, 25));
+      process.off("unhandledRejection", unhandled);
+      expect(unhandled).not.toHaveBeenCalled();
+    };
+  };
+
+  const credentials = { username: "quoder", password: "secret-value" } as const;
+
+  it("awaits delayed child exit before rejecting a startup timeout", async () => {
+    const child = new FakeServerChild(30);
+    let published: (() => Promise<void>) | undefined;
+    const started = Date.now();
+
+    const outcome = await observe(
+      launchAuthenticatedOpenCodeServer(
+        { ...credentials, acceptCloseOwnership: (close) => { published = close; } },
+        launcher(child, { startupTimeoutMs: 10 }),
+      ),
+      child,
+    );
+
+    expect(outcome).toEqual({
+      status: "rejected",
+      message: "Timed out waiting for authenticated OpenCode server startup",
+      exitedWhenObserved: true,
+    });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(35);
+    expect(child.signals).toEqual(["SIGTERM"]);
+    await expect(published?.()).resolves.toBeUndefined();
+    expect(child.signals).toEqual(["SIGTERM"]);
+  });
+
+  it.each([
+    ["child error", (child: FakeServerChild) => child.emit("error", new Error("spawn failed")),
+      "Authenticated OpenCode server failed to start: spawn failed"],
+    ["invalid listening output", (child: FakeServerChild) => child.listen("opencode server listening on"),
+      "Authenticated OpenCode server reported an invalid listening URL"],
+  ])("awaits delayed child exit before rejecting startup %s", async (_name, trigger, message) => {
+    const child = new FakeServerChild(20);
+    const launch = observe(launchAuthenticatedOpenCodeServer(credentials, launcher(child)), child);
+
+    trigger(child);
+
+    await expect(launch).resolves.toEqual({ status: "rejected", message, exitedWhenObserved: true });
+    expect(child.signals).toEqual(["SIGTERM"]);
+  });
+
+  it("rejects premature exit without signalling the already-exited child", async () => {
+    const child = new FakeServerChild();
+    const launch = observe(launchAuthenticatedOpenCodeServer(credentials, launcher(child)), child);
+
+    child.exit(1, null);
+
+    await expect(launch).resolves.toEqual({
+      status: "rejected",
+      message: "Authenticated OpenCode server exited during startup with code 1",
+      exitedWhenObserved: true,
+    });
+    expect(child.signals).toEqual([]);
+  });
+
+  it("rejects cancelled startup only after the shared termination settles", async () => {
+    const child = new FakeServerChild(20);
+    const controller = new AbortController();
+    const launch = observe(
+      launchAuthenticatedOpenCodeServer({ ...credentials, signal: controller.signal }, launcher(child)),
+      child,
+    );
+
+    controller.abort();
+
+    await expect(launch).resolves.toEqual({
+      status: "rejected",
+      message: "Authenticated OpenCode server startup was cancelled",
+      exitedWhenObserved: true,
+    });
+    expect(child.signals).toEqual(["SIGTERM"]);
+  });
+
+  it("settles simultaneous startup failures once through one termination sequence", async () => {
+    const child = new FakeServerChild(30);
+    const verifyAuthentication = vi.fn(async () => undefined);
+    const launch = observe(
+      launchAuthenticatedOpenCodeServer(
+        credentials,
+        launcher(child, { startupTimeoutMs: 5, verifyAuthentication }),
+      ),
+      child,
+    );
+
+    child.emit("error", new Error("first"));
+    child.listen("opencode server listening on");
+    child.emit("error", new Error("second"));
+    await new Promise((resolveTick) => setTimeout(resolveTick, 10));
+    child.listen("opencode server listening on http://127.0.0.1:4096");
+
+    await expect(launch).resolves.toEqual({
+      status: "rejected",
+      message: "Authenticated OpenCode server failed to start: first",
+      exitedWhenObserved: true,
+    });
+    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(verifyAuthentication).not.toHaveBeenCalled();
+    expect(child.stdout.listenerCount("data")).toBe(1);
+    expect(child.listenerCount("exit")).toBe(0);
+  });
+
+  it.each([
+    ["startup timeout", (_child: FakeServerChild, _controller: AbortController) => undefined],
+    ["cancellation", (_child: FakeServerChild, controller: AbortController) => controller.abort()],
+    ["child error", (child: FakeServerChild) => { child.emit("error", new Error("spawn failed")); }],
+  ])("rejects with fixed text when a non-terminating child survives %s", async (_name, trigger) => {
+    const assertNoUnhandledRejection = watchUnhandledRejections();
+    const child = new FakeServerChild();
+    const controller = new AbortController();
+    let published: (() => Promise<void>) | undefined;
+    const started = Date.now();
+    const launch = observe(
+      launchAuthenticatedOpenCodeServer(
+        {
+          ...credentials,
+          signal: controller.signal,
+          acceptCloseOwnership: (close) => { published = close; },
+        },
+        launcher(child, { startupTimeoutMs: 5, terminationTimeoutMs: 5 }),
+      ),
+      child,
+    );
+
+    trigger(child, controller);
+
+    await expect(launch).resolves.toEqual({
+      status: "rejected",
+      message: SERVER_TERMINATION_UNCONFIRMED_MESSAGE,
+      exitedWhenObserved: false,
+    });
+    expect(SERVER_TERMINATION_UNCONFIRMED_MESSAGE).not.toContain("secret-value");
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(Date.now() - started).toBeLessThan(200);
+    await expect(published?.()).rejects.toThrow("did not terminate");
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    await assertNoUnhandledRejection();
+  });
+
+  it("awaits termination before surfacing post-launch authentication failure", async () => {
+    const child = new FakeServerChild(20);
+    const launch = observe(
+      launchAuthenticatedOpenCodeServer(
+        credentials,
+        launcher(child, {
+          verifyAuthentication: async () => {
+            throw new Error("OpenCode server did not reject an unauthenticated health request");
+          },
+        }),
+      ),
+      child,
+    );
+
+    child.listen("opencode server listening on http://127.0.0.1:4096");
+
+    await expect(launch).resolves.toEqual({
+      status: "rejected",
+      message: "OpenCode server did not reject an unauthenticated health request",
+      exitedWhenObserved: true,
+    });
+    expect(child.signals).toEqual(["SIGTERM"]);
+  });
+
+  it("preserves the authenticated success path with idempotent async close", async () => {
+    const assertNoUnhandledRejection = watchUnhandledRejections();
+    const child = new FakeServerChild(5);
+    const verifyAuthentication = vi.fn(async () => undefined);
+    const spawnServer = vi.fn(() => child);
+    let published: (() => Promise<void>) | undefined;
+    const launch = launchAuthenticatedOpenCodeServer(
+      { ...credentials, acceptCloseOwnership: (close) => { published = close; } },
+      launcher(child, { spawnServer, verifyAuthentication, startupTimeoutMs: 20 }),
+    );
+
+    expect(published).toBeDefined();
+    child.listen("opencode server listening on http://127.0.0.1:4096");
+    const server = await launch;
+
+    expect(server.url).toBe("http://127.0.0.1:4096");
+    expect(spawnServer).toHaveBeenCalledWith(expect.objectContaining({
+      args: ["serve", "--pure", "--hostname=127.0.0.1", "--port=0"],
+    }));
+    expect(verifyAuthentication).toHaveBeenCalledWith(
+      "http://127.0.0.1:4096",
+      basicAuthorizationHeader("quoder", "secret-value"),
+    );
+    expect(server.close).toBe(published);
+    await new Promise((resolveTick) => setTimeout(resolveTick, 30));
+    expect(child.signals).toEqual([]);
+    child.emit("error", new Error("late error"));
+    child.listen("opencode server listening on");
+    expect(child.stdout.listenerCount("data")).toBe(1);
+
+    const first = server.close();
+    expect(server.close()).toBe(first);
+    await first;
+    expect(child.signals).toEqual(["SIGTERM"]);
+    await assertNoUnhandledRejection();
+  });
+});
+
+describe("cancellation orchestration against the verified 1.18.33 event contract", () => {
+  const durable = (seq: number, type: string, data: Record<string, unknown>) =>
+    ({ id: `event-${seq}`, type, durable: { seq }, data: { sessionID: "session-1", ...data } }) as unknown as V2Event;
+  const delta = () =>
+    ({ id: "delta", type: "session.next.text.delta", data: { sessionID: "session-1", delta: "x" } }) as unknown as V2Event;
+
+  interface Scenario {
+    /** Emits the tokenized bash call; without it the fixture never starts. */
+    readonly fixtureCall?: boolean;
+    /** Post-interrupt terminal event for the fixture call. */
+    readonly terminal?: "failed" | "success";
+    /** Emits an unrelated call's failure before the fixture's terminal event. */
+    readonly unrelatedFailureFirst?: boolean;
+    readonly completionMarker?: boolean;
+    readonly interruptFails?: boolean;
+  }
+
+  const runScenario = async ({
+    fixtureCall = true,
+    terminal = "failed",
+    unrelatedFailureFirst = false,
+    completionMarker = false,
+    interruptFails = false,
+  }: Scenario = {}) => {
+    const root = await mkdtemp(join(tmpdir(), "quoder-cancellation-driver-test-"));
+    const repository = join(root, "repository");
+    const outside = join(root, "permission-target");
+    await Promise.all([mkdir(repository), mkdir(outside)]);
+    const pidPath = join(repository, "fixture.pid");
+    // A PID that has already exited stands in for a fixture that OpenCode terminated.
+    const exitedPID = spawnSync(process.execPath, ["-e", ""]).pid;
+    const order: string[] = [];
+    let fixtureToken = "";
+    let cancellationStreamClosed = false;
+    let pidFileExistedAtInterrupt: boolean | undefined;
+    let releaseInterrupt: () => void = () => undefined;
+    const interrupted = new Promise<void>((resolveInterrupt) => {
+      releaseInterrupt = resolveInterrupt;
+    });
+
+    const prompt = vi.fn().mockImplementation(async (parameters: { prompt: { text: string } }) => {
+      const token = /fixture\.mjs ([0-9a-f-]{36})/u.exec(parameters.prompt.text)?.[1];
+      if (token === undefined) {
+        return result({ data: { id: parameters.prompt.text.startsWith("Remember this nonce") ? "input-1" : "input-2" } });
+      }
+      fixtureToken = token;
+      return result({ data: { id: "cancellation-input" } });
+    });
+    async function* initialEvents() {
+      yield {
+        id: "durable-1",
+        event: "session.next.step.started",
+        data: JSON.stringify({ type: "session.next.step.started", durable: { seq: 1 } }),
+      };
+    }
+    async function* permissionEvents() {
+      yield {
+        id: "permission-event",
+        type: "permission.v2.asked",
+        data: { id: "permission-1", sessionID: "session-1", action: "external_directory", resources: [outside], save: [] },
+      } as unknown as V2Event;
+    }
+    async function* cancellationEvents() {
+      try {
+        yield delta();
+        yield durable(5, "session.next.tool.called", { callID: "call-glob", tool: "glob", input: { pattern: "*" } });
+        yield durable(6, "session.next.tool.success", { callID: "call-glob", timestamp: Date.now() });
+        if (!fixtureCall) return;
+        yield delta();
+        // The fixture reports its PID some time after its tool call starts; the driver must wait
+        // for it. The timer is armed before the yield because the driver stops pulling events here.
+        setTimeout(() => {
+          order.push("pid-written");
+          if (completionMarker) {
+            void writeFile(join(repository, "fixture-completed.marker"), "completed", "utf8");
+          }
+          void writeFile(pidPath, String(exitedPID), "utf8");
+        }, 200);
+        yield durable(7, "session.next.tool.called", {
+          callID: "call-fixture",
+          tool: "bash",
+          input: { command: `node fixture.mjs ${fixtureToken}` },
+        });
+        await interrupted;
+        let seq = 8;
+        if (unrelatedFailureFirst) {
+          yield durable(seq++, "session.next.tool.failed", { callID: "call-other", timestamp: Date.now(), error: {} });
+          yield delta();
+        }
+        order.push(`emit:${terminal}:call-fixture`);
+        yield durable(seq++, `session.next.tool.${terminal}`, {
+          callID: "call-fixture",
+          timestamp: Date.now(),
+          error: { type: "unknown", message: "Tool execution interrupted" },
+        });
+        yield durable(seq, "session.next.step.ended", { finish: "tool-calls" });
+        await new Promise(() => undefined);
+      } finally {
+        cancellationStreamClosed = true;
+      }
+    }
+    const transcripts: Record<string, unknown[]> = {
+      "session-1": [
+        { id: "input-1", type: "user", time: { created: 1 }, text: "prompt" },
+        {
+          id: "assistant-1",
+          type: "assistant",
+          time: { created: 2, completed: 3 },
+          agent: "build",
+          model: { providerID: "ollama", id: "model" },
+          content: [{ type: "text", id: "text-1", text: "TOKEN_STORED" }],
+        },
+      ],
+      "session-2": [
+        { id: "input-2", type: "user", time: { created: 4 }, text: "prompt" },
+        {
+          id: "assistant-2",
+          type: "assistant",
+          time: { created: 5, completed: 6 },
+          agent: "build",
+          model: { providerID: "ollama", id: "model" },
+          content: [{ type: "text", id: "text-2", text: "NO_PRIOR_SESSION" }],
+        },
+      ],
+    };
+
+    const client = {
+      v2: {
+        session: {
+          create: vi
+            .fn()
+            .mockResolvedValueOnce(result({ data: { id: "session-1" } }))
+            .mockResolvedValueOnce(result({ data: { id: "session-2" } })),
+          prompt,
+          events: vi.fn().mockResolvedValue({ stream: initialEvents() }),
+          permission: {
+            create: vi.fn().mockResolvedValue(result({ data: { id: "permission-1", effect: "ask" } })),
+            reply: vi.fn().mockResolvedValue(result(undefined, 204)),
+          },
+          interrupt: vi.fn().mockImplementation(async () => {
+            order.push("interrupt");
+            pidFileExistedAtInterrupt = existsSync(pidPath);
+            releaseInterrupt();
+            return interruptFails
+              ? failedResult({ _tag: "UnknownError", message: "interrupt failed" }, 500)
+              : result(undefined, 204);
+          }),
+          active: vi.fn().mockImplementation(async () => {
+            order.push("active");
+            return result({ data: {} });
+          }),
+          messages: vi.fn().mockImplementation(async (parameters: { sessionID: string }) =>
+            result({ data: transcripts[parameters.sessionID] ?? [], cursor: {} }),
+          ),
+          get: vi.fn().mockResolvedValue(failedResult({ _tag: "SessionNotFoundError", message: "not found" }, 404)),
+        },
+        event: {
+          subscribe: vi
+            .fn()
+            .mockResolvedValueOnce({ stream: permissionEvents() })
+            .mockResolvedValueOnce({ stream: cancellationEvents() }),
+        },
+      },
+      session: { delete: vi.fn().mockResolvedValue(result(true)) },
+    } as unknown as OpencodeClient;
+
+    const driver = new OpenCodeLiveDriver(client, vi.fn());
+    try {
+      const outcome = await driver.run({ root, repository, outside }).then(
+        (evidence) => ({ evidence, error: undefined }),
+        (error: Error) => ({ evidence: undefined, error }),
+      );
+      return { ...outcome, order, cancellationStreamClosed, pidFileExistedAtInterrupt };
+    } finally {
+      await driver.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  };
+
+  it("passes when the fixture's failure directly follows its call, confirming idle afterwards", async () => {
+    const { evidence, order, cancellationStreamClosed, pidFileExistedAtInterrupt } = await runScenario();
+
+    expect(evidence?.cancellationPassed).toBe(true);
+    expect(evidence?.finalResponse).toBe("TOKEN_STORED");
+    const interruptAt = order.indexOf("interrupt");
+    const terminalAt = order.indexOf("emit:failed:call-fixture");
+    expect(pidFileExistedAtInterrupt).toBe(true);
+    expect(order.indexOf("pid-written")).toBeLessThan(interruptAt);
+    expect(interruptAt).toBeLessThan(terminalAt);
+    expect(order.indexOf("active", interruptAt)).toBeGreaterThan(terminalAt);
+    expect(cancellationStreamClosed).toBe(true);
+  });
+
+  it("ignores an unrelated call's failure and waits for the fixture's own terminal event", async () => {
+    const { evidence, order, cancellationStreamClosed } = await runScenario({ unrelatedFailureFirst: true });
+
+    expect(evidence?.cancellationPassed).toBe(true);
+    expect(order.indexOf("active", order.indexOf("interrupt"))).toBeGreaterThan(
+      order.indexOf("emit:failed:call-fixture"),
+    );
+    expect(cancellationStreamClosed).toBe(true);
+  });
+
+  it("fails when the fixture wrote its completion marker despite a valid terminal event", async () => {
+    const { evidence, cancellationStreamClosed } = await runScenario({ completionMarker: true });
+
+    expect(evidence?.cancellationPassed).toBe(false);
+    expect(cancellationStreamClosed).toBe(true);
+  });
+
+  it("fails when the fixture call completes successfully", async () => {
+    const { evidence, cancellationStreamClosed } = await runScenario({ terminal: "success" });
+
+    expect(evidence?.cancellationPassed).toBe(false);
+    expect(cancellationStreamClosed).toBe(true);
+  });
+
+  it("fails and closes the stream when the fixture call never starts", async () => {
+    const { evidence, order, cancellationStreamClosed } = await runScenario({ fixtureCall: false });
+
+    expect(evidence?.cancellationPassed).toBe(false);
+    expect(order).not.toContain("interrupt");
+    expect(cancellationStreamClosed).toBe(true);
+  });
+
+  it("propagates an interrupt failure after closing the stream", async () => {
+    const { evidence, error, cancellationStreamClosed } = await runScenario({ interruptFails: true });
+
+    expect(evidence).toBeUndefined();
+    expect(error?.message).toContain("interrupt session");
+    expect(cancellationStreamClosed).toBe(true);
   });
 });

@@ -33,14 +33,14 @@ export interface EventClassification {
   readonly structuredExecution: boolean;
   readonly permissionRequest: boolean;
   readonly fixtureStarted: boolean;
-  readonly terminalIdle: boolean;
   readonly normalCompletion: boolean;
 }
 
 export interface CancellationEvidence {
   readonly fixtureStartedAtSequence: number;
   readonly interruptRequestedAtSequence: number;
-  readonly terminalIdleAtSequence: number;
+  /** Sequence of the fixture command's interrupted (failed) tool event. */
+  readonly terminalAtSequence: number;
   readonly fixtureTerminated: boolean;
   readonly events: readonly ProbeEvent[];
 }
@@ -64,7 +64,6 @@ export function classifyEvent(event: ProbeEvent): EventClassification {
     structuredExecution: event.type === "tool.started",
     permissionRequest: event.type === "permission.v2.asked",
     fixtureStarted: event.type === "fixture.started",
-    terminalIdle: event.type === "session.idle",
     normalCompletion: event.type === "fixture.completed",
   };
 }
@@ -121,7 +120,7 @@ export function cancellationPassed(evidence: CancellationEvidence): boolean {
   const ordered =
     evidence.fixtureStartedAtSequence > 0 &&
     evidence.fixtureStartedAtSequence < evidence.interruptRequestedAtSequence &&
-    evidence.interruptRequestedAtSequence < evidence.terminalIdleAtSequence;
+    evidence.interruptRequestedAtSequence < evidence.terminalAtSequence;
   const lateCompletion = evidence.events.some(
     (event) =>
       event.sequence > evidence.interruptRequestedAtSequence &&

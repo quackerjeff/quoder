@@ -169,8 +169,9 @@ Spec: `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/spec.md`
 
 ## Group 8: Documentation update
 
-- [ ] Document the verified feasibility result and next-step decision | `README.md`, `docs/tech.md`, `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/decisions.md`
+- [x] Document the verified feasibility result and next-step decision | `README.md`, `docs/tech.md`, `.cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/decisions.md`
   - **Packages**: None.
   - **Accept**: Documentation identifies the exact tested environment and OpenCode version, gives reproducible commands, reports limitations honestly, and branches on the capability verdict: capability PASS authorizes scoping Milestone 1; capability FAIL records the blocker and required architecture reassessment without representing Milestone 0 as successful.
   - **Verify**: `rg -n 'npm run verify:live|OpenCode.*version|Node.*version|Fresh session creation|Project directory|Local model invocation|Streaming events|Permission handling|File modification|Cancellation|Session deletion|Session isolation|limitation' README.md docs/tech.md .cmd/specs/2026-09-29-opencode-sdk-feasibility-spike/decisions.md` covers the reproducible command, environment versions, all nine capabilities, and limitations; `rg -n 'TODO|FIXME|PLACEHOLDER|<[^>]+>' README.md docs/ || true` returns no spec-related placeholders.
   - **Constraints**: This is the final group. Do not claim untested platform support or document later milestones as implemented.
+  - **Completed evidence**: Updated the README, technical notes, and decision record with the exact QA Cycle 2 environment and outcome, reproducible commands, all nine failed capability predicates and their evidence limitations, the distinction between Capability Verdict FAIL and QA Verdict PASS, verified cleanup, and the requirement to restore/preflight Ollama or reassess the architecture in a separate spec. The documentation states that Milestone 0 did not pass and Milestone 1 remains blocked without claiming inherent SDK failure. Required content search, spec-placeholder review, and `git diff --check` passed on 2026-09-30.

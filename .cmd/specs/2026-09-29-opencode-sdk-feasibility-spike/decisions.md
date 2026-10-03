@@ -55,3 +55,11 @@
 **Decision**: By explicit user authorization, run one narrowly scoped Review Cycle 5 covering only the user-directed Cycle 4 correction. If the fresh reviewer returns PASS with zero critical findings and zero warnings in that scope, mark the general review gate complete. Do not begin security review or QA as part of this authorization.
 
 **Rationale**: A focused independent check can close the escalated finding without reopening unrelated implementation scope. This authorization supersedes only the prior prohibition on creating Cycle 5; all other gate ordering remains unchanged.
+
+## 2026-09-30 — Record Milestone 0 capability failure and block Milestone 1
+
+**Context**: QA Cycle 2 ran the authoritative `npm run verify:live` command on macOS 26.7 arm64 with Node `v24.18.1`, npm `12.0.2`, and the project-local `opencode-ai@1.18.33` and `@opencode-ai/sdk@1.18.33`. The command exited `1` after 120.9 seconds. The authenticated server and first Core V2 session were created, but the initial prompt timed out after 120 seconds while the configured Ollama service was unavailable. All nine capability predicates reported `FAIL` because their complete evidence was absent; downstream streaming, permission handling, file modification, cancellation, normal two-session deletion, and session isolation stages were not reached.
+
+**Decision**: Record `Capability Verdict: FAIL` and conclude that Milestone 0 did not pass. Milestone 1 remains blocked. Do not interpret the separate QA `PASS` as feasibility success: it means only that the negative live run was reliable, finite, auditable, and cleaned up. Before any new feasibility cycle, restore and preflight the required Ollama/model environment or reassess the architecture and its dependency on that environment in a separate spec.
+
+**Rationale**: The PRD requires every capability predicate to pass before production work begins. The run produced trustworthy negative evidence for the tested environment, but it did not establish that the SDK inherently lacks the unexecuted capabilities. Documenting both the failure and its exact limitation preserves the milestone gate without overgeneralizing from an unavailable model service.

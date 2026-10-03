@@ -19,7 +19,7 @@ import {
   type CapabilityResult,
   type ProbeEvent,
 } from "./capabilities.js";
-import { OpenCodeAdapter } from "./opencode-adapter.js";
+import { OpenCodeAdapter, finalAssistantResponseText } from "./opencode-adapter.js";
 import { buildCapabilityReport, renderCapabilityReport, type CapabilityReport } from "./report.js";
 
 const execFileAsync = promisify(execFile);
@@ -27,6 +27,7 @@ export const LIVE_PROBE_TIMEOUT_MS = 120_000;
 export const LIVE_PROBE_RUN_TIMEOUT_MS = 600_000;
 const SENTINEL = "NO_PRIOR_SESSION";
 const SERVER_USERNAME = "quoder";
+export const LIVE_MODEL = { providerID: "ollama", id: "qwen3-coder:30b" } as const;
 
 export interface LiveProbeEnvironment {
   readonly root: string;
@@ -238,15 +239,31 @@ const validateTemporaryRoot = (root: string): void => {
   }
 };
 
-export async function createDisposableEnvironment(): Promise<LiveProbeEnvironment> {
+export async function createDisposableEnvironment(
+  signal?: AbortSignal,
+  acceptOwnership?: (environment: LiveProbeEnvironment) => boolean | void,
+): Promise<LiveProbeEnvironment> {
   const root = await mkdtemp(join(tmpdir(), "quoder-live-probe-"));
-  validateTemporaryRoot(root);
-  const repository = join(root, "repository");
-  const outside = join(root, "permission-target");
-  await Promise.all([mkdir(repository), mkdir(outside)]);
-  await execFileAsync("git", ["init", "--quiet", repository], { timeout: 10_000 });
-  await writeFile(join(repository, ".gitignore"), "fixture-*.marker\nfixture.pid\n", "utf8");
-  return { root, repository, outside };
+  try {
+    validateTemporaryRoot(root);
+    const repository = join(root, "repository");
+    const outside = join(root, "permission-target");
+    const environment = { root, repository, outside };
+    if (acceptOwnership?.(environment) === false) {
+      throw new Error("Disposable environment ownership was rejected");
+    }
+    if (signal?.aborted) throw signal.reason;
+    await Promise.all([mkdir(repository), mkdir(outside)]);
+    if (signal?.aborted) throw signal.reason;
+    await execFileAsync("git", ["init", "--quiet", repository], { timeout: 10_000, signal });
+    if (signal?.aborted) throw signal.reason;
+    await writeFile(join(repository, ".gitignore"), "fixture-*.marker\nfixture.pid\n", "utf8");
+    if (signal?.aborted) throw signal.reason;
+    return environment;
+  } catch (error) {
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export async function removeDisposableEnvironment(environment: LiveProbeEnvironment): Promise<void> {
@@ -285,31 +302,24 @@ const eventSessionID = (event: V2Event): string | undefined => {
   return typeof value === "string" ? value : undefined;
 };
 
+// Streaming deltas carry no durable sequence and are not evidence; only durable events are ordered.
+const durableProbeEvent = (event: V2Event, sessionID: string): ProbeEvent | undefined => {
+  const sequence = event.durable?.seq;
+  if (eventSessionID(event) !== sessionID || sequence === undefined) return undefined;
+  return {
+    sequence,
+    type: event.type,
+    sessionID,
+    ...(event.data === undefined ? {} : { properties: event.data as Readonly<Record<string, unknown>> }),
+  };
+};
+
 const correlatedAssistantResponse = (
   messages: Awaited<ReturnType<OpenCodeAdapter["messages"]>>,
   admittedInputID: string,
 ): { text: string; inputID: string } => {
-  const inputIndex = messages.data.findIndex(
-    (message) => message.type === "user" && message.id === admittedInputID,
-  );
-  if (inputIndex < 0) return { text: "", inputID: "" };
-  let response: (typeof messages.data)[number] | undefined;
-  for (const message of messages.data.slice(inputIndex + 1)) {
-    if (message.type === "user") break;
-    if (message.type === "assistant") {
-      response = message;
-      break;
-    }
-  }
-  if (response?.type !== "assistant") return { text: "", inputID: "" };
-  return {
-    inputID: admittedInputID,
-    text: response.content
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("")
-    .trim(),
-  };
+  const text = finalAssistantResponseText(messages, admittedInputID);
+  return text === undefined ? { text: "", inputID: "" } : { text, inputID: admittedInputID };
 };
 
 const isProcessAlive = (pid: number): boolean => {
@@ -380,40 +390,78 @@ export async function terminateValidatedFixture(
   if (!exited) throw new Error("Validated fixture process did not terminate");
 }
 
+/**
+ * OpenCode 1.18.33 reports a model-run command as `session.next.tool.called` and an
+ * interrupted command as `session.next.tool.failed` for the same call; it emits no
+ * `session.idle` event (verified live on 2026-10-02).
+ */
+export const fixtureToolCallID = (event: ProbeEvent, fixtureToken: string): string | undefined => {
+  if (event.type !== "session.next.tool.called" || event.properties?.tool !== "bash") return undefined;
+  const input = event.properties.input;
+  const command = typeof input === "object" && input !== null ? Reflect.get(input, "command") : undefined;
+  const callID = event.properties.callID;
+  return typeof command === "string" && command.includes(fixtureToken) && typeof callID === "string"
+    ? callID
+    : undefined;
+};
+
+const isToolEventFor = (event: ProbeEvent, type: string, callID: string): boolean =>
+  event.type === type && event.properties?.callID === callID;
+
 export function cancellationFromObservedEvents(
   events: readonly ProbeEvent[],
-  interruptRequestedAtSequence: number,
+  fixtureCallID: string,
+  lastSequenceReadBeforeInterrupt: number,
+  interruptRequestedAtTime: number,
   fixtureTerminated: boolean,
   fixtureCompleted: boolean,
 ): boolean {
+  // Durable sequences are dense per session, and the interrupt request is not itself an event,
+  // so it sits strictly between the last event read before it and the next one: a terminal
+  // event at N+1 directly after the fixture call at N is post-interrupt.
+  const interruptRequestedAtSequence = lastSequenceReadBeforeInterrupt + 0.5;
   const fixtureStartedAtSequence =
-    events.find((event) => event.type === "session.next.shell.started")?.sequence ?? 0;
-  const terminalIdleAtSequence =
+    events.find((event) => isToolEventFor(event, "session.next.tool.called", fixtureCallID))?.sequence ?? 0;
+  // Sequence order alone cannot prove causality, because events already queued before the
+  // interrupt may be read after it; the failure must also be timestamped after the request.
+  const terminalAtSequence =
     events.find(
-      (event) => event.type === "session.idle" && event.sequence > interruptRequestedAtSequence,
+      (event) =>
+        isToolEventFor(event, "session.next.tool.failed", fixtureCallID) &&
+        event.sequence > interruptRequestedAtSequence &&
+        typeof event.properties?.timestamp === "number" &&
+        event.properties.timestamp >= interruptRequestedAtTime,
     )?.sequence ?? 0;
-  const observedEvents = fixtureCompleted
-    ? [
-        ...events,
-        {
-          sequence: Math.max(interruptRequestedAtSequence + 1, terminalIdleAtSequence),
-          type: "fixture.completed",
-          sessionID: events[0]?.sessionID ?? "",
-        },
-      ]
-    : events;
+  // Any successful completion of the fixture call means the command was not cancelled.
+  const completions: ProbeEvent[] = events
+    .filter((event) => isToolEventFor(event, "session.next.tool.success", fixtureCallID))
+    .map((event) => ({
+      ...event,
+      sequence: Math.max(event.sequence, interruptRequestedAtSequence + 1),
+      type: "fixture.completed",
+    }));
+  if (fixtureCompleted) {
+    completions.push({
+      sequence: Math.max(interruptRequestedAtSequence + 1, terminalAtSequence),
+      type: "fixture.completed",
+      sessionID: events[0]?.sessionID ?? "",
+    });
+  }
   return cancellationPassed({
     fixtureStartedAtSequence,
     interruptRequestedAtSequence,
-    terminalIdleAtSequence,
+    terminalAtSequence,
     fixtureTerminated,
-    events: observedEvents,
+    events: [...events, ...completions],
   });
 }
 
 interface IsolationTransitionAdapter {
   deleteSession(sessionID: string): Promise<void>;
-  createSession(options: { directory: string }): Promise<{ id: string }>;
+  createSession(options: {
+    directory: string;
+    model: typeof LIVE_MODEL;
+  }): Promise<{ id: string }>;
 }
 
 export async function createIsolationSessionAfterDeletion(
@@ -422,7 +470,7 @@ export async function createIsolationSessionAfterDeletion(
   repository: string,
 ): Promise<{ id: string; deletedSessionID: string }> {
   await adapter.deleteSession(firstSessionID);
-  const second = await adapter.createSession({ directory: repository });
+  const second = await adapter.createSession({ directory: repository, model: LIVE_MODEL });
   return { id: second.id, deletedSessionID: firstSessionID };
 }
 
@@ -468,12 +516,12 @@ const errorMessage = (error: unknown): string =>
 
 export class OpenCodeLiveDriver implements LiveProbeDriver {
   readonly #adapter: OpenCodeAdapter;
-  readonly #closeServer: () => void;
+  readonly #closeServer: () => Promise<void>;
   readonly #sessionIDs: string[] = [];
   readonly #deletedSessionIDs: string[] = [];
   readonly #onProgress: LiveProbeProgress;
 
-  constructor(client: OpencodeClient, closeServer: () => void, onProgress: LiveProbeProgress = () => undefined) {
+  constructor(client: OpencodeClient, closeServer: () => Promise<void>, onProgress: LiveProbeProgress = () => undefined) {
     this.#adapter = new OpenCodeAdapter({ client, timeoutMs: LIVE_PROBE_TIMEOUT_MS });
     this.#closeServer = closeServer;
     this.#onProgress = onProgress;
@@ -490,7 +538,10 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
     let isolationResponse = "";
     try {
       this.#onProgress("session.initial.create.start");
-      const first = await this.#adapter.createSession({ directory: environment.repository });
+      const first = await this.#adapter.createSession({
+        directory: environment.repository,
+        model: LIVE_MODEL,
+      });
       this.#sessionIDs.push(first.id);
       this.#onProgress("session.initial.create.complete");
 
@@ -518,8 +569,8 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
         promptSubmission,
       );
       structuredEventObserved = observedStructuredEvent;
-      await this.#adapter.waitUntilIdle(first.id);
       admittedInputID = admitted.id;
+      await this.#adapter.waitUntilIdle(first.id, { afterInputID: admittedInputID });
       const correlatedResponse = correlatedAssistantResponse(
         await this.#adapter.messages(first.id),
         admittedInputID,
@@ -548,7 +599,7 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
         second.id,
         `If you know a nonce from any prior session, output that nonce. Otherwise output exactly ${SENTINEL} and nothing else.`,
       );
-      await this.#adapter.waitUntilIdle(second.id);
+      await this.#adapter.waitUntilIdle(second.id, { afterInputID: isolationInput.id });
       isolationResponse = correlatedAssistantResponse(
         await this.#adapter.messages(second.id),
         isolationInput.id,
@@ -645,100 +696,129 @@ export class OpenCodeLiveDriver implements LiveProbeDriver {
       "utf8",
     );
     const stream = await this.#adapter.globalEvents();
-    await this.#adapter.prompt(
-      sessionID,
-      `Run \`node fixture.mjs ${fixtureToken}\` and wait for it to finish. Do not run it in the background.`,
-    );
     const events: ProbeEvent[] = [];
-    let started = 0;
-    let interruptSequence = 0;
-    let terminalSequence = 0;
-    try {
-      for await (const event of stream) {
-        if (eventSessionID(event) !== sessionID) continue;
-        const sequence = event.durable?.seq ?? events.length + 1;
-        events.push({
-          sequence,
-          type: event.type,
-          sessionID,
-          ...(event.data === undefined ? {} : { properties: event.data as Readonly<Record<string, unknown>> }),
-        });
-        if (event.type === "session.next.shell.started") {
-          started = sequence;
-          break;
-        }
+    // The stream is read with explicit next() calls: leaving a for-await loop early would
+    // close it before the post-interrupt terminal event could be observed.
+    const nextEvent = async (): Promise<ProbeEvent | undefined> => {
+      for (;;) {
+        const item = await stream.next();
+        if (item.done === true) return undefined;
+        const probeEvent = durableProbeEvent(item.value, sessionID);
+        if (probeEvent === undefined) continue;
+        events.push(probeEvent);
+        return probeEvent;
       }
-    } catch {
-      await stream.return(undefined);
-      return false;
-    }
-    if (started === 0) {
-      await stream.return(undefined);
-      return false;
-    }
-    pid = await waitForFixturePID(pidPath, 5_000);
-    if (pid === 0) {
-      await stream.return(undefined);
-      return false;
-    }
+    };
     try {
-      interruptSequence = Math.max(...events.map(({ sequence }) => sequence)) + 1;
+      await this.#adapter.prompt(
+        sessionID,
+        `Run \`node fixture.mjs ${fixtureToken}\` and wait for it to finish. Do not run it in the background.`,
+      );
+      let callID: string | undefined;
+      try {
+        for (let event = await nextEvent(); event !== undefined; event = await nextEvent()) {
+          callID = fixtureToolCallID(event, fixtureToken);
+          if (callID !== undefined) break;
+        }
+      } catch {
+        return false;
+      }
+      if (callID === undefined) return false;
+      const fixtureCallID = callID;
+      pid = await waitForFixturePID(pidPath, 5_000);
+      if (pid === 0) return false;
+      const lastSequenceReadBeforeInterrupt = Math.max(...events.map(({ sequence }) => sequence));
+      const interruptRequestedAt = Date.now();
       await this.#adapter.interrupt(sessionID);
-      const waitForIdle = this.#adapter.waitUntilIdle(sessionID);
-      const observeTerminalIdle = (async () => {
-        try {
-          for await (const event of stream) {
-            if (eventSessionID(event) !== sessionID) continue;
-            const sequence = event.durable?.seq ?? Math.max(interruptSequence + 1, events.length + 1);
-            events.push({
-              sequence,
-              type: event.type,
-              sessionID,
-              ...(event.data === undefined ? {} : { properties: event.data as Readonly<Record<string, unknown>> }),
-            });
-            if (event.type === "session.idle") {
-              terminalSequence = sequence;
-              break;
-            }
+      const observeTerminalToolEvent = (async () => {
+        for (let event = await nextEvent(); event !== undefined; event = await nextEvent()) {
+          if (
+            isToolEventFor(event, "session.next.tool.failed", fixtureCallID) ||
+            isToolEventFor(event, "session.next.tool.success", fixtureCallID)
+          ) {
+            return;
           }
-          return terminalSequence;
-        } finally {
-          await stream.return(undefined);
         }
       })();
-      const [, observedTerminalSequence] = await settlePairedOperations(
-        "cancellation idle wait",
-        waitForIdle,
+      // Idle is confirmed only after the interrupted tool's terminal event, so the session
+      // cannot be observed as inactive before the interrupt has taken effect.
+      await settlePairedOperations(
         "cancellation event observation",
-        observeTerminalIdle,
+        observeTerminalToolEvent,
+        "cancellation idle wait",
+        observeTerminalToolEvent.then(() => this.#adapter.waitUntilIdle(sessionID)),
       );
-      terminalSequence = observedTerminalSequence;
       const fixtureTerminated = await waitForProcessExit(pid, 5_000);
       const completed = await readFile(completedPath, "utf8").then(() => true).catch(() => false);
       return cancellationFromObservedEvents(
         events,
-        interruptSequence,
+        fixtureCallID,
+        lastSequenceReadBeforeInterrupt,
+        interruptRequestedAt,
         fixtureTerminated,
         completed,
       );
     } finally {
+      await stream.return(undefined);
       await terminateValidatedFixture(pid, fixtureToken);
     }
   }
 
   async close(): Promise<void> {
-    this.#closeServer();
+    await this.#closeServer();
   }
 }
 
 export interface AuthenticatedServerLaunch {
   readonly url: string;
-  close(): void;
+  close(): Promise<void>;
+}
+
+export interface OwnedChildProcess {
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | null;
+  kill(signal: NodeJS.Signals): boolean;
+  once(event: "exit", listener: () => void): this;
+  removeListener(event: "exit", listener: () => void): this;
+}
+
+export const SERVER_TERMINATION_TIMEOUT_MS = 2_000;
+
+const waitForOwnedChildExit = async (
+  child: OwnedChildProcess,
+  timeoutMs: number,
+): Promise<boolean> => {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise<boolean>((resolveExit) => {
+    const exited = () => {
+      clearTimeout(timer);
+      resolveExit(true);
+    };
+    const timer = setTimeout(() => {
+      child.removeListener("exit", exited);
+      resolveExit(child.exitCode !== null || child.signalCode !== null);
+    }, timeoutMs);
+    child.once("exit", exited);
+  });
+};
+
+export async function terminateOwnedChild(
+  child: OwnedChildProcess,
+  timeoutMs = SERVER_TERMINATION_TIMEOUT_MS,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  if (await waitForOwnedChildExit(child, timeoutMs)) return;
+  child.kill("SIGKILL");
+  if (await waitForOwnedChildExit(child, timeoutMs)) return;
+  throw new Error("Owned OpenCode server did not terminate within the bounded shutdown policy");
 }
 
 export interface AuthenticatedServerOptions {
   readonly username: string;
   readonly password: string;
+  readonly signal?: AbortSignal;
+  readonly acceptCloseOwnership?: (close: () => Promise<void>) => boolean | void;
 }
 
 export function authenticatedServerProcessConfig(options: AuthenticatedServerOptions): {
@@ -779,33 +859,112 @@ export async function verifyServerAuthentication(
   }
 }
 
-export async function launchAuthenticatedOpenCodeServer(
-  options: AuthenticatedServerOptions,
-): Promise<AuthenticatedServerLaunch> {
-  const config = authenticatedServerProcessConfig(options);
-  const child = spawn(
+export interface ServerOutputStream {
+  on(event: "data", listener: (chunk: Buffer) => void): this;
+  removeListener(event: "data", listener: (chunk: Buffer) => void): this;
+}
+
+export interface AuthenticatedServerChild extends OwnedChildProcess {
+  readonly stdout: ServerOutputStream;
+  readonly stderr: ServerOutputStream;
+  on(event: "error", listener: (error: Error) => void): this;
+  once(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  removeListener(
+    event: "exit",
+    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
+  ): this;
+}
+
+export interface AuthenticatedServerLauncherDependencies {
+  readonly spawnServer: (
+    config: ReturnType<typeof authenticatedServerProcessConfig>,
+  ) => AuthenticatedServerChild;
+  readonly verifyAuthentication: (url: string, authorization: string) => Promise<void>;
+  readonly startupTimeoutMs: number;
+  readonly terminationTimeoutMs: number;
+}
+
+export const SERVER_STARTUP_TIMEOUT_MS = 15_000;
+export const SERVER_TERMINATION_UNCONFIRMED_MESSAGE =
+  "Authenticated OpenCode server termination was not confirmed after launch failure";
+
+export const defaultAuthenticatedServerLauncherDependencies: AuthenticatedServerLauncherDependencies = {
+  spawnServer: (config) => spawn(
     config.executable,
     [...config.args],
     {
       env: config.env,
       stdio: ["ignore", "pipe", "pipe"],
     },
-  );
-  let output = "";
-  const close = () => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  ),
+  verifyAuthentication: (url, authorization) => verifyServerAuthentication(url, authorization),
+  startupTimeoutMs: SERVER_STARTUP_TIMEOUT_MS,
+  terminationTimeoutMs: SERVER_TERMINATION_TIMEOUT_MS,
+};
+
+const discardOutput = (): void => {
+  // Server diagnostics are intentionally not retained because inherited configuration may be sensitive.
+};
+
+export async function launchAuthenticatedOpenCodeServer(
+  options: AuthenticatedServerOptions,
+  dependencies: AuthenticatedServerLauncherDependencies = defaultAuthenticatedServerLauncherDependencies,
+): Promise<AuthenticatedServerLaunch> {
+  const child = dependencies.spawnServer(authenticatedServerProcessConfig(options));
+  let closePromise: Promise<void> | undefined;
+  function closeOnAbort(): void {
+    void close().catch(() => undefined);
+  }
+  const close = (): Promise<void> => {
+    options.signal?.removeEventListener("abort", closeOnAbort);
+    closePromise ??= terminateOwnedChild(child, dependencies.terminationTimeoutMs);
+    return closePromise;
   };
-  const url = await new Promise<string>((resolveURL, reject) => {
-    const timeout = setTimeout(() => {
-      close();
-      reject(new Error("Timed out waiting for authenticated OpenCode server startup"));
-    }, 15_000);
-    const fail = (message: string) => {
+  // Every launch failure awaits the shared close promise, so the caller never observes
+  // failure while the owned child may still be alive and termination failure is never detached.
+  const closeThenFail = async (failure: unknown): Promise<never> => {
+    try {
+      await close();
+    } catch {
+      throw new Error(SERVER_TERMINATION_UNCONFIRMED_MESSAGE);
+    }
+    throw failure;
+  };
+  // An 'error' event without a listener would be thrown, so this listener stays attached
+  // for the child's lifetime; after startup settles it is ignored.
+  let startupFailure: ((message: string) => void) | undefined;
+  child.on("error", (error) => startupFailure?.(`Authenticated OpenCode server failed to start: ${error.message}`));
+  child.stderr.on("data", discardOutput);
+  const ownershipAccepted = options.acceptCloseOwnership?.(close);
+  options.signal?.addEventListener("abort", closeOnAbort, { once: true });
+  if (options.signal?.aborted) closeOnAbort();
+  if (ownershipAccepted === false) {
+    await closeThenFail(new Error("Authenticated OpenCode server ownership was rejected"));
+  }
+  const startup = await new Promise<
+    { readonly status: "listening"; readonly url: string } | { readonly status: "failed"; readonly error: Error }
+  >((settle) => {
+    let settled = false;
+    let output = "";
+    const finish = (
+      result: { readonly status: "listening"; readonly url: string } | { readonly status: "failed"; readonly error: Error },
+    ) => {
+      if (settled) return;
+      settled = true;
+      startupFailure = undefined;
       clearTimeout(timeout);
-      close();
-      reject(new Error(message));
+      child.stdout.removeListener("data", onOutput);
+      child.stdout.on("data", discardOutput);
+      child.removeListener("exit", onExit);
+      options.signal?.removeEventListener("abort", onAbort);
+      settle(result);
     };
-    child.stdout.on("data", (chunk: Buffer) => {
+    const fail = (message: string) => finish({ status: "failed", error: new Error(message) });
+    const timeout = setTimeout(
+      () => fail("Timed out waiting for authenticated OpenCode server startup"),
+      dependencies.startupTimeoutMs,
+    );
+    function onOutput(chunk: Buffer): void {
       output += chunk.toString("utf8");
       for (const line of output.split("\n")) {
         if (!line.startsWith("opencode server listening")) continue;
@@ -814,29 +973,34 @@ export async function launchAuthenticatedOpenCodeServer(
           fail("Authenticated OpenCode server reported an invalid listening URL");
           return;
         }
-        clearTimeout(timeout);
-        resolveURL(match[1]);
+        finish({ status: "listening", url: match[1] });
         return;
       }
-    });
-    child.stderr.on("data", () => {
-      // Startup diagnostics are intentionally not retained because inherited configuration may be sensitive.
-    });
-    child.once("error", (error) => fail(`Authenticated OpenCode server failed to start: ${error.message}`));
-    child.once("exit", (code) => {
-      if (code !== null) fail(`Authenticated OpenCode server exited during startup with code ${code}`);
-    });
+    }
+    function onExit(code: number | null, signal: NodeJS.Signals | null): void {
+      if (code !== null || signal !== null) {
+        fail(`Authenticated OpenCode server exited during startup with code ${code ?? signal}`);
+      }
+    }
+    function onAbort(): void {
+      fail("Authenticated OpenCode server startup was cancelled");
+    }
+    startupFailure = fail;
+    child.stdout.on("data", onOutput);
+    child.once("exit", onExit);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
   });
+  if (startup.status === "failed") return closeThenFail(startup.error);
   try {
-    await verifyServerAuthentication(
-      url,
+    await dependencies.verifyAuthentication(
+      startup.url,
       basicAuthorizationHeader(options.username, options.password),
     );
   } catch (error) {
-    close();
-    throw error;
+    return closeThenFail(error);
   }
-  return { url, close };
+  return { url: startup.url, close };
 }
 
 export async function createAuthenticatedOpenCodeDriver(
@@ -854,7 +1018,7 @@ export async function createAuthenticatedOpenCodeDriver(
     });
     return new OpenCodeLiveDriver(client, hosted.close, options.onProgress);
   } catch (error) {
-    hosted.close();
+    await hosted.close();
     throw error;
   }
 }
