@@ -16,7 +16,17 @@ export type StyleRole =
   | "emphasis"
   | "code"
   | "quote"
-  | "link";
+  | "link"
+  | "strike"
+  | "codeKeyword"
+  | "codeString"
+  | "codeNumber"
+  | "codeComment"
+  | "codeTitle"
+  | "codeType"
+  | "codeMeta"
+  | "codeAddition"
+  | "codeDeletion";
 
 type StyleFormat = Parameters<typeof styleText>[0];
 
@@ -36,6 +46,16 @@ const PALETTE: Readonly<Record<StyleRole, StyleFormat>> = {
   code: "yellow",
   quote: ["gray", "italic"],
   link: ["underline", "blue"],
+  strike: "strikethrough",
+  codeKeyword: "magenta",
+  codeString: "green",
+  codeNumber: "yellow",
+  codeComment: ["gray", "italic"],
+  codeTitle: "blue",
+  codeType: "cyan",
+  codeMeta: "gray",
+  codeAddition: "green",
+  codeDeletion: "red",
 };
 
 /**

@@ -53,13 +53,19 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
 
 ## Group 4: Markdown and highlighting
 
-- [ ] Add the incremental block renderer and highlighter | `src/ui/markdown.ts`, `src/ui/highlight.ts`, `tests/unit/`
+- [x] Add the incremental block renderer and highlighter | `src/ui/markdown.ts`, `src/ui/highlight.ts`, `tests/unit/`
   - **Accept**:
     - Blocks print once complete, and a growing paragraph flushes at line boundaries after an idle interval.
     - `text.ended` finalizes a block.
     - Code fences are highlighted for the registered languages and printed plainly otherwise.
     - Highlighter output is sanitized.
     - Without colour, the renderer prints readable plain text.
+  - **Completed evidence**:
+    - `renderMarkdown` renders headings, paragraphs, emphasis, strikethrough, inline code, links, images, lists (nested, ordered, loose, task), blockquotes, tables (aligned columns), rules and code fences. It uses the `marked` lexer only, and source is sanitized before lexing.
+    - `MarkdownStream` prints blocks as they complete: after a blank line, a closing fence, or a heading or rule line. `flushLines` prints a slow paragraph's complete lines and continues it without a gap. Fences wait for their closing fence. `end(full)` renders a missing tail and returns false when the text does not match.
+    - The output is identical for delta sizes 1, 3, 7 and 64.
+    - `highlightLines` uses highlight.js `lib/common` (36 languages, about 19 ms to load), the fence language only, and per-line styling. Entities are decoded and every piece is re-sanitized. A test checks that coloured output contains only SGR sequences.
+    - 17 new tests; 284 tests in total.
 
 ## Group 5: Live view and harness integration
 
