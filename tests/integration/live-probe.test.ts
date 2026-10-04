@@ -1020,6 +1020,30 @@ describe("authenticated server startup lifecycle", () => {
     expect(child.signals).toEqual(["SIGTERM"]);
   });
 
+  it("stops a live server if the Quoder process exits, and unregisters once the server has exited", async () => {
+    const child = new FakeServerChild(5);
+    let hook: (() => void) | undefined;
+    const unregister = vi.fn();
+    const launch = launchAuthenticatedOpenCodeServer(
+      credentials,
+      launcher(child, {
+        onProcessExit: (registered) => {
+          hook = registered;
+          return unregister;
+        },
+      }),
+    );
+    child.listen("opencode server listening on http://127.0.0.1:4096");
+    await expect(launch).resolves.toMatchObject({ url: "http://127.0.0.1:4096" });
+
+    hook?.();
+    expect(child.signals).toEqual(["SIGTERM"]);
+    await vi.waitFor(() => expect(child.exited).toBe(true));
+    expect(unregister).toHaveBeenCalledTimes(1);
+    hook?.();
+    expect(child.signals).toEqual(["SIGTERM"]);
+  });
+
   it("rejects premature exit without signalling the already-exited child", async () => {
     const child = new FakeServerChild();
     const launch = observe(launchAuthenticatedOpenCodeServer(credentials, launcher(child)), child);

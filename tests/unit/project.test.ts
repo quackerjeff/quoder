@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -21,6 +21,21 @@ describe("project resolution", () => {
       root: "/tmp/scratch-project",
       name: "scratch-project",
     });
+  });
+
+  it("canonicalizes a symlinked or non-canonical launch directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quoder-project-test-"));
+    try {
+      await mkdir(join(root, "QuackTrack"));
+      await symlink(join(root, "QuackTrack"), join(root, "link"));
+      // On macOS tmpdir() is itself under the /var -> /private/var symlink.
+      await expect(resolveProject(join(root, "link"), async () => undefined)).resolves.toEqual({
+        root: await realpath(join(root, "QuackTrack")),
+        name: "QuackTrack",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("finds the real repository root from a subdirectory with git", async () => {

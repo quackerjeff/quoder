@@ -36,6 +36,8 @@ export interface EventMonitorOptions {
   readonly onQuestionRejected?: (question: QuestionAsked, rejected: boolean) => void;
   /** Called when the subscription ends for any reason other than `stop()`. */
   readonly onEnded?: () => void;
+  /** Called synchronously with each `session.next.*` event (raw) of an own session, for display. */
+  readonly onSessionEvent?: (event: { readonly type: string; readonly data: unknown }) => void;
   /** Called after a permission request has been recorded; the caller decides how to reply. */
   readonly onPermissionAsked?: (permission: PermissionAsked) => void;
 }
@@ -84,6 +86,17 @@ export async function startEventMonitor(options: EventMonitorOptions): Promise<E
       // The 1.18.33 server sends `server.connected` first, once the subscription is registered.
       if (event.type === "server.connected") {
         confirmConnected();
+        continue;
+      }
+      if (event.type.startsWith("session.next.") && options.onSessionEvent !== undefined) {
+        const sessionID = eventSessionID(event);
+        if (sessionID !== undefined && options.isOwnSession(sessionID)) {
+          try {
+            options.onSessionEvent({ type: event.type, data: event.data });
+          } catch {
+            // A display callback must never end the monitor.
+          }
+        }
         continue;
       }
       if (event.type !== "question.v2.asked" && event.type !== "permission.v2.asked") continue;

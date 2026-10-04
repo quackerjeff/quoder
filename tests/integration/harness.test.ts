@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { EventMonitorOptions } from "../../src/event-monitor.js";
 import { Harness, type HarnessTraceEvent } from "../../src/harness/repl.js";
 import type { AuthenticatedServerOptions } from "../../src/opencode-server.js";
+import { createTheme, type Theme } from "../../src/ui/style.js";
 
 const MODEL = { providerID: "ollama", id: "glm-4.7-flash:latest" };
 const PROJECT = { root: "/work/QuackTrack", name: "QuackTrack" };
@@ -35,6 +36,8 @@ interface FakeOptions {
  * A fake OpenCode behind the real adapter. Prompt text selects the scripted behaviour:
  * "perm…" raises a permission request (and ends the turn), "permok…" raises one and still answers,
  * "ask…" raises a question, "slow…" runs until interrupted, "boom…" ends with a step error;
+ * "stream…" streams text and a read tool before answering ("streammiss…" drops part of the final
+ * text from the stream; "streamslow…" streams, starts a bash tool, and runs until interrupted);
  * anything else is answered with "Answer: <prompt>". While `dead`, every call fails like a
  * stopped server.
  */
@@ -48,6 +51,29 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
   const alive = async () => {
     if (state.dead) throw new TypeError("fetch failed");
   };
+  const STREAMED_ANSWER = "Streamed **answer** done.";
+  const emit = (type: string, data: Record<string, unknown>) => state.monitor?.onSessionEvent?.({ type: `session.next.${type}`, data });
+  /** The live display events a real OpenCode would publish for a "stream…" prompt (shapes verified live). */
+  const streamEvents = (sessionID: string, text: string) => {
+    const base = { timestamp: 1, sessionID };
+    emit("step.started", { ...base, assistantMessageID: `step-${sessionID}`, agent: "build", model: MODEL });
+    for (const delta of ["Reading ", "the file.", "\n\n"]) emit("text.delta", { ...base, assistantMessageID: `step-${sessionID}`, textID: "t1", delta });
+    emit("tool.input.started", { ...base, assistantMessageID: `step-${sessionID}`, callID: "c1", name: "read" });
+    emit("tool.called", { ...base, assistantMessageID: `step-${sessionID}`, callID: "c1", tool: "read", input: { path: `${PROJECT.root}/notes.txt` } });
+    emit("text.ended", { ...base, assistantMessageID: `step-${sessionID}`, textID: "t1", text: "Reading the file.\n\n" });
+    emit("tool.success", { ...base, assistantMessageID: `step-${sessionID}`, callID: "c1", structured: { content: "alpha\nbeta\n" }, content: [], outputPaths: [] });
+    emit("step.ended", { ...base, assistantMessageID: `step-${sessionID}`, finish: "tool-calls", cost: 0, tokens: { input: 900, output: 40, reasoning: 0, cache: { read: 0, write: 0 } } });
+    if (text.startsWith("streamslow")) {
+      emit("step.started", { ...base, assistantMessageID: `slow-${sessionID}`, agent: "build", model: MODEL });
+      emit("tool.called", { ...base, assistantMessageID: `slow-${sessionID}`, callID: "c2", tool: "bash", input: { command: "sleep 60" } });
+      return;
+    }
+    emit("step.started", { ...base, assistantMessageID: `asst-${sessionID}`, agent: "build", model: MODEL });
+    const deltas = text.startsWith("streammiss") ? ["Streamed "] : ["Streamed **ans", "wer** done."];
+    for (const delta of deltas) emit("text.delta", { ...base, assistantMessageID: `asst-${sessionID}`, textID: "t2", delta });
+    if (!text.startsWith("streammiss")) emit("text.ended", { ...base, assistantMessageID: `asst-${sessionID}`, textID: "t2", text: STREAMED_ANSWER });
+    emit("step.ended", { ...base, assistantMessageID: `asst-${sessionID}`, finish: "stop", cost: 0, tokens: { input: 1000, output: 1200, reasoning: 0, cache: { read: 0, write: 0 } } });
+  };
   const turn = (sessionID: string) => {
     const prompt = prompts.get(sessionID) ?? "";
     const userMessage = { id: `input-${sessionID}`, type: "user", time: { created: 1 }, text: prompt };
@@ -57,7 +83,8 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
     if (prompt.startsWith("perm") || prompt.startsWith("ask")) {
       return [userMessage, { ...done(""), time: { created: 2 }, content: [{ type: "tool", tool: "read" }] }];
     }
-    if (prompt.startsWith("slow")) {
+    if (prompt.startsWith("stream") && !prompt.startsWith("streamslow")) return [userMessage, done(STREAMED_ANSWER)];
+    if (prompt.startsWith("slow") || prompt.startsWith("streamslow")) {
       return interrupted.has(sessionID)
         ? [userMessage, done("partial", { finish: "error", error: { type: "unknown", message: "Provider turn interrupted" } })]
         : [userMessage];
@@ -86,6 +113,7 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
           if (text.startsWith("perm")) {
             state.monitor?.onPermissionAsked?.({ sessionID, requestID: `per_${sessionID}`, action: "external_directory", resourceCount: 1 });
           }
+          if (text.startsWith("stream")) streamEvents(sessionID, text);
           if (text.startsWith("ask")) {
             const question = { sessionID, requestID: `que_${sessionID}`, questions: [{ question: "Which language?", options: [{ label: "Rust" }] }] };
             state.monitor?.onQuestionAsked?.(question);
@@ -95,7 +123,7 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
         }),
         active: vi.fn(async () => {
           await alive();
-          const running = [...prompts.keys()].filter((id) => prompts.get(id)?.startsWith("slow") && !interrupted.has(id));
+          const running = [...prompts.keys()].filter((id) => /^(slow|streamslow)/u.test(prompts.get(id) ?? "") && !interrupted.has(id));
           return result({ data: Object.fromEntries(running.map((id) => [id, { type: "running" }])) });
         }),
         messages: vi.fn(async (parameters: { sessionID: string }) => {
@@ -144,6 +172,7 @@ interface HarnessRunOptions extends FakeOptions {
   /** The first launch waits for this gate, or rejects when its abort signal fires. */
   readonly launchGate?: ReturnType<typeof gate>;
   readonly monitorUnconfirmed?: boolean;
+  readonly theme?: Theme;
 }
 
 const startHarness = (options: HarnessRunOptions = {}) => {
@@ -159,7 +188,14 @@ const startHarness = (options: HarnessRunOptions = {}) => {
   const launchOptions: AuthenticatedServerOptions[] = [];
   const counts = { launched: 0, closed: 0, monitorsStopped: 0 };
   const harness = new Harness(
-    { project: PROJECT, model: MODEL, input, output, terminal: options.terminal ?? false },
+    {
+      project: PROJECT,
+      model: MODEL,
+      input,
+      output,
+      terminal: options.terminal ?? false,
+      ...(options.theme === undefined ? {} : { theme: options.theme, columns: () => 60 }),
+    },
     {
       launchServer: vi.fn(async (launch: AuthenticatedServerOptions) => {
         launchOptions.push(launch);
@@ -218,7 +254,7 @@ describe("quoder harness (Milestone 1)", () => {
     expect(sessionsCreated(run.trace)).toEqual(["ses_1", "ses_2"]);
     expect(sessionsDeleted(run.trace)).toEqual(["ses_1", "ses_2"]);
     expect(run.calls).toContain("create:ses_1:/work/QuackTrack");
-    expect(run.output()).toContain("QuackTrack > ");
+    expect(run.output()).toContain("QuackTrack ❯ ");
     expect(run.output()).toContain("Answer: first question");
     expect(run.output()).toContain("Answer: second question");
     expect(run.trace.at(-1)).toEqual({ event: "server.stopped" });
@@ -322,7 +358,7 @@ describe("quoder harness (Milestone 1)", () => {
     await vi.waitFor(() => expect(run.calls).toContain("prompt:ses_1"));
 
     run.harness.interrupt();
-    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled."));
+    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled after"));
     run.input.end("next prompt\n");
 
     await expect(run.finished).resolves.toBe(0);
@@ -340,7 +376,7 @@ describe("quoder harness (Milestone 1)", () => {
 
     run.harness.interrupt();
     createGate.release();
-    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled."));
+    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled after"));
     run.input.end();
 
     await expect(run.finished).resolves.toBe(0);
@@ -350,7 +386,7 @@ describe("quoder harness (Milestone 1)", () => {
 
   it("Ctrl-C at an idle prompt leaves Quoder and stops the server", async () => {
     const run = startHarness();
-    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack > "));
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
 
     run.harness.interrupt();
 
@@ -459,7 +495,7 @@ describe("quoder harness (Milestone 1)", () => {
 
   it("reports one notice when the event stream drops before the server exits at idle", async () => {
     const run = startHarness();
-    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack > "));
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
 
     run.fake.state.monitor?.onEnded?.();
     run.exits[0]?.();
@@ -491,7 +527,7 @@ describe("quoder harness in an interactive terminal", () => {
   it("refuses typing while busy, cancels on Ctrl-C, hints on a second Ctrl-C, and exits on Ctrl-C when idle", async () => {
     const deleteGate = gate();
     const run = startHarness({ terminal: true, deleteGate });
-    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack > "));
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
 
     run.input.write("slow task\r");
     await vi.waitFor(() => expect(run.calls).toContain("prompt:ses_1"));
@@ -503,7 +539,7 @@ describe("quoder harness in an interactive terminal", () => {
     run.input.write("\u0003");
     await vi.waitFor(() => expect(run.output()).toContain("Still cleaning up the cancelled prompt"));
     deleteGate.release();
-    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled."));
+    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled after"));
 
     run.input.write("\u0003");
     await expect(run.finished).resolves.toBe(0);
@@ -515,7 +551,7 @@ describe("quoder harness in an interactive terminal", () => {
 
   it("exits on Ctrl-D at an empty prompt", async () => {
     const run = startHarness({ terminal: true });
-    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack > "));
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
 
     run.input.write("\u0004");
 
@@ -525,14 +561,99 @@ describe("quoder harness in an interactive terminal", () => {
 
   it("redraws the prompt after a notice shown while idle", async () => {
     const run = startHarness({ terminal: true });
-    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack > "));
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
 
     run.exits[0]?.();
     await vi.waitFor(() => expect(run.output()).toContain("The OpenCode server stopped unexpectedly"));
 
     const afterNotice = run.output().split("The OpenCode server stopped unexpectedly")[1] ?? "";
-    expect(afterNotice).toContain("QuackTrack > ");
+    expect(afterNotice).toContain("QuackTrack ❯ ");
     run.input.write("\u0004");
     await expect(run.finished).resolves.toBe(0);
+  });
+});
+
+describe("quoder harness live view (Milestone 2)", () => {
+  const occurrences = (text: string, part: string) => text.split(part).length - 1;
+
+  it("streams text and tool activity in order, then shows the final status without repeating the answer", async () => {
+    const run = startHarness();
+    run.input.write("stream please\n");
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+
+    const output = run.output();
+    const order = ["Reading the file.", "✓ ● Read   notes.txt  2 lines", "Streamed answer done.", "✓ Done in"].map((part) => output.indexOf(part));
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(occurrences(output, "Streamed answer done.")).toBe(1);
+    expect(output).toMatch(/✓ Done in \d+\.\ds · 1 tool · 1\.2k tokens/u);
+    // Piped output carries no cursor control and no colour.
+    expect(output).not.toContain("\u001b");
+    const events = run.trace.map((event) => event.event);
+    expect(events.indexOf("stream.first-text")).toBeGreaterThan(-1);
+    expect(events.indexOf("stream.first-text")).toBeLessThan(events.indexOf("prompt.completed"));
+    expect(run.trace).toContainEqual({ event: "activity.tool", tool: "read" });
+    expect(sessionsDeleted(run.trace)).toEqual(["ses_1"]);
+  });
+
+  it("prints the full answer when the stream missed part of it", async () => {
+    const run = startHarness();
+    run.input.write("streammiss please\n");
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("(The streamed answer was incomplete; the full answer follows.)");
+    expect(run.output()).toContain("Streamed answer done.");
+  });
+
+  it("prints an answer that was not streamed at all", async () => {
+    const run = startHarness();
+    run.input.write("plain question\n");
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(occurrences(run.output(), "Answer: plain question")).toBe(1);
+    expect(run.output()).not.toContain("incomplete");
+  });
+
+  it("cancels mid-stream: unfinished tools are marked cancelled and the harness stays active", async () => {
+    const run = startHarness();
+    run.input.write("streamslow work\nafter cancel\n");
+    await vi.waitFor(() => expect(run.output()).toContain("✓ ● Read   notes.txt"));
+
+    run.harness.interrupt();
+    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled after"));
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+
+    const output = run.output();
+    expect(output).toContain("Cancelling OpenCode execution…");
+    expect(output).toContain("– $ Run    sleep 60  cancelled");
+    expect(output).toContain("Harness session remains active.");
+    expect(output.indexOf("Cancelling OpenCode execution")).toBeLessThan(output.indexOf("– $ Run    sleep 60"));
+    expect(run.calls).toContain("interrupt:ses_1");
+    expect(sessionsDeleted(run.trace)).toEqual(["ses_1", "ses_2"]);
+    expect(output).toContain("Answer: after cancel");
+  });
+
+  it("draws an animated, erasable status line and colour on an interactive terminal", async () => {
+    const run = startHarness({ terminal: true, theme: createTheme(true) });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack"));
+    run.input.write("streamslow work\r");
+    await vi.waitFor(() => expect(run.output()).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/u));
+    await vi.waitFor(() => expect(run.output()).toContain("Running sleep 60"));
+
+    run.input.write("\u0003");
+    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled after"));
+    run.input.write("\u0003");
+    await expect(run.finished).resolves.toBe(0);
+
+    const output = run.output();
+    expect(output).toContain("\r\u001b[2K");
+    expect(output).toContain("\u001b[1m\u001b[36mQuackTrack\u001b[39m\u001b[22m");
+    // Status frames never exceed the terminal width (60 columns here).
+    const frames = output.split("\r\u001b[2K").map((frame) => frame.split("\n")[0] ?? "");
+    for (const frame of frames) expect([...frame.replace(/\u001b\[[0-9;]*m/gu, "")].length).toBeLessThanOrEqual(60);
   });
 });

@@ -69,7 +69,7 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
 
 ## Group 5: Live view and harness integration
 
-- [ ] Wire the monitor, runner and live view; add status line, final status, reconciliation and cancellation display | `src/event-monitor.ts`, `src/harness/`, `src/ui/status-line.ts`, `src/cli.ts`, `tests/`
+- [x] Wire the monitor, runner and live view; add status line, final status, reconciliation and cancellation display | `src/event-monitor.ts`, `src/harness/`, `src/ui/status-line.ts`, `src/cli.ts`, `tests/`
   - **Accept**:
     - The monitor forwards own-session `session.next.*` events.
     - `resolveProject` canonicalizes the project root with `realpath`, and a unit test covers a symlinked launch directory.
@@ -79,6 +79,22 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
     - Cancellation output matches FR-12.
     - The trace gains `stream.first-text` and `activity.tool` (names and counts only).
     - All Milestone 1 integration tests still pass, and new integration tests cover TTY, piped output, mid-stream cancellation and a missed delta.
+  - **Completed evidence**:
+    - `startEventMonitor` gains `onSessionEvent` for own-session `session.next.*` events.
+    - `src/harness/live-view.ts` (`LiveView`) provides:
+      - the TTY status line: spinner, phase, elapsed time, model and reasoning preview. It is redrawn at 10 Hz, truncated to `columns - 1`, and erased before permanent output;
+      - streamed Markdown for each text block;
+      - an idle flush after 400 ms;
+      - tool lines when tools finish, with unfinished tools marked cancelled;
+      - blank lines between text and tool output;
+      - reconciliation of the final step's streamed text with the authoritative answer. The full answer is printed when nothing was streamed, or after a note when the stream was incomplete.
+    - The runner itself is unchanged: completion and final-answer selection are as in Milestone 1. The view finds the final message from the last `step.started`, so the runner needs no `onEvent` sink.
+    - `formatResult(result, theme, stats)` no longer repeats the answer. It prints notes and the reason the turn ended, then the status line: `✓ Done in Xs · N tools · Nk tokens`, `– Execution cancelled after Xs. Harness session remains active.`, `✗ Failed after`, or `! Stopped after`.
+    - The banner, prompt (`QuackTrack ❯`) and notices are coloured. `--no-color`, `NO_COLOR` and `FORCE_COLOR` are wired through `colorEnabled`.
+    - The trace adds `stream.first-text` and `activity.tool` (tool name only).
+    - `resolveProject` uses `realpath`, with a symlink test.
+    - **Found and fixed:** a closed output pipe crashed Quoder on `EPIPE` and orphaned the server (a defect from Milestone 1). The CLI now terminates cleanly with code 141 on an output error, and the launcher's process-exit hook stops a live server. Details are in `decisions.md`.
+    - 303 tests pass (302 before the fix), including 5 new integration tests (stream order without a repeated answer, missed delta, unstreamed answer, mid-stream cancellation, TTY status line within width), 10 live-view unit tests and a rewritten format suite.
 
 ## Group 6: Live acceptance check
 

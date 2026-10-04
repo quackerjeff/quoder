@@ -1,5 +1,7 @@
+import { PLAIN_THEME, type Theme } from "../ui/style.js";
+import type { TurnStats } from "./live-view.js";
 import type { PromptResult, RejectedPermission, TurnOutcome } from "./session-runner.js";
-import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
+import { sanitizeLine } from "./terminal-text.js";
 
 const seconds = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
 
@@ -24,42 +26,66 @@ const notes = (result: PromptResult): string[] => {
   return lines;
 };
 
-const describeOutcome = (outcome: TurnOutcome): string => {
+/** Why a turn ended without an answer; the answer itself is shown by the live view. */
+const describeOutcome = (outcome: TurnOutcome, theme: Theme): string | undefined => {
   switch (outcome.kind) {
     case "answered":
-      return sanitizeForTerminal(outcome.text);
-    case "permission-rejected": {
-      return [
-        `OpenCode asked for permission (${describePermission(outcome)}).`,
-        "Quoder cannot grant permissions interactively yet, so the request was not granted and the turn ended.",
-      ].join("\n");
-    }
+    case "cancelled":
+      return undefined;
+    case "permission-rejected":
+      return theme.paint(
+        "warning",
+        [
+          `OpenCode asked for permission (${describePermission(outcome)}).`,
+          "Quoder cannot grant permissions interactively yet, so the request was not granted and the turn ended.",
+        ].join("\n"),
+      );
     case "question-rejected": {
       const lines = outcome.questions.map(({ question, options }) => {
         const choices = options.length > 0 ? ` (${options.map((option) => sanitizeLine(option, 60)).join(" / ")})` : "";
-        return `  ${sanitizeLine(question)}${choices}`;
+        return `  ${theme.paint("strong", sanitizeLine(question))}${theme.paint("dim", choices)}`;
       });
       return [
-        "The model asked a question, which Quoder cannot answer interactively yet:",
+        theme.paint("warning", "The model asked a question, which Quoder cannot answer interactively yet:"),
         ...(lines.length > 0 ? lines : ["  (no question text was provided)"]),
         "Answer it in your next prompt.",
       ].join("\n");
     }
-    case "cancelled":
-      return "Execution cancelled.";
     case "failed":
-      return `The prompt did not complete: ${sanitizeLine(outcome.reason)}`;
+      return theme.paint("error", `The prompt did not complete: ${sanitizeLine(outcome.reason)}`);
   }
 };
 
-export function formatResult(result: PromptResult): string {
-  const extra = notes(result);
-  const lines = [...extra, ...(extra.length > 0 ? [""] : []), describeOutcome(result.outcome), ""];
-  if (result.outcome.kind === "answered") lines.push(`Completed in ${seconds(result.elapsedMs)}.`);
-  if (!result.sessionDeleted) {
-    lines.push("Warning: the OpenCode session could not be verified as deleted.");
+const count = (n: number, one: string): string => `${n} ${one}${n === 1 ? "" : "s"}`;
+const tokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+
+/** The final status line, e.g. `✓ Done in 41.8s · 4 tools · 1.2k tokens`. */
+const statusLine = (result: PromptResult, theme: Theme, stats: TurnStats | undefined): string => {
+  const elapsed = seconds(result.elapsedMs);
+  switch (result.outcome.kind) {
+    case "answered": {
+      const extra = stats === undefined ? [] : [count(stats.tools, "tool"), ...(stats.outputTokens > 0 ? [`${tokens(stats.outputTokens)} tokens`] : [])];
+      return `${theme.paint("success", `✓ Done in ${elapsed}`)}${theme.paint("dim", extra.map((part) => ` · ${part}`).join(""))}`;
+    }
+    case "cancelled":
+      return `${theme.paint("warning", `– Execution cancelled after ${elapsed}.`)} ${theme.paint("dim", "Harness session remains active.")}`;
+    case "failed":
+      return theme.paint("error", `✗ Failed after ${elapsed}`);
+    case "permission-rejected":
+    case "question-rejected":
+      return theme.paint("warning", `! Stopped after ${elapsed}`);
   }
-  return `${lines.join("\n").trimEnd()}\n`;
+};
+
+/** Everything after the live output: notes, why the turn ended, the status line, warnings. */
+export function formatResult(result: PromptResult, theme: Theme = PLAIN_THEME, stats?: TurnStats): string {
+  const lines = notes(result).map((note) => theme.paint("warning", note));
+  const outcome = describeOutcome(result.outcome, theme);
+  if (outcome !== undefined) lines.push(...(lines.length > 0 ? [""] : []), outcome);
+  if (lines.length > 0) lines.push("");
+  lines.push(statusLine(result, theme, stats));
+  if (!result.sessionDeleted) lines.push(theme.paint("error", "Warning: the OpenCode session could not be verified as deleted."));
+  return `${lines.join("\n")}\n`;
 }
 
 export const HELP_TEXT = [
@@ -69,4 +95,5 @@ export const HELP_TEXT = [
   "  /exit   Leave Quoder (Ctrl-D also works)",
   "",
   "Ctrl-C cancels a running prompt; at an empty prompt it leaves Quoder.",
+  "Colour follows your terminal; set NO_COLOR or pass --no-color to turn it off.",
 ].join("\n");

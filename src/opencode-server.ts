@@ -126,7 +126,17 @@ export interface AuthenticatedServerLauncherDependencies {
   readonly verifyAuthentication: (url: string, authorization: string) => Promise<void>;
   readonly startupTimeoutMs: number;
   readonly terminationTimeoutMs: number;
+  /**
+   * Registers a hook run synchronously if the Quoder process exits while the server is alive (for
+   * example after an uncaught error); returns its unregistration. Defaults to `process.once("exit")`.
+   */
+  readonly onProcessExit?: (hook: () => void) => () => void;
 }
+
+const registerProcessExitHook = (hook: () => void): (() => void) => {
+  process.once("exit", hook);
+  return () => process.removeListener("exit", hook);
+};
 
 export const SERVER_STARTUP_TIMEOUT_MS = 15_000;
 export const SERVER_TERMINATION_UNCONFIRMED_MESSAGE =
@@ -156,6 +166,11 @@ export async function launchAuthenticatedOpenCodeServer(
   dependencies: AuthenticatedServerLauncherDependencies = defaultAuthenticatedServerLauncherDependencies,
 ): Promise<AuthenticatedServerLaunch> {
   const child = dependencies.spawnServer(authenticatedServerProcessConfig(options));
+  // Last resort: a Quoder process that dies without its orderly shutdown must not orphan the server.
+  const unregisterExitHook = (dependencies.onProcessExit ?? registerProcessExitHook)(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  });
+  child.once("exit", unregisterExitHook);
   const exited = new Promise<void>((resolveExited) => {
     if (child.exitCode !== null || child.signalCode !== null) resolveExited();
     else child.once("exit", () => resolveExited());

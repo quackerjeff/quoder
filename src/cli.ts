@@ -7,6 +7,7 @@ import { createOpencodeClient, type ModelRef } from "@opencode-ai/sdk/v2";
 import { Harness, type HarnessTraceEvent } from "./harness/repl.js";
 import { resolveProject } from "./harness/project.js";
 import { launchAuthenticatedOpenCodeServer } from "./opencode-server.js";
+import { colorEnabled, createTheme } from "./ui/style.js";
 import { packagePath } from "./package-root.js";
 
 export const DEFAULT_MODEL: ModelRef = { providerID: "ollama", id: "glm-4.7-flash:latest" };
@@ -84,6 +85,8 @@ async function main(): Promise<number> {
       input: process.stdin,
       output: process.stdout,
       terminal: process.stdin.isTTY === true && process.stdout.isTTY === true,
+      theme: createTheme(colorEnabled({ isTTY: process.stdout.isTTY === true, env: process.env, noColorFlag: parsed.noColor })),
+      columns: () => process.stdout.columns,
     },
     {
       launchServer: (options) => launchAuthenticatedOpenCodeServer(options),
@@ -91,6 +94,11 @@ async function main(): Promise<number> {
       ...(trace === undefined ? {} : { trace }),
     },
   );
+  // A closed output pipe (for example `quoder | head`) ends Quoder through its orderly shutdown
+  // instead of crashing on EPIPE and leaving the server behind; 141 is the conventional SIGPIPE code.
+  const outputClosed = (): void => harness.terminate(141);
+  process.stdout.on("error", outputClosed);
+  process.stderr.on("error", outputClosed);
   // In a TTY readline reports Ctrl-C itself; these cover piped input and external signals.
   process.on("SIGINT", () => harness.interrupt());
   // Conventional 128 + signal exit codes, so supervisors can tell a signalled exit apart.

@@ -10,9 +10,12 @@ import {
   type AuthenticatedServerLaunch,
   type AuthenticatedServerOptions,
 } from "../opencode-server.js";
+import { PLAIN_THEME, type Theme } from "../ui/style.js";
 import { HELP_TEXT, formatResult } from "./format.js";
+import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
 import { SessionTracker, runPrompt, type StopRequest, type TurnOutcome } from "./session-runner.js";
+import { narrowStreamEvent } from "./stream-events.js";
 
 export const HARNESS_OPERATION_TIMEOUT_MS = 30_000;
 /** The monitor's subscription lives as long as its server; this only bounds a forgotten one. */
@@ -28,7 +31,9 @@ export type HarnessTraceEvent =
   | { readonly event: "session.created"; readonly sessionID: string }
   | { readonly event: "session.deleted"; readonly sessionID: string; readonly verified: boolean }
   | { readonly event: "permission.rejected"; readonly sessionID: string; readonly replied: boolean }
-  | { readonly event: "prompt.completed"; readonly outcome: TurnOutcome["kind"]; readonly elapsedMs: number };
+  | { readonly event: "prompt.completed"; readonly outcome: TurnOutcome["kind"]; readonly elapsedMs: number }
+  | { readonly event: "stream.first-text" }
+  | { readonly event: "activity.tool"; readonly tool: string };
 
 export interface HarnessDependencies {
   readonly launchServer: (options: AuthenticatedServerOptions) => Promise<AuthenticatedServerLaunch>;
@@ -43,8 +48,15 @@ export interface HarnessOptions {
   readonly model: ModelRef;
   readonly input: NodeJS.ReadableStream;
   readonly output: NodeJS.WritableStream;
-  /** True for an interactive TTY: readline handles Ctrl-C and lines typed while busy are refused. */
+  /**
+   * True for an interactive TTY: readline handles Ctrl-C, lines typed while busy are refused, and an
+   * animated status line is drawn while a prompt runs.
+   */
   readonly terminal: boolean;
+  /** Colour theme; plain by default. */
+  readonly theme?: Theme;
+  /** Terminal width, read on every status-line frame. */
+  readonly columns?: () => number | undefined;
 }
 
 interface ServerSession {
@@ -56,7 +68,8 @@ interface ServerSession {
 }
 
 /**
- * The persistent Quoder harness (Milestone 1): one OpenCode server, a fresh session per prompt.
+ * The persistent Quoder harness: one OpenCode server, a fresh session per prompt, and a live view
+ * of each prompt's activity (Milestone 2).
  *
  * One sequential loop consumes input lines in order. EOF, `/exit`, and signals end the loop, and
  * the loop's exit path alone runs the single, memoized shutdown, so a server is never left behind.
@@ -79,6 +92,8 @@ export class Harness {
   #server: ServerSession | undefined;
   #startingServer: Promise<ServerSession> | undefined;
   #running: AbortController | undefined;
+  /** The running prompt's live display. */
+  #view: LiveView | undefined;
   #inputClosed = false;
   #exitCode: number | undefined;
   #finished: Promise<number> | undefined;
@@ -101,7 +116,8 @@ export class Harness {
       if (this.#running.signal.aborted) {
         this.#write("Still cleaning up the cancelled prompt…\n");
       } else {
-        this.#write("\nCancelling OpenCode execution…\n");
+        if (this.#view === undefined) this.#write("\nCancelling OpenCode execution…\n");
+        else this.#view.cancelling();
         this.#running.abort();
       }
       return;
@@ -124,21 +140,26 @@ export class Harness {
 
   async #main(): Promise<number> {
     const { project, model } = this.#options;
-    this.#write(`Quoder — ${project.name} (${project.root})\nModel: ${model.providerID}/${model.id}\nStarting OpenCode server…\n`);
+    const theme = this.#theme;
+    this.#write(
+      `${theme.paint("prompt", "Quoder")} ${theme.paint("dim", "·")} ${theme.paint("strong", project.name)} ${theme.paint("dim", project.root)}\n` +
+        `${theme.paint("dim", "Model")} ${theme.paint("accent", `${model.providerID}/${model.id}`)}\n` +
+        `${theme.paint("dim", "Starting OpenCode server…")}\n`,
+    );
     try {
       await this.#ensureServer();
     } catch {
       if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
-      this.#write("Could not start the OpenCode server. Run `npm run verify:environment` in Quoder to diagnose.\n");
+      this.#write(`${theme.paint("error", "Could not start the OpenCode server.")} Run \`npm run verify:environment\` in Quoder to diagnose.\n`);
       return this.#shutdownOnce(1);
     }
     if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
-    this.#write("Ready. Type /help for help.\n\n");
+    this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
     const readline = createInterface({
       input: this.#options.input,
       output: this.#options.output,
       terminal: this.#options.terminal,
-      prompt: `${project.name} > `,
+      prompt: `${theme.paint("prompt", project.name)} ${theme.paint("accent", "❯")} `,
     });
     this.#readline = readline;
     readline.on("line", (line) => this.#receive(line));
@@ -200,13 +221,26 @@ export class Harness {
   async #runPrompt(prompt: string): Promise<void> {
     const controller = new AbortController();
     this.#running = controller;
-    this.#write("Starting fresh OpenCode session…\n");
+    const theme = this.#theme;
+    this.#write(`${theme.paint("dim", "Starting fresh OpenCode session…")}\n`);
+    const view = new LiveView({
+      theme,
+      write: (text) => this.#write(text),
+      root: this.#options.project.root,
+      modelLabel: this.#options.model.id,
+      statusLine: this.#options.terminal,
+      ...(this.#options.columns === undefined ? {} : { columns: this.#options.columns }),
+      onFirstText: () => this.#trace({ event: "stream.first-text" }),
+      onToolFinished: (tool) => this.#trace({ event: "activity.tool", tool }),
+    });
+    this.#view = view;
     try {
       let server: ServerSession;
       try {
         server = await this.#ensureServer();
       } catch {
-        this.#write("Could not start the OpenCode server; the prompt was not run.\n\n");
+        view.finish();
+        this.#write(`${theme.paint("error", "Could not start the OpenCode server; the prompt was not run.")}\n\n`);
         return;
       }
       const result = await runPrompt({
@@ -216,17 +250,23 @@ export class Harness {
         model: this.#options.model,
         prompt,
         cancel: controller.signal,
-        onSessionCreated: (sessionID) => this.#trace({ event: "session.created", sessionID }),
+        onSessionCreated: (sessionID) => {
+          view.setSession(sessionID);
+          this.#trace({ event: "session.created", sessionID });
+        },
         onSessionDeleted: (sessionID, verified) => this.#trace({ event: "session.deleted", sessionID, verified }),
       });
       if (result.sessionID !== undefined && !result.sessionDeleted) this.#undeletedSessions.push(result.sessionID);
       this.#trace({ event: "prompt.completed", outcome: result.outcome.kind, elapsedMs: result.elapsedMs });
-      this.#write(`\n${formatResult(result)}\n`);
+      const stats = view.finish(result);
+      this.#write(`\n${formatResult(result, theme, stats)}\n`);
       for (const notice of this.#notices.splice(0)) {
         const alreadyShown = result.outcome.kind === "failed" && result.outcome.reason.startsWith(notice);
-        if (!alreadyShown) this.#write(`Note: ${notice} A new OpenCode server will start with your next prompt.\n\n`);
+        if (!alreadyShown) this.#write(`${theme.paint("warning", `Note: ${notice} A new OpenCode server will start with your next prompt.`)}\n\n`);
       }
     } finally {
+      view.finish();
+      this.#view = undefined;
       this.#running = undefined;
     }
   }
@@ -275,6 +315,10 @@ export class Harness {
         adapter,
         isOwnSession: (sessionID) => this.#tracker.owns(sessionID),
         subscriptionTimeoutMs: HARNESS_MONITOR_SUBSCRIPTION_MS,
+        onSessionEvent: (raw) => {
+          const event = narrowStreamEvent(raw);
+          if (event !== undefined) this.#view?.handle(event);
+        },
         onQuestionAsked: (question) => this.#tracker.noteQuestion(question),
         onQuestionRejected: (_question, rejected) => {
           if (!rejected) this.#markUnhealthy(server, "Quoder could not reject the model's question.");
@@ -402,6 +446,10 @@ export class Harness {
     if (!(await this.#closeLaunch(server.launch))) return exitCode === 0 ? 1 : exitCode;
     this.#trace({ event: "server.stopped" });
     return exitCode;
+  }
+
+  get #theme(): Theme {
+    return this.#options.theme ?? PLAIN_THEME;
   }
 
   #write(text: string): void {

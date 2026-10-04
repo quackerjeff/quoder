@@ -53,3 +53,13 @@ Only event names, field names, string lengths, counts and timings were recorded.
 - Print activity lines on completion.
 - Treat reasoning as optional.
 - **Group 5 adds `realpath` canonicalization of the project root** in `resolveProject`, so the server cwd and session directory always match exactly.
+
+## 2026-10-03 — Found while verifying Group 5: a closed output pipe orphaned the server
+
+**Context**: A local check (`printf '/exit\n' | node dist/cli.js | head -1`, with no model call) made Quoder crash on an unhandled `EPIPE` `error` event on stdout. The crash skipped the orderly shutdown and left `opencode serve` running with parent PID 1. This defect predates Milestone 2: Milestone 1's harness had no output-error handling either. Every orphan this created was terminated after its identity was checked; a separate server owned by the developer's own running `quoder` was left untouched.
+
+**Decision**:
+- **CLI.** `process.stdout` and `process.stderr` `error` events now call `harness.terminate(141)`, the conventional SIGPIPE code, so the normal shutdown deletes sessions and closes the server.
+- **Launcher safety net.** `launchAuthenticatedOpenCodeServer` registers a synchronous process-`exit` hook that sends SIGTERM to a still-running server child. The hook is unregistered when the child exits, and is injectable as `onProcessExit` for tests. Any Quoder process exit (an uncaught error, `process.exit`) therefore stops its server. Only a SIGKILL of Quoder itself can still orphan one.
+
+**Verification**: A new launcher test covers the hook. Repeating the closed-pipe run twice left no orphan; 303 tests pass.
