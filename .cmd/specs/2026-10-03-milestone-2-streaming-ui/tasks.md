@@ -129,10 +129,100 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
     - Both exit-criterion lines are printed, and the script's exit status follows Milestone 2.
     - `tsc` passes for the live config, and `build:live` succeeds.
 
+## Fix Group 1: Review cycle 1 findings
+
+- [x] Resolve review cycle 1's four warnings and adopted suggestions | `src/harness/line-keys.ts`, `src/harness/repl.ts`, `src/harness/live-view.ts`, `src/ui/markdown.ts`, `tests/`, `decisions.md`
+  - **Accept**:
+    - Line endings are decided per keypress, with no queue, and kitty Ctrl+J, Esc then Return, split chunks and bracketed paste are handled.
+    - Harness messages during a prompt erase the status line.
+    - Nested-list fences stream intact.
+    - Spec deviations are recorded in `decisions.md`.
+    - Regression tests exist for each.
+  - **Completed evidence**: 345 tests pass, and a pseudo-terminal check succeeded. See `decisions.md` ("Review cycle 1 fixes").
+
+## Fix Group 2: Review cycle 2 findings
+
+- [x] Resolve review cycle 2's three warnings and adopted suggestions | `src/harness/line-keys.ts`, `src/harness/repl.ts`, `src/ui/markdown.ts`, `tests/`, `decisions.md`
+  - **Accept**:
+    - A split paste end marker cannot leave the filter stuck in a paste.
+    - Typing while busy is not echoed over the status line.
+    - A loose list streams item by item.
+    - Idle flushes never break a fence nested in a list.
+    - Regression tests exist and were checked to fail without the fixes where applicable.
+  - **Completed evidence**: 352 tests pass, a pseudo-terminal check succeeded, and a comparison of streamed and one-shot rendering was run. See `decisions.md` ("Review cycle 2 fixes").
+
+## Fix Group 3: Review cycle 3 findings (user-authorized fourth review round)
+
+- [x] Resolve review cycle 3's two warnings and adopted suggestions | `src/harness/line-keys.ts`, `src/ui/markdown.ts`, `tests/`, `decisions.md`
+  - **Accept**:
+    - A late or lost paste end marker cannot leave the input stuck in a paste.
+    - Lists that follow an intro line in the same block stream nested fences and loose items intact.
+    - Regression tests exist for each.
+    - The incorrect `decisions.md` claim is corrected.
+  - **Completed evidence**: 359 tests pass, the comparison of streamed and one-shot rendering was rerun, and a pseudo-terminal check succeeded. See `decisions.md` ("Review cycle 3 fixes").
+
+## Security Fix Group 1: Security review cycle 1 findings
+
+- [x] Sanitize after lexing, and bound syntax highlighting | `src/ui/markdown.ts`, `src/ui/highlight.ts`, `tests/unit/markdown.test.ts`, `decisions.md`
+  - **Accept**:
+    - No character reference can make rendered Markdown emit a control character, in any block or inline type, on the streamed or reconciled path.
+    - Highlighting cannot block the event loop for more than about 0.25 s.
+    - Regression tests exist and were checked to fail without the fix.
+  - **Completed evidence**: 372 tests pass. See `decisions.md` ("Security review cycle 1 fixes").
+
+## Security Fix Group 2: Security review cycle 2 findings
+
+- [x] Bound inline and block nesting, and make Markdown rendering fail safe | `src/ui/markdown.ts`, `tests/unit/markdown.test.ts`, `decisions.md`
+  - **Accept**:
+    - Nested emphasis renders in linear time and space in colour.
+    - Deep nesting never throws, drops text or ends the harness.
+    - Regression tests exist and were checked to fail without the cap.
+  - **Completed evidence**: 382 tests pass. See `decisions.md` ("Security review cycle 2 fixes").
+
+## Security Fix Group 3: Security review cycle 3 findings (user-authorized fourth security round)
+
+- [x] Add a rendering budget and bounded output to Markdown rendering | `src/ui/markdown.ts`, `src/harness/live-view.ts`, `tests/`, `decisions.md`
+  - **Accept**:
+    - No model text of about 200 KB or less can make rendering take more than about 0.2 s per block, expand output beyond 10× its source plus 4 KB, or exhaust memory.
+    - Over-budget text is shown sanitized and complete.
+    - Ordinary formatting is unaffected.
+  - **Completed evidence**: 392 tests pass. See `decisions.md` ("Security review cycle 3 fixes").
+
+## Security Fix Group 4: Security review cycle 4 findings (user-authorized fifth security round)
+
+- [x] Isolate Markdown rendering in a worker with a hard deadline, a memory limit and a per-stream budget | `src/ui/isolated-render.ts`, `src/ui/render-worker.ts`, `src/ui/render-protocol.ts`, `src/ui/markdown.ts`, `src/harness/live-view.ts`, `src/harness/repl.ts`, `src/cli.ts`, `tests/`, `decisions.md`
+  - **Accept**:
+    - No model text can block the main thread for more than about the deadline (200 ms) per chunk, or about 1 s per stream.
+    - No model text can crash Quoder through rendering memory.
+    - Any failure shows sanitized plain text.
+    - Ordinary Markdown is still formatted.
+  - **Completed evidence**: 401 tests pass, and a scratch run against the built CLI modules succeeded. See `decisions.md` ("Markdown rendering isolated in a worker").
+
+## Security Fix Group 5: Security review cycle 5 finding (user-authorized short sixth round)
+
+- [x] Make the plain-text fallback linear | `src/ui/markdown.ts`, `tests/unit/markdown.test.ts`, `decisions.md`, `docs/backlog.md`
+  - **Accept**:
+    - `plainMarkdown` and every trailing-newline trim are linear.
+    - Time-bounded tests exist and were checked to fail with the old regex.
+  - **Completed evidence**: 405 tests pass. See `decisions.md` ("Security review cycle 5 fix").
+
+## Security Fix Group 6: Security review cycle 6 finding
+
+- [x] Make fence detection linear, and fuzz every main-thread text path | `src/ui/markdown.ts`, `src/harness/line-keys.ts`, `tests/unit/markdown.test.ts`, `decisions.md`
+  - **Accept**:
+    - No main-thread code over model text is super-linear (fuzzed: the slowest call over 1,793 shapes × 7 contexts at 60 KB was 25 ms).
+    - Time-bounded tests exist and were checked to fail with the old regex.
+  - **Completed evidence**: 409 tests pass. See `decisions.md` ("Security review cycle 6 fix").
+
 ## Group 7: Review, security review, QA
 
 - [ ] Run the general review (up to 3 cycles), the security review and QA (including an authorized `verify:harness` and a manual terminal check) | spec directory
   - **Accept**: The reports are persisted verbatim and all three gates pass.
+  - **Progress**:
+    - **General review: PASS at cycle 4** (cycles 1–3 FAIL; cycle 4 was authorized by the developer).
+    - **Security review: PASS at cycle 7** (cycles 1–6 FAIL; cycles 4–7 were authorized by the developer).
+    - Both reports are persisted verbatim in `review.md` and `security-review.md`.
+    - **QA:** pending. It needs the developer's authorization for the real-model `verify:harness` run and a manual iTerm2 check.
 
 ## Group 8: Documentation and closure
 

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { createInterface, type Interface } from "node:readline";
+import { createInterface, emitKeypressEvents, type Interface } from "node:readline";
 
 import type { ModelRef, OpencodeClient } from "@opencode-ai/sdk/v2";
 
@@ -10,9 +10,10 @@ import {
   type AuthenticatedServerLaunch,
   type AuthenticatedServerOptions,
 } from "../opencode-server.js";
+import type { MarkdownRenderer } from "../ui/markdown.js";
 import { PLAIN_THEME, type Theme } from "../ui/style.js";
 import { HELP_TEXT, formatResult } from "./format.js";
-import { DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys, type LineEnding } from "./line-keys.js";
+import { CONTINUE_MARK, DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys } from "./line-keys.js";
 import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
 import { SessionTracker, runPrompt, type StopRequest, type TurnOutcome } from "./session-runner.js";
@@ -58,6 +59,8 @@ export interface HarnessOptions {
   readonly theme?: Theme;
   /** Terminal width, read on every status-line frame. */
   readonly columns?: () => number | undefined;
+  /** Renders model Markdown; the CLI passes the isolated (worker) renderer. */
+  readonly renderMarkdown?: MarkdownRenderer;
 }
 
 interface ServerSession {
@@ -85,8 +88,9 @@ export class Harness {
    */
   #launchAbort: AbortController | undefined;
   readonly #lines: string[] = [];
-  /** How each line readline will report ended (terminal only), in order. */
-  readonly #lineEndings: LineEnding[] = [];
+  /** Whether the line readline is about to report ends with Shift+Return (terminal only). */
+  #continueArmed = false;
+  #lineContinues = false;
   /** Lines of a multi-line prompt still being typed (Shift+Return). */
   readonly #pendingLines: string[] = [];
   #rawMode = false;
@@ -122,7 +126,7 @@ export class Harness {
   interrupt(): void {
     if (this.#running !== undefined) {
       if (this.#running.signal.aborted) {
-        this.#write("Still cleaning up the cancelled prompt…\n");
+        this.#notice("Still cleaning up the cancelled prompt…\n");
       } else {
         if (this.#view === undefined) this.#write("\nCancelling OpenCode execution…\n");
         else this.#view.cancelling();
@@ -192,8 +196,23 @@ export class Harness {
     if (this.#options.terminal) {
       // Readline sees the keys through this filter, so it no longer puts the terminal in raw mode
       // itself; Quoder does, and restores it on shutdown.
-      const keys = new LineEndingKeys((ending) => this.#lineEndings.push(ending));
+      const keys = new LineEndingKeys({
+        // While a prompt runs, typing is not echoed over the status line; Return explains why.
+        isBusy: () => this.#running !== undefined,
+        onReturnWhileBusy: () => this.#notice("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n"),
+      });
       input = this.#options.input.pipe(keys);
+      // Registered before readline's own keypress listener, so each Return is classified just
+      // before readline turns it into a `line`.
+      emitKeypressEvents(keys);
+      keys.on("keypress", (sequence: string | undefined, key: { name?: string } | undefined) => {
+        if (sequence === CONTINUE_MARK) {
+          this.#continueArmed = true;
+          return;
+        }
+        if (key?.name === "return" || key?.name === "enter") this.#lineContinues = this.#continueArmed;
+        this.#continueArmed = false;
+      });
       this.#setRawMode(true);
       this.#setKeyboardProtocol(true);
     }
@@ -223,14 +242,15 @@ export class Harness {
   }
 
   #receive(line: string): void {
-    const ending = this.#options.terminal ? (this.#lineEndings.shift() ?? "submit") : "submit";
+    const continues = this.#options.terminal && this.#lineContinues;
+    this.#lineContinues = false;
     if (this.#exitCode !== undefined) return;
     if (this.#running !== undefined && this.#options.terminal) {
       this.#pendingLines.length = 0;
-      this.#write("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n");
+      this.#notice("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n");
       return;
     }
-    if (ending === "continue") {
+    if (continues) {
       this.#pendingLines.push(line);
       this.#readline?.setPrompt(this.#continuationPrompt);
       this.#readline?.prompt();
@@ -308,6 +328,7 @@ export class Harness {
       modelLabel: this.#options.model.id,
       statusLine: this.#options.terminal,
       ...(this.#options.columns === undefined ? {} : { columns: this.#options.columns }),
+      ...(this.#options.renderMarkdown === undefined ? {} : { render: this.#options.renderMarkdown }),
       onFirstText: () => this.#trace({ event: "stream.first-text" }),
       onToolFinished: (tool) => this.#trace({ event: "activity.tool", tool }),
     });
@@ -482,7 +503,7 @@ export class Harness {
       await launch.close();
       return true;
     } catch {
-      this.#write("Warning: an OpenCode server did not confirm termination.\n");
+      this.#notice(`${this.#theme.paint("error", "Warning: an OpenCode server did not confirm termination.")}\n`);
       return false;
     }
   }
@@ -501,7 +522,7 @@ export class Harness {
         this.#undeletedSessions.push(sessionID);
       }
     }
-    if (deleted > 0) this.#write(`Deleted ${deleted} earlier OpenCode session(s) that could not be verified before.\n`);
+    if (deleted > 0) this.#notice(`Deleted ${deleted} earlier OpenCode session(s) that could not be verified before.\n`);
   }
 
   #shutdownOnce(exitCode: number): Promise<number> {
@@ -530,6 +551,12 @@ export class Harness {
 
   get #theme(): Theme {
     return this.#options.theme ?? PLAIN_THEME;
+  }
+
+  /** Output that may appear while a prompt runs: through the live view, so its status line is erased first. */
+  #notice(text: string): void {
+    if (this.#view === undefined) this.#write(text);
+    else this.#view.note(text);
   }
 
   #write(text: string): void {

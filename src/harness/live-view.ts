@@ -1,4 +1,4 @@
-import { MarkdownStream, renderMarkdown } from "../ui/markdown.js";
+import { MarkdownStream, type MarkdownRenderer } from "../ui/markdown.js";
 import type { Theme } from "../ui/style.js";
 import { renderActivity, runningLabel, summarizeCall, summarizeResult, type ToolCall, type ToolOutcome } from "./activity.js";
 import type { PromptResult } from "./session-runner.js";
@@ -22,6 +22,8 @@ export interface LiveViewOptions {
   readonly statusLine: boolean;
   /** Terminal width; the status line is truncated to one less, so it never wraps. */
   readonly columns?: () => number | undefined;
+  /** Renders Markdown chunks; Quoder passes the isolated (worker) renderer. Defaults to in-process. */
+  readonly render?: MarkdownRenderer;
   readonly onFirstText?: () => void;
   readonly onToolFinished?: (tool: string) => void;
   readonly now?: () => number;
@@ -33,6 +35,36 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const CLEAR_LINE = "\r\u001b[2K";
 const DEFAULT_COLUMNS = 80;
 const PREVIEW_LENGTH = 200;
+
+/** Display columns of one code point: 2 for East Asian wide and emoji ranges, else 1 (approximate). */
+const columnsOf = (codePoint: number): number =>
+  (codePoint >= 0x1100 && codePoint <= 0x115f) ||
+  (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
+  (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+  (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+  (codePoint >= 0xfe30 && codePoint <= 0xfe4f) ||
+  (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+  (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+  (codePoint >= 0x1f300 && codePoint <= 0x1faff) ||
+  (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+    ? 2
+    : 1;
+
+/** Truncates `text` to at most `room` display columns, ending with "…" when shortened. */
+export const fitColumns = (text: string, room: number): string => {
+  const characters = [...text];
+  const total = characters.reduce((sum, character) => sum + columnsOf(character.codePointAt(0) ?? 0), 0);
+  if (total <= room) return text;
+  let used = 0;
+  let fitted = "";
+  for (const character of characters) {
+    const width = columnsOf(character.codePointAt(0) ?? 0);
+    if (used + width > room - 1) break;
+    fitted += character;
+    used += width;
+  }
+  return `${fitted}…`;
+};
 
 interface TextBlock {
   readonly messageID: string;
@@ -68,6 +100,7 @@ export class LiveView {
   #finished = false;
   #frame = 0;
   #statusShown = false;
+  #drawnPhase = "";
   /** What the last permanent output was, so text and tool lines are separated by a blank line. */
   #lastKind: "text" | "tool" | "note" | undefined;
   /** The text stream that wrote last. */
@@ -80,9 +113,9 @@ export class LiveView {
     this.#now = options.now ?? Date.now;
     this.#started = this.#now();
     if (options.statusLine) {
-      this.#ticker = setInterval(() => this.#drawStatus(), options.frameMs ?? 100);
+      this.#ticker = setInterval(() => this.#drawStatus(true), options.frameMs ?? 100);
       this.#ticker.unref();
-      this.#drawStatus();
+      this.#drawStatus(true);
     }
   }
 
@@ -153,7 +186,15 @@ export class LiveView {
         this.#finishTool(event.callID, { kind: "failed", message: event.message });
         break;
     }
-    this.#drawStatus();
+    // Between ticks, redraw only when something visible changed (not on every text delta).
+    if (!this.#statusShown || this.#phase !== this.#drawnPhase) {
+      this.#drawStatus(false);
+    }
+  }
+
+  /** A harness message shown while the prompt runs; the status line is erased first. */
+  note(text: string): void {
+    this.#permanent(text);
   }
 
   /** Ctrl-C was pressed: say so at once; `finish` reports the outcome. */
@@ -190,13 +231,27 @@ export class LiveView {
       .join("")
       .trim();
     if (streamed === finalText.trim()) return;
-    const rendered = renderMarkdown(finalText, this.#options.theme);
+    // Rendered block by block, like a stream, so the rendering budget applies per block.
+    let rendered = "";
+    const stream = new MarkdownStream(
+      this.#options.theme,
+      (text) => {
+        rendered += text;
+      },
+      this.#streamOptions,
+    );
+    stream.push(finalText);
+    stream.end();
     const gap = this.#lastKind === undefined ? "" : "\n";
     if (streamed !== "") {
       this.#permanent(`${gap}${this.#paint("dim", "(The streamed answer was incomplete; the full answer follows.)")}\n\n${rendered}`, "text");
     } else {
       this.#permanent(`${gap}${rendered}`, "text");
     }
+  }
+
+  get #streamOptions(): { readonly render?: MarkdownRenderer } {
+    return this.#options.render === undefined ? {} : { render: this.#options.render };
   }
 
   #stats(): TurnStats {
@@ -211,7 +266,7 @@ export class LiveView {
         const separate = this.#lastKind !== undefined && (this.#lastKind !== "text" || this.#current !== stream);
         this.#current = stream;
         this.#permanent(`${separate && !text.startsWith("\n") ? "\n" : ""}${text}`, "text");
-      });
+      }, this.#streamOptions);
       block = { messageID, stream, ended: false };
       this.#blocks.set(textID, block);
     }
@@ -241,7 +296,7 @@ export class LiveView {
     this.#idleFlush = setTimeout(() => {
       this.#idleFlush = undefined;
       for (const block of this.#blocks.values()) if (!block.ended) block.stream.flushLines();
-      this.#drawStatus();
+      this.#drawStatus(false);
     }, this.#options.idleFlushMs ?? 400);
     this.#idleFlush.unref();
   }
@@ -267,17 +322,18 @@ export class LiveView {
     this.#statusShown = false;
   }
 
-  #drawStatus(): void {
+  /** Draws the status line; only the ticker advances the spinner, so it turns at a steady rate. */
+  #drawStatus(advance: boolean): void {
     if (!this.#options.statusLine || this.#finished) return;
     const width = Math.max(10, (this.#options.columns?.() ?? DEFAULT_COLUMNS) - 1);
     const elapsed = `${((this.#now() - this.#started) / 1000).toFixed(1)}s`;
-    const spinner = SPINNER[this.#frame++ % SPINNER.length] ?? "·";
+    if (advance) this.#frame++;
+    const spinner = SPINNER[this.#frame % SPINNER.length] ?? "·";
+    this.#drawnPhase = this.#phase;
     const head = `${this.#phase}… ${elapsed} · ${this.#options.modelLabel}`;
     const preview = this.#reasoning === "" ? "" : ` · ${sanitizeLine(this.#reasoning, PREVIEW_LENGTH)}`;
-    // Plain text is truncated to the width before styling, so the line never wraps.
-    const plain = `${head}${preview}`;
-    const room = width - 2;
-    const fitted = [...plain].length > room ? `${[...plain].slice(0, Math.max(0, room - 1)).join("")}…` : plain;
+    // Plain text is truncated to the width (in display columns) before styling, so it never wraps.
+    const fitted = fitColumns(`${head}${preview}`, width - 2);
     const headPart = fitted.slice(0, Math.min(fitted.length, head.length));
     const rest = fitted.slice(headPart.length);
     this.#options.write(`${CLEAR_LINE}${this.#paint("accent", spinner)} ${this.#paint("dim", headPart)}${rest === "" ? "" : this.#paint("quote", rest)}`);

@@ -698,6 +698,50 @@ describe("multi-line prompts in an interactive terminal", () => {
     expect(promptTexts(run)).toEqual(["real prompt"]);
   });
 
+  it("stays in step after keys readline does not turn into a line (review cycle 1)", async () => {
+    const run = startHarness({ terminal: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    // Kitty Ctrl+J continues; kitty Esc right before Return must not swallow that Return.
+    run.input.write("one\u001b[106;5utwo\u001b[27u\r");
+    await vi.waitFor(() => expect(run.output()).toContain("✓ Done in"));
+    // Afterwards Shift+Return still continues and Return still submits.
+    run.input.write("three\u001b[13;2ufour\r");
+    await vi.waitFor(() => expect(promptTexts(run)).toHaveLength(2));
+    await vi.waitFor(() => expect(run.output().split("✓ Done in")).toHaveLength(3));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(promptTexts(run)).toEqual(["one\ntwo", "three\nfour"]);
+  });
+
+  it("sends a bracketed paste of several lines as one prompt once Return is pressed", async () => {
+    const run = startHarness({ terminal: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    run.input.write("\u001b[200~line one\rline two\u001b[201~");
+    await vi.waitFor(() => expect(run.output()).toMatch(/ … (?:\u001b\[\d+G)?line two/u));
+    expect(promptTexts(run)).toEqual([]);
+    run.input.write("\r");
+    await vi.waitFor(() => expect(run.output()).toContain("✓ Done in"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(promptTexts(run)).toEqual(["line one\nline two"]);
+    expect(run.output()).toContain("\u001b[?2004h");
+    expect(run.output()).toContain("\u001b[?2004l");
+  });
+
+  it("removes its process exit hook when it shuts down", async () => {
+    const before = process.listenerCount("exit");
+    const run = startHarness({ terminal: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    expect(process.listenerCount("exit")).toBe(before + 1);
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+    expect(process.listenerCount("exit")).toBe(before);
+  });
+
   it("treats each piped line as its own prompt", async () => {
     const run = startHarness();
     run.input.write("one\ntwo\n");
@@ -705,5 +749,43 @@ describe("multi-line prompts in an interactive terminal", () => {
     await expect(run.finished).resolves.toBe(0);
 
     expect(promptTexts(run)).toEqual(["one", "two"]);
+  });
+});
+
+describe("harness messages while the status line is shown (review cycle 1)", () => {
+  /**
+   * Status frames that were committed to the scrollback: a frame (text after an erase that starts
+   * with the spinner) must be erased again before anything else, so it may never contain a newline.
+   */
+  const committedFrames = (output: string) =>
+    output
+      .split("\r\u001b[2K")
+      .slice(1)
+      .filter((frame) => /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] /u.test(frame) && frame.includes("\n"));
+
+  it("erases the status line before Quoder's own messages", async () => {
+    const deleteGate = gate();
+    const run = startHarness({ terminal: true, deleteGate });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("slow work\r");
+    await vi.waitFor(() => expect(run.calls).toContain("prompt:ses_1"));
+    await vi.waitFor(() => expect(run.output()).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] /u));
+
+    run.input.write("typed while busy\r");
+    await vi.waitFor(() => expect(run.output()).toContain("still running the previous prompt"));
+    run.input.write("\u0003");
+    await vi.waitFor(() => expect(run.calls).toContain("interrupt:ses_1"));
+    await new Promise((resolvePause) => setTimeout(resolvePause, 150));
+    run.input.write("\u0003");
+    await vi.waitFor(() => expect(run.output()).toContain("Still cleaning up the cancelled prompt"));
+    deleteGate.release();
+    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled after"));
+    run.input.write("\u0003");
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(committedFrames(run.output())).toEqual([]);
+    // Typing while busy is neither echoed nor run.
+    expect(run.output()).not.toContain("typed while busy");
+    expect(run.calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:ses_1"]);
   });
 });

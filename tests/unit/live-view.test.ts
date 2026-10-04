@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { LiveView, type LiveViewOptions } from "../../src/harness/live-view.js";
+import { LiveView, fitColumns, type LiveViewOptions } from "../../src/harness/live-view.js";
 import type { PromptResult } from "../../src/harness/session-runner.js";
 import type { StreamEvent } from "../../src/harness/stream-events.js";
 import { PLAIN_THEME } from "../../src/ui/style.js";
@@ -109,6 +109,30 @@ describe("live view", () => {
     expect(output()).toBe("Looking.\n\nFinal.\n");
   });
 
+  it("renders a long unstreamed answer block by block, so formatting survives the budget", () => {
+    const { live, output } = view();
+    const answer = Array.from({ length: 300 }, (_unused, index) => `Paragraph **${index}** with _emphasis_.`).join("\n\n");
+    live.finish(answered(answer));
+    expect(output()).toContain("Paragraph 0 with emphasis.");
+    expect(output()).not.toContain("**");
+  });
+
+  it("renders text blocks and the reconciled answer through the given renderer", () => {
+    const rendered: string[] = [];
+    const { live, output } = view({
+      render: (source) => {
+        rendered.push(source);
+        return `<${source.trim()}>\n`;
+      },
+    });
+    live.handle({ kind: "step-started", sessionID: S, messageID: "m1" });
+    live.handle(text("Streamed.\n\n"));
+    live.finish(answered("Different final answer."));
+    expect(rendered).toEqual(["Streamed.\n\n", "Different final answer."]);
+    expect(output()).toContain("<Streamed.>");
+    expect(output()).toContain("<Different final answer.>");
+  });
+
   it("sanitizes model text and tool details", () => {
     const { live, output } = view();
     live.handle(text("Hi \u001b]52;c;eA==\u0007there\n\n"));
@@ -167,5 +191,39 @@ describe("live view status line", () => {
     const length = output().length;
     vi.advanceTimersByTime(1_000);
     expect(output().length).toBe(length);
+  });
+});
+
+describe("status line pacing and width (review cycle 1)", () => {
+  it("does not redraw or advance the spinner on every streamed delta", () => {
+    vi.useFakeTimers();
+    let output = "";
+    const live = new LiveView({
+      theme: PLAIN_THEME,
+      write: (text) => {
+        output += text;
+      },
+      root: "/work/QuackTrack",
+      modelLabel: "glm",
+      statusLine: true,
+      columns: () => 80,
+    });
+    live.setSession(S);
+    live.handle({ kind: "step-started", sessionID: S, messageID: "m1" });
+    const framesBefore = output.split("\r\u001b[2K").length;
+    for (let index = 0; index < 50; index++) live.handle(text("word "));
+    // One redraw for the change of phase to Writing, none for the other 49 deltas.
+    expect(output.split("\r\u001b[2K").length - framesBefore).toBe(1);
+    const spinners = new Set(output.split("\r\u001b[2K").filter((frame) => frame !== "").map((frame) => frame[0]));
+    expect(spinners.size).toBe(1);
+    live.finish(cancelled);
+  });
+
+  it("fits wide characters by display columns", () => {
+    expect(fitColumns("abc", 3)).toBe("abc");
+    expect(fitColumns("abcd", 3)).toBe("ab…");
+    expect(fitColumns("漢字漢字", 8)).toBe("漢字漢字");
+    expect(fitColumns("漢字漢字", 7)).toBe("漢字漢…");
+    expect(fitColumns("ab🙂🙂", 5)).toBe("ab🙂…");
   });
 });

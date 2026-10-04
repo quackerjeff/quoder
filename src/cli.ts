@@ -7,6 +7,7 @@ import { createOpencodeClient, type ModelRef } from "@opencode-ai/sdk/v2";
 import { Harness, type HarnessTraceEvent } from "./harness/repl.js";
 import { resolveProject } from "./harness/project.js";
 import { launchAuthenticatedOpenCodeServer } from "./opencode-server.js";
+import { IsolatedMarkdownRenderer } from "./ui/isolated-render.js";
 import { colorEnabled, createTheme } from "./ui/style.js";
 import { packagePath } from "./package-root.js";
 
@@ -77,6 +78,10 @@ async function main(): Promise<number> {
     return 2;
   }
   const project = await resolveProject(process.cwd());
+  // Model Markdown is rendered in a worker with a hard deadline, so crafted output can neither
+  // freeze Quoder nor exhaust its memory. Started now, so it is ready before the first answer.
+  const markdown = new IsolatedMarkdownRenderer();
+  markdown.start();
   const trace = traceWriter(process.env.QUODER_TRACE_FILE);
   const harness = new Harness(
     {
@@ -87,6 +92,7 @@ async function main(): Promise<number> {
       terminal: process.stdin.isTTY === true && process.stdout.isTTY === true,
       theme: createTheme(colorEnabled({ isTTY: process.stdout.isTTY === true, env: process.env, noColorFlag: parsed.noColor })),
       columns: () => process.stdout.columns,
+      renderMarkdown: (source, theme) => markdown.render(source, theme),
     },
     {
       launchServer: (options) => launchAuthenticatedOpenCodeServer(options),

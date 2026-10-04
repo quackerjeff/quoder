@@ -8,7 +8,16 @@ import type { StyleRole, Theme } from "./style.js";
  * about 36 languages) and only the fence's own language: no automatic detection. highlight.js
  * returns HTML; its spans are mapped to theme roles and its entities decoded, and every text piece
  * is sanitized again before styling.
+ *
+ * Some grammars take super-linear time on crafted input (about 13 s for 80 KB of repeated C#
+ * tokens), and highlighting runs on the event loop, where it would block Ctrl-C. Blocks over a
+ * fixed budget are therefore shown plain.
  */
+
+/** Largest block highlighted (worst case measured near 0.1–0.4 s at this size). */
+export const HIGHLIGHT_MAX_CHARACTERS = 8_000;
+/** Longest line highlighted; longer lines (minified code, crafted input) leave the block plain. */
+export const HIGHLIGHT_MAX_LINE = 1_000;
 
 const SCOPE_ROLES: Readonly<Record<string, StyleRole>> = {
   keyword: "codeKeyword",
@@ -63,14 +72,16 @@ export const isHighlightable = (language: string | undefined): language is strin
  */
 export function highlightLines(code: string, language: string | undefined, theme: Theme): string[] {
   const clean = sanitizeForTerminal(code);
-  if (!theme.color || !isHighlightable(language)) return clean.split("\n");
+  const lines = clean.split("\n");
+  const overBudget = clean.length > HIGHLIGHT_MAX_CHARACTERS || lines.some((line) => line.length > HIGHLIGHT_MAX_LINE);
+  if (!theme.color || !isHighlightable(language) || overBudget) return lines;
   let html: string;
   try {
     html = hljs.highlight(clean, { language, ignoreIllegals: true }).value;
   } catch {
     return clean.split("\n");
   }
-  const lines: string[] = [""];
+  const styled: string[] = [""];
   const roles: (StyleRole | undefined)[] = [];
   for (const match of html.matchAll(/<span class="([^"]*)">|<\/span>|([^<]+)/gu)) {
     if (match[1] !== undefined) {
@@ -85,9 +96,9 @@ export function highlightLines(code: string, language: string | undefined, theme
     const role = roles.at(-1);
     const pieces = sanitizeForTerminal(decode(match[2])).split("\n");
     pieces.forEach((piece, index) => {
-      if (index > 0) lines.push("");
-      lines[lines.length - 1] += role === undefined ? piece : theme.paint(role, piece);
+      if (index > 0) styled.push("");
+      styled[styled.length - 1] += role === undefined ? piece : theme.paint(role, piece);
     });
   }
-  return lines;
+  return styled;
 }

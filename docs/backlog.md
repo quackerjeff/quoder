@@ -26,5 +26,13 @@ The existing behaviour stays: Shift+Return inserts a line break, Return submits,
 **Notes for whoever picks this up:**
 - Readline cannot do this, so a small custom line editor is needed. It could be done together with the possible move to a full-screen TUI (Milestone 2 decision 1), since both replace readline's rendering.
 - Keep `LineEndingKeys` (`src/harness/line-keys.ts`) as the key decoder. It already turns kitty-protocol keys into legacy bytes and classifies Return versus Shift+Return.
-- Consider bracketed paste (`CSI ? 2004 h`), so a pasted block is inserted as text rather than handled as keystrokes.
+- Bracketed paste is already enabled (Milestone 2): `LineEndingKeys` turns a paste's line breaks into continuations. A real editor should insert the pasted block as text at the cursor.
 - Rendering must handle wrapped lines and wide characters, and keep the cursor where it is while the status line redraws.
+
+## Rendering performance follow-ups (Milestone 2 security review)
+
+*Recorded 2026-10-04; spec `2026-10-03-milestone-2-streaming-ui`. Both are low risk, but worth doing in Milestone 9 hardening.*
+
+- **Incremental block scan.** `MarkdownStream` runs `scan()` over the whole pending block on every delta, which is O(n²/delta) in total for one very long block (an unclosed fence, a list with many blank lines, a table without pipes). No single call blocked longer than about 43 ms in measurements. To fix it, keep the scan offset and state between calls.
+- **Earlier detection of a dead render worker.** A worker that dies (for example of its own memory limit) is noticed only when the 200 ms deadline expires, because its `exit` event cannot run while the main thread waits. This is harmless at 200 ms. If the deadline is ever raised, have the worker set a "dying" flag in shared memory from `process.on("exit")`.
+- **Milestone 2 review suggestions carried forward:** see the "General review passed at cycle 4" entry in that spec's `decisions.md`.
