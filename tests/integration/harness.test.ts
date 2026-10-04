@@ -36,6 +36,7 @@ interface FakeOptions {
  * A fake OpenCode behind the real adapter. Prompt text selects the scripted behaviour:
  * "perm…" raises a permission request (and ends the turn), "permok…" raises one and still answers,
  * "ask…" raises a question, "slow…" runs until interrupted, "boom…" ends with a step error;
+ * "drop…" is dropped by OpenCode in its first session (idle, no response) and answered in the next;
  * "stream…" streams text and a read tool before answering ("streammiss…" drops part of the final
  * text from the stream; "streamslow…" streams, starts a bash tool, and runs until interrupted);
  * anything else is answered with "Answer: <prompt>". While `dead`, every call fails like a
@@ -74,11 +75,14 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
     if (!text.startsWith("streammiss")) emit("text.ended", { ...base, assistantMessageID: `asst-${sessionID}`, textID: "t2", text: STREAMED_ANSWER });
     emit("step.ended", { ...base, assistantMessageID: `asst-${sessionID}`, finish: "stop", cost: 0, tokens: { input: 1000, output: 1200, reasoning: 0, cache: { read: 0, write: 0 } } });
   };
+  const droppedOnce = new Set<string>();
+  const dropped = new Set<string>();
   const turn = (sessionID: string) => {
     const prompt = prompts.get(sessionID) ?? "";
     const userMessage = { id: `input-${sessionID}`, type: "user", time: { created: 1 }, text: prompt };
     const done = (text: string, extra: Record<string, unknown> = {}) =>
       ({ id: `asst-${sessionID}`, type: "assistant", time: { created: 2, completed: 3 }, agent: "build", model: MODEL, content: [{ type: "text", id: "t", text }], ...extra });
+    if (dropped.has(sessionID)) return [userMessage];
     if (prompt.startsWith("permok")) return [userMessage, done(`Answer: ${prompt}`)];
     if (prompt.startsWith("perm") || prompt.startsWith("ask")) {
       return [userMessage, { ...done(""), time: { created: 2 }, content: [{ type: "tool", tool: "read" }] }];
@@ -110,6 +114,10 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
           const text = parameters.prompt.text;
           prompts.set(sessionID, text);
           calls.push(`prompt:${sessionID}`);
+          if (text.startsWith("drop") && !droppedOnce.has(text)) {
+            droppedOnce.add(text);
+            dropped.add(sessionID);
+          }
           if (text.startsWith("perm")) {
             state.monitor?.onPermissionAsked?.({ sessionID, requestID: `per_${sessionID}`, action: "external_directory", resourceCount: 1 });
           }
@@ -230,6 +238,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
         };
       }),
       trace: (event) => trace.push(event),
+      noResponseTimeoutMs: 300,
     },
   );
   const finished = harness.run();
@@ -787,5 +796,24 @@ describe("harness messages while the status line is shown (review cycle 1)", () 
     // Typing while busy is neither echoed nor run.
     expect(run.output()).not.toContain("typed while busy");
     expect(run.calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:ses_1"]);
+  });
+});
+
+describe("prompts OpenCode drops (Milestone 2 QA)", () => {
+  it("sends a dropped prompt again in a fresh session, says so, and deletes both sessions", async () => {
+    const run = startHarness();
+    run.input.write("drop this one\nnext\n");
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("OpenCode did not start on the prompt; sending it again in a fresh session…");
+    expect(run.output()).toContain("Answer: drop this one");
+    expect(run.output()).toContain("Answer: next");
+    expect(sessionsCreated(run.trace)).toEqual(["ses_1", "ses_2", "ses_3"]);
+    expect(sessionsDeleted(run.trace)).toEqual(["ses_1", "ses_2", "ses_3"]);
+    const events = run.trace.map((event) => event.event);
+    expect(events.filter((event) => event === "prompt.started")).toHaveLength(2);
+    expect(events.filter((event) => event === "prompt.retried")).toHaveLength(1);
+    expect(events.filter((event) => event === "prompt.completed")).toHaveLength(2);
   });
 });

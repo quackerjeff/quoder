@@ -19,6 +19,8 @@ const assistant = (text: string, extra: Record<string, unknown> = {}) => ({
 interface FakeTurn {
   /** Messages returned once the session is idle. */
   readonly messages: unknown[];
+  /** Per-session messages, overriding `messages` (for example a dropped first session). */
+  readonly messagesBySession?: Readonly<Record<string, unknown[]>>;
   /** Number of `isActive` polls that report running before idle. */
   readonly runningPolls?: number;
   /** Stays running until interrupted. */
@@ -26,6 +28,7 @@ interface FakeTurn {
   readonly promptFails?: boolean;
   readonly deleteFails?: boolean;
   readonly createFails?: boolean;
+  readonly deleteFailsFor?: string;
 }
 
 const fakeAdapter = (turn: FakeTurn) => {
@@ -44,12 +47,12 @@ const fakeAdapter = (turn: FakeTurn) => {
       if (turn.promptFails) throw new Error("submit prompt: rejected");
       return { id: "input-1" };
     }),
-    isActive: vi.fn(async () => {
+    isActive: vi.fn(async (_sessionID: string) => {
       polls++;
       if (turn.runsUntilInterrupted) return !interrupted;
       return polls <= (turn.runningPolls ?? 0);
     }),
-    messages: vi.fn(async () => ({ data: turn.messages, cursor: {} })),
+    messages: vi.fn(async (sessionID: string) => ({ data: turn.messagesBySession?.[sessionID] ?? turn.messages, cursor: {} })),
     interrupt: vi.fn(async (sessionID: string) => {
       calls.push(`interrupt:${sessionID}`);
       interrupted = true;
@@ -60,6 +63,7 @@ const fakeAdapter = (turn: FakeTurn) => {
     deleteSession: vi.fn(async (sessionID: string) => {
       calls.push(`delete:${sessionID}`);
       if (turn.deleteFails) throw new Error("verify session deletion: not confirmed");
+      if (turn.deleteFailsFor === sessionID) throw new Error("verify session deletion: not confirmed");
     }),
   };
   return { adapter: adapter as unknown as OpenCodeAdapter, calls, raw: adapter };
@@ -256,17 +260,137 @@ describe("one prompt in one fresh OpenCode session", () => {
     expect(calls).toEqual(["create:/work/QuackTrack"]);
   });
 
-  it("fails a turn that stays idle without any assistant message", async () => {
+  it("sends a dropped prompt once more in a fresh session, and fails if that is dropped too", async () => {
     let clock = 0;
     const { adapter, calls } = fakeAdapter({ messages: [user("input-1")] });
+    let retries = 0;
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, {
+      noResponseTimeoutMs: 1_000,
+      now: () => (clock += 400),
+      onRetry: () => retries++,
+    });
+
+    expect(result.outcome).toEqual({ kind: "failed", reason: "OpenCode did not start a response" });
+    expect(retries).toBe(1);
+    expect(calls).toEqual([
+      "create:/work/QuackTrack", "prompt:ses_1", "interrupt:ses_1", "idle:ses_1", "delete:ses_1",
+      "create:/work/QuackTrack", "prompt:ses_2", "interrupt:ses_2", "idle:ses_2", "delete:ses_2",
+    ]);
+    expect(result).toMatchObject({ sessionID: "ses_2", sessionDeleted: true });
+  });
+
+  it("answers from the second session when OpenCode dropped the first (Milestone 2 QA)", async () => {
+    let clock = 0;
+    const { adapter, calls } = fakeAdapter({
+      messages: [user("input-1"), assistant("Done.")],
+      messagesBySession: { ses_1: [user("input-1")] },
+    });
 
     const result = await run(adapter, new SessionTracker(), new AbortController().signal, {
       noResponseTimeoutMs: 1_000,
       now: () => (clock += 400),
     });
 
-    expect(result.outcome).toEqual({ kind: "failed", reason: "OpenCode did not start a response" });
-    expect(calls.slice(-3)).toEqual(["interrupt:ses_1", "idle:ses_1", "delete:ses_1"]);
+    expect(result).toMatchObject({ sessionID: "ses_2", outcome: { kind: "answered", text: "Done." }, sessionDeleted: true });
+    expect(calls.filter((call) => call.startsWith("delete:"))).toEqual(["delete:ses_1", "delete:ses_2"]);
+  });
+
+  it("does not retry when the dropped session could not be verified as deleted", async () => {
+    let clock = 0;
+    const { adapter, calls } = fakeAdapter({ messages: [user("input-1")], deleteFailsFor: "ses_1" });
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, {
+      noResponseTimeoutMs: 1_000,
+      now: () => (clock += 400),
+    });
+
+    expect(result).toMatchObject({ sessionID: "ses_1", sessionDeleted: false, outcome: { kind: "failed" } });
+    expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
+  });
+
+  it("does not retry when cancelled while waiting for a response", async () => {
+    let clock = 0;
+    const cancel = new AbortController();
+    const { adapter, calls } = fakeAdapter({ messages: [user("input-1")] });
+
+    const result = await run(adapter, new SessionTracker(), cancel.signal, {
+      noResponseTimeoutMs: 1_000,
+      now: () => {
+        clock += 400;
+        if (clock > 1_000) cancel.abort();
+        return clock;
+      },
+    });
+
+    expect(result.outcome).toEqual({ kind: "cancelled" });
+    expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
+  });
+
+});
+
+describe("cancelling around a retry (review cycle 5)", () => {
+  const dropFirst = (extra: Partial<FakeTurn> = {}) =>
+    fakeAdapter({ messages: [user("input-1"), assistant("Done.")], messagesBySession: { ses_1: [user("input-1")] }, ...extra });
+
+  it("reports a Ctrl-C pressed while the dropped session is cleaned up, and does not retry", async () => {
+    let clock = 0;
+    const cancel = new AbortController();
+    const { adapter, calls, raw } = dropFirst();
+    raw.deleteSession.mockImplementationOnce(async (sessionID: string) => {
+      calls.push(`delete:${sessionID}`);
+      cancel.abort();
+    });
+    let retries = 0;
+
+    const result = await run(adapter, new SessionTracker(), cancel.signal, {
+      noResponseTimeoutMs: 1_000,
+      now: () => (clock += 400),
+      onRetry: () => retries++,
+    });
+
+    expect(result).toMatchObject({ sessionID: "ses_1", outcome: { kind: "cancelled" }, sessionDeleted: true });
+    expect(retries).toBe(0);
+    expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
+  });
+
+  it.each([
+    ["Ctrl-C", undefined, { kind: "cancelled" }],
+    ["a harness stop", { stopped: "Server lost." }, { kind: "failed", reason: "Server lost." }],
+  ])("stops the retried turn on %s and still deletes its session", async (_name, reason, outcome) => {
+    let clock = 0;
+    const cancel = new AbortController();
+    const tracker = new SessionTracker();
+    const { adapter, calls, raw } = dropFirst({ runsUntilInterrupted: false });
+    // The retried session keeps running until it is stopped.
+    raw.isActive.mockImplementation(async (sessionID: string) => sessionID === "ses_2" && !calls.includes("interrupt:ses_2"));
+
+    const pending = run(adapter, tracker, cancel.signal, { noResponseTimeoutMs: 1_000, now: () => (clock += 400), pollIntervalMs: 5 });
+    await vi.waitFor(() => expect(calls).toContain("prompt:ses_2"));
+    cancel.abort(reason);
+    const result = await pending;
+
+    expect(result).toMatchObject({ sessionID: "ses_2", outcome, sessionDeleted: true });
+    expect(calls.slice(-3)).toEqual(["interrupt:ses_2", "idle:ses_2", "delete:ses_2"]);
+    expect(tracker.owns("ses_1") || tracker.owns("ses_2")).toBe(false);
+  });
+
+  it("still settles and deletes the second session when cancelled while it is being created", async () => {
+    let clock = 0;
+    const cancel = new AbortController();
+    const { adapter, calls, raw } = dropFirst();
+    const create = raw.createSession.getMockImplementation();
+    raw.createSession.mockImplementation(async (options: { directory: string; model: unknown }) => {
+      const session = await create!(options);
+      if (session.id === "ses_2") cancel.abort();
+      return session;
+    });
+
+    const result = await run(adapter, new SessionTracker(), cancel.signal, { noResponseTimeoutMs: 1_000, now: () => (clock += 400) });
+
+    expect(result).toMatchObject({ sessionID: "ses_2", outcome: { kind: "cancelled" }, sessionDeleted: true });
+    expect(calls).not.toContain("prompt:ses_2");
+    expect(calls.slice(-3)).toEqual(["interrupt:ses_2", "idle:ses_2", "delete:ses_2"]);
   });
 });
 

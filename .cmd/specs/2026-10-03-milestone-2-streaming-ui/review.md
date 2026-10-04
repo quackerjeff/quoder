@@ -313,3 +313,108 @@ None.
 Scratch files are in `/private/tmp/claude-501/m2review4/` (`keys.mjs`, `md.mjs`, `md3.mjs`). The repository was not modified.
 
 ### Verdict: PASS
+
+## Cycle 5 — 2026-10-04 (QA addendum: dropped-prompt retry)
+Reviewing: QA Fix Group 1 (uncommitted diff against 0ee4bdd: `src/harness/session-runner.ts`, `src/harness/repl.ts`, `scripts/verify-harness.ts`, `tests/unit/session-runner.test.ts`, `tests/integration/harness.test.ts`, spec `tasks.md`/`decisions.md`)
+
+### Invariants checked (no defects found)
+- **Fresh session per prompt and cleanup.** Each `runAttempt` creates its own session, registers it with the tracker, settles it (interrupt and wait for idle, since a dropped turn has `endedIdle: false`), deletes and verifies it, reports `onSessionDeleted`, and unregisters it. All of that happens before `onRetry` and before the second session is created. I confirmed the order in the unit test and in a scratch run against the built `dist/` (outside the repo).
+- **Unverified first-session deletion is never lost.** The runner retries only when `attempt.sessionDeleted` is true (`session-runner.ts:201`). If the first deletion is unverified, the result keeps `sessionID: ses_1, sessionDeleted: false`, and `repl.ts:368` pushes it to `#undeletedSessions`. After a retry, `sessionID`/`sessionDeleted` describe the second session, and the first is known to be verified deleted. Permissions and questions from the first session are dropped from the result, which is acceptable: the session has no assistant message, so no tool ran.
+- **No permission is ever granted.** Unchanged. A late event from the first session after `unregister` fails `isOwnSession`, so the monitor ignores it. It is never answered, and in particular never granted.
+- **Cancel and stop requests during the retry.** The scratch experiment (`/private/tmp/claude-501/quoder-review-c5/exp.mjs`) covered three cases:
+  - Ctrl-C during the second attempt gives `cancelled`, and `ses_2` is interrupted, idled, deleted and unregistered.
+  - A `StopRequest` abort during the retry gives `failed: "Server lost."`, with the same cleanup.
+  - An abort while `createSession` #2 is in flight gives `cancelled`, and `ses_2` is still settled and deleted.
+
+  Cancelling during the 5 s detection window returns `cancelled` without a retry (covered by an existing test).
+- **Could the 5 s check misfire on a legitimate turn?** No window found. `docs/tech.md:237` records that admission synchronously registers the run before the HTTP response, and that the session stays in `active` until every step drains. `docs/tech.md:176` says a pending question keeps the session running. A legitimate turn is therefore never "inactive with no assistant message", and `idleWithoutResponseSince` resets whenever the session is active. The worst case is a run that fails before creating any assistant message. That would now fail after one retry (about 10 s plus cleanup) instead of after 30 s, which is harmless.
+- **LiveView across the session switch.** `setSession(ses_2)` resets the phase. `handle` drops any event whose `sessionID` is not the current session (`live-view.ts:129`), and the monitor also filters out the unregistered `ses_1`. No late `ses_1` output can reach the view. The retry note goes through `view.note`, which erases the status line first.
+- **verify-harness logic.** Segmenting by `prompt.started` is correct: it is traced once per `#runPrompt`, before `#ensureServer`, so a server-start failure still opens a segment. Other row logic:
+  - The "Fresh session per prompt" row requires one session per prompt, or two only when the prompt was retried, and every session ID distinct.
+  - "Session deletion" still covers every created session.
+  - `cancelledDeleted` requires at least one session and every session verified deleted.
+  - `streamedBeforeCompletion` and the tool list are per prompt, as before.
+
+### Critical
+None.
+
+### Warning
+- **[tests/unit/session-runner.test.ts:312 (and session-runner.ts:201)] The cancel guard before the retry and cancellation during the retry are untested.**
+  - **What the test actually covers.** "does not retry after the developer cancelled" aborts at clock 1200, inside the detection window (idle since 800, timeout 1000). `runTurn` therefore returns `cancelled` with `dropped: false`, and the runner never reaches the `!options.cancel.aborted` check at line 201. That check could be deleted and the test would still pass.
+  - **Failure scenario this leaves open.** A future change that removes or reorders the guard would let a Ctrl-C pressed while the dropped session is being settled or deleted be ignored: the runner would start a fresh session and send the prompt again after the developer cancelled. No test would fail.
+  - **Also untested.** Cancel and `StopRequest` during the second attempt, and an abort during the second `createSession`. These are the session-cleanup paths the change adds. I confirmed they work today only by the scratch experiment above.
+  - **Fix.** Add unit tests for:
+    - an abort fired from `deleteSession("ses_1")` (or from `onRetry`): expect one `create:` call and `onRetry` not called (or no second session);
+    - an abort, then a `{ stopped }` abort, during `ses_2`'s polling: expect `cancelled` or `failed: <stop message>`, `sessionID: "ses_2"`, the calls `interrupt:ses_2`, `idle:ses_2` and `delete:ses_2`, and the tracker no longer owning either session.
+  - **Also.** Rename the existing test to say "cancelled while waiting for a response".
+
+### Suggestion
+- **[src/harness/session-runner.ts:201] Ctrl-C during cleanup is reported as a failure.** If Ctrl-C arrives while the dropped session is being settled or deleted, the retry is correctly skipped, but the outcome stays `failed: "OpenCode did not start a response"`, not `cancelled` (seen in the scratch run). The developer pressed Ctrl-C and sees a failure. Consider returning `abortedOutcome(options.cancel)` when `attempt.dropped && options.cancel.aborted`.
+- **[src/harness/session-runner.ts:174] Inaccurate `Attempt.dropped` doc comment.** It says "and the session is gone", but `dropped` is also true when the deletion was unverified. Reword it to "admitted but OpenCode never started a response".
+- **[scripts/verify-harness.ts:165-176] Stale comment and fallback clock start.** The comment says SIGINT is sent only while the third prompt is "provably running (created, not completed)". The trigger is now `prompt.started`, which comes before `session.created`, and the 15 s fallback clock starts there. The practical risk is small, because the server is already up for prompt 3. One edge case: if the fallback fires between a dropped first attempt and the retry, the prompt ends `failed` and the row fails spuriously. Consider requiring `target.sessionIDs.length > 0` before arming the fallback, and updating the comment.
+- **[docs/tech.md:290] Stale timeout figure.** It still says an idle session with no assistant message "fails after 30 s" and does not mention the retry. This is due in Group 8, but it should not be missed.
+
+### Tests
+- [x] All tests passing: `npx vitest run` gives 20 files and 413 tests passed. `npx tsc --noEmit -p .` and `npx tsc --noEmit -p tsconfig.live.json` are both clean. `npm run build` succeeded.
+- [ ] Test coverage adequate for changes: the cancel guard before the retry and cancel/stop during the retry are untested (see Warning).
+
+### Verdict: FAIL
+The implementation behaves correctly in every scenario I checked. The FAIL comes only from the Warning: the retry's cancellation and stop paths, including the guard at `session-runner.ts:201`, have no tests. Adding the tests listed above should be enough to pass.
+
+## Cycle 6 — 2026-10-04 (QA addendum follow-up)
+Reviewing: QA Fix Group 1 review fixes
+
+**Process incident, needs your attention:** During mutation testing, one setup `cp` failed. Because the command was chained with `&&`, the shell stayed in the repository, so three mutations were applied to the real `src/harness/session-runner.ts` instead of the scratch copy:
+- the guard branch was removed
+- the post-create `cancel.aborted` check was replaced with a bare block
+- the `if (!endedIdle) await settle(...)` line was removed
+
+I found this straight away and restored all three spots from the exact original text I had read earlier in this cycle. After the restore:
+- `git diff 0ee4bdd --stat` again shows `session-runner.ts | 62` (the same as before the incident).
+- The restored region was re-read and matches the original.
+- `git status` shows the same 8 modified files and no untracked files.
+- `npx vitest run` in the repo passes 417/417.
+
+No other repo file was touched. Please run a quick `git diff -- src/harness/session-runner.ts` yourself to confirm. The mutation runs were then redone in a scratch copy, since deleted.
+
+### Critical
+- None.
+
+### Warning
+- None. The cycle 5 Warning is resolved:
+  - **New tests exist and pass.** They are in `tests/unit/session-runner.test.ts`, describe block "cancelling around a retry (review cycle 5)":
+    - Ctrl-C during cleanup of the dropped session.
+    - Ctrl-C and a harness stop during the retried turn (`it.each`).
+    - Cancel while the second session is being created.
+  - **Mutation testing in the scratch copy** (`session-runner.test.ts` plus `harness.test.ts`):
+    - Removing the guard branch (`if (attempt.dropped && options.cancel.aborted)` → `if (false)`) fails only "reports a Ctrl-C pressed while the dropped session is cleaned up, and does not retry". So the test does reach the guard, and catches its removal.
+    - Removing only the `outcome: abortedOutcome(...)` override (keeping the no-retry) also fails that test. So it checks both "no retry" and "reported as `cancelled`".
+    - Making the retry ignore cancel (`runAttempt({...options, cancel: new AbortController().signal})`) fails both retried-turn stop tests and the cancel-while-creating test.
+    - Removing the post-create `cancel.aborted` check fails "still settles and deletes the second session when cancelled while it is being created", plus an existing harness test.
+    - Removing `tracker.unregister` fails the two retried-turn stop tests, which assert neither session is still registered.
+    - Removing `settle` fails 13 tests, including all the new retry-cancel tests.
+- **Adopted suggestions are correct:**
+  - **Cancel during cleanup of a dropped session** (`src/harness/session-runner.ts:200-206`): now reports `abortedOutcome(...)`, i.e. `cancelled`, or `failed` with the stop reason for a harness stop. No retry, and the result keeps `ses_1` and its real `sessionDeleted` value. Precedence over the retry branch is correct even when deletion was not verified.
+  - **verify-harness cancel fallback** (`scripts/verify-harness.ts:166-188`): armed only when all of these hold:
+    - exactly three prompts have started (`prompt.started` count === 3), so a 4th has not;
+    - the target has no outcome;
+    - the target has at least one session.
+
+    The clock restarts whenever the target's session count changes, so a retry restarts it.
+  - **Can SIGINT be sent while Quoder is idle?** In practice, no:
+    - `prompt.started` is traced inside `#runPrompt` after `#running` is set, and `prompt.completed` is traced before `#running` is cleared in `finally`. So "started, not completed" lies within the running window.
+    - Server-start failure leaves no session, so the fallback never arms.
+    - If the fallback fires between deleting the dropped session and creating the retry session, Quoder is still inside `runPrompt` (`#running` set). The new guard turns that into `cancelled`, and the dropped session ID is in `deleted`, so "Cancel and continue" passes.
+    - The only remaining path is the race in the suggestion below; it is pre-existing and fails safe.
+  - **"Fresh session per prompt" and "Cancel and continue"** now key on `prompt.started` and allow exactly two sessions when `prompt.retried` was traced. A retry whose second session failed to create is correctly reported as a failure.
+
+### Suggestion
+- [scripts/verify-harness.ts:184] `cancelTargetSeenAt ??= Date.now();` is now dead code. The preceding block always assigns it the first time a session appears, because `cancelTargetSessions` starts at 0 and the length is already ≥ 1. Remove it, and optionally make `cancelTargetSeenAt` a plain `number`.
+- [scripts/verify-harness.ts:174-188] **Narrow, pre-existing race:** the target prompt can complete between the async trace read and `child.kill("SIGINT")`. An idle SIGINT makes Quoder exit (`interrupt()` → `#requestExit(0)`), so the 4th prompt never runs. The script then reports FAIL rather than passing wrongly, so it is a possible flaky false negative only. Worth one sentence in the comment, which currently says "never when idle".
+- [tests/unit/session-runner.test.ts:390] Minor tidy: the empty line before the closing `});` of the first describe block.
+
+### Tests
+- [x] All tests passing: `npx vitest run` gives 20 files, 417/417. `npx tsc --noEmit -p .` is clean, and so is `npx tsc --noEmit -p tsconfig.live.json`.
+- [x] Test coverage adequate for changes. The retry's cancel and stop paths, the post-cancel guard, cleanup of the second session, and tracker unregistration are all covered, and each is shown by mutation to catch its removal.
+
+### Verdict: PASS

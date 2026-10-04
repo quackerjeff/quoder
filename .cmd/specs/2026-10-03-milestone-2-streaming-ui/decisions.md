@@ -321,3 +321,47 @@ It found one Warning: the plain-text fallback that the isolation relies on runs 
   - token-tree sanitization after lexing;
   - Markdown rendering isolated in a worker with a hard 200 ms deadline per chunk, a 1 s budget per stream and a 256 MB memory limit;
   - linear main-thread code, checked by fuzzing.
+
+## 2026-10-04 — QA finding: OpenCode intermittently drops the first prompt (QA Fix Group 1)
+
+**Context**:
+- **The first QA run.** The authorized `npm run verify:harness` passed every Milestone 2 row: streamed before completion, tool activity and cancel-and-continue, plus one server, four sessions all verified deleted, and clean cleanup. However, prompt 1 ended `failed`, so both exit criteria were NOT MET.
+- **The diagnostic.** An authorized diagnostic ran the built CLI on that prompt three times, each with a fresh server, printing only Quoder's own status lines. Run 1 printed "The prompt did not complete: OpenCode did not start a response" after 30.9 s; runs 2 and 3 answered in 8.7 s and 7.3 s.
+- **The cause.** This is the behaviour found in Group 1. OpenCode 1.18.33 accepts the **first** prompt on a fresh server, then goes idle with no assistant message and no error, and the model never runs. It now also happens with the canonical directory: 2 of 5 fresh servers today. Later prompts on the same server always worked. It is not a Milestone 2 regression: the Milestone 1 runner has the same 30 s failure path, and Milestone 1's single QA run happened not to hit it.
+
+**Decision** (the developer chose fast detection and one retry):
+- **Detection.** An admitted prompt whose session is idle with no assistant message for `NO_RESPONSE_TIMEOUT_MS` (now 5 s, previously 30 s) counts as dropped. An admitted run is registered as active at once (verified in Milestone 0), so idle without a response is never a slow model.
+- **Retry.** The runner deletes the dropped session, verified as usual, and sends the prompt once more in a fresh session. Nothing ran in the dropped turn, so this is safe. There is no retry if the dropped session's deletion was not verified (that session is reported as before) or if the developer cancelled. A second drop fails with the old message.
+- **What the developer sees.** A dim note: "OpenCode did not start on the prompt; sending it again in a fresh session…".
+- **Trace.** New events `prompt.started` and `prompt.retried`.
+- **`verify:harness`.** It now splits the trace at `prompt.started`. A prompt may own two sessions only if it was retried; every session must be distinct and verified deleted. The "Fresh session per prompt" row reports the number of retries.
+
+**Verification**: 413 tests pass. New runner tests cover a retry that answers from the second session, a double drop that fails, no retry when the deletion was unverified, and no retry after a cancel. A harness test covers the note, three sessions all deleted, and the `prompt.started`/`prompt.retried` trace. Next: a focused general review of this change, then `verify:harness` again.
+
+## 2026-10-04 — Review cycle 5 (QA addendum) fixes
+
+**Context**: The focused review of QA Fix Group 1 found the behaviour correct in every scenario it checked. It returned FAIL for one Warning: the retry's cancel and stop paths, including the guard that prevents a retry after Ctrl-C, were untested.
+
+**Changes**:
+- **Tests:**
+  - Ctrl-C while the dropped session is being cleaned up: reported as `cancelled`, with no retry. With the guard removed, this test fails.
+  - Ctrl-C and a harness stop during the retried turn: the second session is interrupted, settled, deleted and unregistered.
+  - Cancel while the second session is being created: it is still settled and deleted, and never prompted.
+  - The existing test is renamed to "when cancelled while waiting for a response".
+- **Suggestions adopted:**
+  - A cancel during cleanup of a dropped session now reports `cancelled`, not "OpenCode did not start a response".
+  - `Attempt.dropped`'s comment is corrected.
+  - `verify:harness` arms the cancel fallback only once the third prompt has a session, and restarts the clock on a retry.
+  - The stale 30 s figure in `docs/tech.md` is due in Group 8.
+
+**Verification**: 417 tests pass.
+
+## 2026-10-04 — QA addendum review passed (cycle 6); a reviewer process incident checked
+
+**Context**: Review cycle 6 returned PASS. Mutation testing showed that each new test catches the removal of the code it covers.
+
+**Process incident**: The reviewer reported that a failed `cp` during its mutation testing briefly applied three mutations to the real `src/harness/session-runner.ts`, which it then restored. The orchestrator checked this independently. The file's full diff against `0ee4bdd` matches exactly the changes made in QA Fix Group 1 and its review fixes (the guard branch, the post-create cancel check and the `settle` call are all intact), and 417 tests pass. No other file was affected. Future reviewer prompts should ask for mutation experiments in a scratch copy only, with explicit `cd` checks.
+
+**Carried forward** (no code change after a passing review):
+- the dead `cancelTargetSeenAt ??=` line in `verify-harness`;
+- a comment noting the narrow, pre-existing race in which the cancel target completes just before SIGINT. That race fails safe, as a false NOT MET.

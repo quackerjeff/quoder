@@ -222,7 +222,18 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
     - **General review: PASS at cycle 4** (cycles 1–3 FAIL; cycle 4 was authorized by the developer).
     - **Security review: PASS at cycle 7** (cycles 1–6 FAIL; cycles 4–7 were authorized by the developer).
     - Both reports are persisted verbatim in `review.md` and `security-review.md`.
-    - **QA:** pending. It needs the developer's authorization for the real-model `verify:harness` run and a manual iTerm2 check.
+    - **QA, automated:** `verify:harness` run 1 was NOT MET because OpenCode dropped the first prompt. This was diagnosed and fixed in QA Fix Group 1, reviewed in cycles 5 and 6 (PASS). Run 2 met both criteria: `Milestone 2 Exit Criterion: MET`, including a live retry. See `qa.md`.
+    - **QA, manual iTerm2 check:** pending the developer (checklist in `qa.md`).
+
+## QA Fix Group 1: Dropped first prompt (QA finding, 2026-10-04)
+
+- [x] Detect a prompt OpenCode dropped within 5 s and retry it once in a fresh session | `src/harness/session-runner.ts`, `src/harness/repl.ts`, `scripts/verify-harness.ts`, `tests/`, `decisions.md`
+  - **Accept**:
+    - A dropped prompt is retried once, safely (both sessions deleted and verified; no retry if the deletion was unverified or the prompt cancelled).
+    - The developer is told.
+    - `verify:harness` handles retried prompts.
+    - Tests cover each path.
+  - **Completed evidence**: 417 tests pass. Review cycles 5 (FAIL, untested cancel paths) and 6 (PASS). `verify:harness` run 2 met both exit criteria, with one live retry. See `decisions.md` and `qa.md`.
 
 ## Group 8: Documentation and closure
 

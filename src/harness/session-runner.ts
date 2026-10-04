@@ -8,8 +8,15 @@ import {
 } from "../opencode-adapter.js";
 
 export const TURN_POLL_INTERVAL_MS = 250;
-/** How long an idle session may go without any assistant message before the turn is failed. */
-export const NO_RESPONSE_TIMEOUT_MS = 30_000;
+/**
+ * How long an admitted prompt's session may sit idle with no assistant message before the prompt
+ * counts as dropped. OpenCode 1.18.33 intermittently drops the first prompt on a fresh server: it is
+ * admitted, then the session goes idle and the model never runs (2 of 5 fresh servers in Milestone 2
+ * QA). An admitted run is registered as active at once, so idle without a response is not a slow
+ * model; a dropped prompt is retried once in a fresh session.
+ */
+export const NO_RESPONSE_TIMEOUT_MS = 5_000;
+const NOT_STARTED = "OpenCode did not start a response";
 
 export interface QuestionSummary {
   readonly question: string;
@@ -154,25 +161,59 @@ export interface RunPromptOptions {
   readonly cancel: AbortSignal;
   readonly onSessionCreated?: (sessionID: string) => void;
   readonly onSessionDeleted?: (sessionID: string, verified: boolean) => void;
+  /** Called when a dropped prompt is about to be sent again in a fresh session. */
+  readonly onRetry?: () => void;
   readonly pollIntervalMs?: number;
   readonly noResponseTimeoutMs?: number;
   readonly now?: () => number;
 }
 
+interface Attempt {
+  readonly sessionID: string | undefined;
+  readonly outcome: TurnOutcome;
+  /** The prompt was admitted but OpenCode never started a response. */
+  readonly dropped: boolean;
+  readonly rejectedPermissions: RejectedPermission[];
+  readonly rejectedQuestions: QuestionSummary[];
+  readonly sessionDeleted: boolean;
+}
+
 /**
  * Runs one developer prompt in a fresh OpenCode session (FR-3, FR-15). The session is always
- * deleted, and the deletion verified, whatever happened during the turn.
+ * deleted, and the deletion verified, whatever happened during the turn. A prompt OpenCode dropped
+ * (admitted, never started) is sent once more in another fresh session; nothing ran in the first.
  */
 export async function runPrompt(options: RunPromptOptions): Promise<PromptResult> {
   const now = options.now ?? Date.now;
   const started = now();
-  const empty = { rejectedPermissions: [], rejectedQuestions: [] };
   if (options.cancel.aborted) {
-    return { sessionID: undefined, outcome: abortedOutcome(options.cancel), ...empty, sessionDeleted: true, elapsedMs: 0 };
+    return {
+      sessionID: undefined,
+      outcome: abortedOutcome(options.cancel),
+      rejectedPermissions: [],
+      rejectedQuestions: [],
+      sessionDeleted: true,
+      elapsedMs: 0,
+    };
   }
+  let attempt = await runAttempt(options);
+  // Retry only when the dropped session was verifiably deleted and the developer has not cancelled.
+  if (attempt.dropped && options.cancel.aborted) {
+    // Ctrl-C (or a harness stop) while the dropped session was being cleaned up: report that.
+    attempt = { ...attempt, outcome: abortedOutcome(options.cancel) };
+  } else if (attempt.dropped && attempt.sessionDeleted) {
+    options.onRetry?.();
+    attempt = await runAttempt(options);
+  }
+  const { dropped: _dropped, ...result } = attempt;
+  return { ...result, elapsedMs: now() - started };
+}
+
+async function runAttempt(options: RunPromptOptions): Promise<Attempt> {
   let sessionID: string | undefined;
   let outcome: TurnOutcome;
   let endedIdle = false;
+  let dropped = false;
   try {
     const session = await options.adapter.createSession({ directory: options.directory, model: options.model });
     sessionID = session.id;
@@ -184,6 +225,7 @@ export async function runPrompt(options: RunPromptOptions): Promise<PromptResult
       const turn = await runTurn(options, sessionID);
       outcome = turn.outcome;
       endedIdle = turn.endedIdle;
+      dropped = turn.dropped;
     }
   } catch (error) {
     outcome = options.cancel.aborted ? abortedOutcome(options.cancel) : { kind: "failed", reason: failureReason(error) };
@@ -207,13 +249,13 @@ export async function runPrompt(options: RunPromptOptions): Promise<PromptResult
     options.onSessionDeleted?.(sessionID, sessionDeleted);
     options.tracker.unregister(sessionID);
   }
-  return { sessionID, outcome, rejectedPermissions, rejectedQuestions, sessionDeleted, elapsedMs: now() - started };
+  return { sessionID, outcome, dropped, rejectedPermissions, rejectedQuestions, sessionDeleted };
 }
 
 async function runTurn(
   options: RunPromptOptions,
   sessionID: string,
-): Promise<{ readonly outcome: TurnOutcome; readonly endedIdle: boolean }> {
+): Promise<{ readonly outcome: TurnOutcome; readonly endedIdle: boolean; readonly dropped: boolean }> {
   const { adapter, cancel } = options;
   const admitted = await adapter.prompt(sessionID, options.prompt);
   const pollIntervalMs = options.pollIntervalMs ?? TURN_POLL_INTERVAL_MS;
@@ -221,15 +263,15 @@ async function runTurn(
   const now = options.now ?? Date.now;
   let idleWithoutResponseSince: number | undefined;
   for (;;) {
-    if (cancel.aborted) return { outcome: abortedOutcome(cancel), endedIdle: false };
+    if (cancel.aborted) return { outcome: abortedOutcome(cancel), endedIdle: false, dropped: false };
     if (!(await adapter.isActive(sessionID))) {
       const messages = await adapter.messages(sessionID);
       if (hasAssistantResponseAfter(messages, admitted.id)) {
-        return { outcome: classifyEndedTurn(options, sessionID, messages, admitted.id), endedIdle: true };
+        return { outcome: classifyEndedTurn(options, sessionID, messages, admitted.id), endedIdle: true, dropped: false };
       }
       idleWithoutResponseSince ??= now();
       if (now() - idleWithoutResponseSince >= noResponseTimeoutMs) {
-        return { outcome: { kind: "failed", reason: "OpenCode did not start a response" }, endedIdle: false };
+        return { outcome: { kind: "failed", reason: NOT_STARTED }, endedIdle: false, dropped: true };
       }
     } else {
       idleWithoutResponseSince = undefined;

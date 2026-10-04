@@ -34,6 +34,8 @@ export type HarnessTraceEvent =
   | { readonly event: "session.deleted"; readonly sessionID: string; readonly verified: boolean }
   | { readonly event: "permission.rejected"; readonly sessionID: string; readonly replied: boolean }
   | { readonly event: "prompt.completed"; readonly outcome: TurnOutcome["kind"]; readonly elapsedMs: number }
+  | { readonly event: "prompt.started" }
+  | { readonly event: "prompt.retried" }
   | { readonly event: "stream.first-text" }
   | { readonly event: "activity.tool"; readonly tool: string };
 
@@ -42,6 +44,8 @@ export interface HarnessDependencies {
   readonly createClient: (baseUrl: string, authorization: string) => OpencodeClient;
   readonly startMonitor?: typeof startEventMonitor;
   readonly operationTimeoutMs?: number;
+  /** How long an admitted prompt may stay idle without a response before it counts as dropped. */
+  readonly noResponseTimeoutMs?: number;
   readonly trace?: (event: HarnessTraceEvent) => void;
 }
 
@@ -333,6 +337,7 @@ export class Harness {
       onToolFinished: (tool) => this.#trace({ event: "activity.tool", tool }),
     });
     this.#view = view;
+    this.#trace({ event: "prompt.started" });
     try {
       let server: ServerSession;
       try {
@@ -349,6 +354,11 @@ export class Harness {
         model: this.#options.model,
         prompt,
         cancel: controller.signal,
+        ...(this.#dependencies.noResponseTimeoutMs === undefined ? {} : { noResponseTimeoutMs: this.#dependencies.noResponseTimeoutMs }),
+        onRetry: () => {
+          this.#trace({ event: "prompt.retried" });
+          view.note(`${theme.paint("dim", "OpenCode did not start on the prompt; sending it again in a fresh session…")}\n`);
+        },
         onSessionCreated: (sessionID) => {
           view.setSession(sessionID);
           this.#trace({ event: "session.created", sessionID });

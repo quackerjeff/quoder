@@ -58,9 +58,13 @@ const readTrace = async (path: string): Promise<TraceEntry[]> =>
       }
     });
 
-/** Per-prompt view of the trace: each `session.created` starts the next prompt. */
+/**
+ * Per-prompt view of the trace: each `prompt.started` starts the next prompt. A prompt OpenCode
+ * dropped is retried in a second session (`prompt.retried`), so a prompt may own two sessions.
+ */
 interface PromptTrace {
-  sessionID?: string;
+  sessionIDs: string[];
+  retried: boolean;
   streamedBeforeCompletion: boolean;
   tools: string[];
   outcome?: string;
@@ -69,12 +73,14 @@ interface PromptTrace {
 const perPrompt = (trace: readonly TraceEntry[]): PromptTrace[] => {
   const prompts: PromptTrace[] = [];
   for (const entry of trace) {
-    if (entry.event === "session.created") {
-      prompts.push({ ...(entry.sessionID === undefined ? {} : { sessionID: entry.sessionID }), streamedBeforeCompletion: false, tools: [] });
+    if (entry.event === "prompt.started") {
+      prompts.push({ sessionIDs: [], retried: false, streamedBeforeCompletion: false, tools: [] });
       continue;
     }
     const current = prompts.at(-1);
     if (current === undefined || current.outcome !== undefined) continue;
+    if (entry.event === "session.created" && entry.sessionID !== undefined) current.sessionIDs.push(entry.sessionID);
+    if (entry.event === "prompt.retried") current.retried = true;
     if (entry.event === "stream.first-text") current.streamedBeforeCompletion = true;
     if (entry.event === "activity.tool" && entry.tool !== undefined) current.tools.push(entry.tool);
     if (entry.event === "prompt.completed" && entry.outcome !== undefined) current.outcome = entry.outcome;
@@ -157,15 +163,23 @@ async function main(): Promise<number> {
     child.stdin.on("error", () => undefined);
     child.stdin.end(PROMPTS.map((prompt) => `${prompt}\n`).join(""));
     // Ctrl-C for the third prompt: piped stdin means SIGINT reaches the CLI's own handler. It is
-    // sent only while that prompt is provably running (created, not completed), never when idle.
+    // sent only while that prompt is provably running (started, with a session, not completed),
+    // never when idle: once it streams text, or after a fallback measured from its latest session,
+    // so a retry after a dropped first attempt restarts the clock.
     let cancelSent = false;
     let cancelTargetSeenAt: number | undefined;
+    let cancelTargetSessions = 0;
     const canceller = setInterval(() => {
       if (cancelSent || child.pid === undefined) return;
       void readTrace(tracePath).then((trace) => {
         const prompts = perPrompt(trace);
         const target = prompts[CANCELLED_PROMPT];
         if (cancelSent || prompts.length !== CANCELLED_PROMPT + 1 || target === undefined || target.outcome !== undefined) return;
+        if (target.sessionIDs.length === 0) return;
+        if (target.sessionIDs.length !== cancelTargetSessions) {
+          cancelTargetSessions = target.sessionIDs.length;
+          cancelTargetSeenAt = Date.now();
+        }
         cancelTargetSeenAt ??= Date.now();
         if (target.streamedBeforeCompletion || Date.now() - cancelTargetSeenAt >= CANCEL_FALLBACK_MS) {
           cancelSent = true;
@@ -200,7 +214,13 @@ async function main(): Promise<number> {
     const results = [
       row("Harness launch and exit", exitCode === 0, `exit code ${String(exitCode)}`),
       row("Single OpenCode server", count("server.started") === 1 && count("server.lost") === 0, `${count("server.started")} started, ${count("server.lost")} lost`),
-      row("Fresh session per prompt", created.length === PROMPTS.length && new Set(created).size === created.length, `${created.length} sessions, ${new Set(created).size} distinct`),
+      row(
+        "Fresh session per prompt",
+        prompts.length === PROMPTS.length &&
+          prompts.every((prompt) => prompt.sessionIDs.length === (prompt.retried ? 2 : 1)) &&
+          new Set(created).size === created.length,
+        `${prompts.length} prompts, ${created.length} sessions, ${new Set(created).size} distinct, ${prompts.filter((prompt) => prompt.retried).length} retried after OpenCode dropped the prompt`,
+      ),
       row(
         "Prompts completed",
         outcomes.length === PROMPTS.length && outcomes.every((outcome, index) => outcome === EXPECTED_OUTCOMES[index]),
@@ -214,6 +234,7 @@ async function main(): Promise<number> {
     const toolNames = prompts[TOOL_PROMPT]?.tools ?? [];
     const cancelled = prompts[CANCELLED_PROMPT];
     const after = prompts[CANCELLED_PROMPT + 1];
+    const cancelledDeleted = cancelled !== undefined && cancelled.sessionIDs.length > 0 && cancelled.sessionIDs.every((id) => deleted.includes(id));
     const milestone2 = [
       row("Streamed before completion", answered.length > 0 && streamed === answered.length, `${streamed} of ${answered.length} answered prompts streamed text before completing`),
       row("Tool activity observed", toolNames.length > 0, `prompt ${TOOL_PROMPT + 1} tools: ${toolNames.join(", ") || "none"}`),
@@ -221,11 +242,10 @@ async function main(): Promise<number> {
         "Cancel and continue",
         cancelSent &&
           cancelled?.outcome === "cancelled" &&
-          cancelled.sessionID !== undefined &&
-          deleted.includes(cancelled.sessionID) &&
+          cancelledDeleted &&
           after?.outcome === "answered",
         `SIGINT ${cancelSent ? "sent" : "not sent"}; prompt ${CANCELLED_PROMPT + 1} ${cancelled?.outcome ?? "missing"}, ` +
-          `session ${cancelled?.sessionID !== undefined && deleted.includes(cancelled.sessionID) ? "verified deleted" : "not verified deleted"}; ` +
+          `session ${cancelledDeleted ? "verified deleted" : "not verified deleted"}; ` +
           `next prompt ${after?.outcome ?? "missing"}`,
       ),
     ];
