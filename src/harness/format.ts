@@ -91,9 +91,10 @@ export function formatResult(result: PromptResult, theme: Theme = PLAIN_THEME, s
 export const HELP_TEXT = [
   "Each prompt runs in a fresh OpenCode session that is deleted afterwards.",
   "",
-  "  /help   Show this help",
-  "  /exit   Leave Quoder (Ctrl-D also works)",
+  "  /help          Show this help",
+  "  /exit          Leave Quoder (Ctrl-D also works)",
+  "  Shift+Return   Start a new line; Return sends the prompt",
   "",
-  "Ctrl-C cancels a running prompt; at an empty prompt it leaves Quoder.",
+  "Ctrl-C cancels a running prompt or discards a multi-line prompt; at an empty prompt it leaves Quoder.",
   "Colour follows your terminal; set NO_COLOR or pass --no-color to turn it off.",
 ].join("\n");

@@ -1,8 +1,12 @@
 /**
- * Milestone 1 live acceptance check. Runs the built `quoder` CLI as a subprocess from a disposable
- * project directory, submits two prompts through stdin in one harness process, and verifies the
- * exit criterion from the harness trace: one OpenCode server, a fresh session per prompt, every
- * session deleted (verified 404), a clean exit, and no residual server. The OpenCode server is a
+ * Live acceptance check for Milestones 1 and 2. Runs the built `quoder` CLI as a subprocess from a
+ * disposable project directory (with a seeded file), submits four prompts through stdin in one
+ * harness process, and verifies from the harness trace:
+ * - Milestone 1: one OpenCode server, a fresh session per prompt, every session deleted (verified
+ *   404), a clean exit, and no residual server;
+ * - Milestone 2: text streamed before each answered prompt completed, tool activity shown while the
+ *   model read the seeded file, and a SIGINT (Ctrl-C) during the third prompt cancelled it without
+ *   ending the harness, so the fourth prompt still answered. The OpenCode server is a
  * direct child of the CLI process; this script tracks exactly those children by parent PID and
  * terminates any still running at the end, so a failed or timed-out run never leaves one behind.
  *
@@ -10,7 +14,7 @@
  * only fixed row names, counts, and outcome kinds are printed, never model text.
  */
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -18,20 +22,65 @@ import { promisify } from "node:util";
 import { packagePath } from "../src/package-root.js";
 
 const execFileAsync = promisify(execFile);
-const RUN_TIMEOUT_MS = 300_000;
+const RUN_TIMEOUT_MS = 420_000;
+/** Cancel the third prompt once it streams text, or after this long if it has not. */
+const CANCEL_FALLBACK_MS = 15_000;
 const SERVER_COMMAND = "opencode serve --pure --hostname=127.0.0.1 --port=0";
 const TRACK_INTERVAL_MS = 500;
+const SEED_FILE = "notes.txt";
 const PROMPTS = [
   "Reply with exactly QUODER_ONE and nothing else. Do not use any tools and do not ask any questions.",
-  "Reply with exactly QUODER_TWO and nothing else. Do not use any tools and do not ask any questions.",
+  `Use your read tool to read ${SEED_FILE} in this project, then reply with exactly the first word of that file and nothing else. Do not ask any questions.`,
+  "Write a detailed essay of at least 2000 words about the history of mutual exclusion in computing. Do not use any tools and do not ask any questions.",
+  "Reply with exactly QUODER_AFTER and nothing else. Do not use any tools and do not ask any questions.",
 ];
+const EXPECTED_OUTCOMES = ["answered", "answered", "cancelled", "answered"];
+const CANCELLED_PROMPT = 2;
+const TOOL_PROMPT = 1;
 
 interface TraceEntry {
   readonly event: string;
   readonly sessionID?: string;
   readonly verified?: boolean;
   readonly outcome?: string;
+  readonly tool?: string;
 }
+
+const readTrace = async (path: string): Promise<TraceEntry[]> =>
+  (await readFile(path, "utf8").catch(() => ""))
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as TraceEntry];
+      } catch {
+        return []; // A line still being appended.
+      }
+    });
+
+/** Per-prompt view of the trace: each `session.created` starts the next prompt. */
+interface PromptTrace {
+  sessionID?: string;
+  streamedBeforeCompletion: boolean;
+  tools: string[];
+  outcome?: string;
+}
+
+const perPrompt = (trace: readonly TraceEntry[]): PromptTrace[] => {
+  const prompts: PromptTrace[] = [];
+  for (const entry of trace) {
+    if (entry.event === "session.created") {
+      prompts.push({ ...(entry.sessionID === undefined ? {} : { sessionID: entry.sessionID }), streamedBeforeCompletion: false, tools: [] });
+      continue;
+    }
+    const current = prompts.at(-1);
+    if (current === undefined || current.outcome !== undefined) continue;
+    if (entry.event === "stream.first-text") current.streamedBeforeCompletion = true;
+    if (entry.event === "activity.tool" && entry.tool !== undefined) current.tools.push(entry.tool);
+    if (entry.event === "prompt.completed" && entry.outcome !== undefined) current.outcome = entry.outcome;
+  }
+  return prompts;
+};
 
 /** PIDs of OpenCode servers whose parent is `parentPID`. */
 const serverChildren = async (parentPID: number): Promise<number[]> => {
@@ -81,8 +130,11 @@ const row = (name: string, pass: boolean, evidence: string): boolean => {
 };
 
 async function main(): Promise<number> {
-  const project = await mkdtemp(join(tmpdir(), "quoder-harness-acceptance-"));
-  const tracePath = join(project, "quoder-trace.jsonl");
+  const project = await realpath(await mkdtemp(join(tmpdir(), "quoder-harness-acceptance-")));
+  await writeFile(join(project, SEED_FILE), "QUODER_NOTES are the first words of this file.\n", "utf8");
+  // Outside the project, so the model's tools never see it.
+  const traceDirectory = await mkdtemp(join(tmpdir(), "quoder-harness-trace-"));
+  const tracePath = join(traceDirectory, "quoder-trace.jsonl");
   const trackedServers = new Set<number>();
   try {
     const child = spawn(process.execPath, [packagePath("dist", "cli.js")], {
@@ -104,6 +156,23 @@ async function main(): Promise<number> {
     }, TRACK_INTERVAL_MS);
     child.stdin.on("error", () => undefined);
     child.stdin.end(PROMPTS.map((prompt) => `${prompt}\n`).join(""));
+    // Ctrl-C for the third prompt: piped stdin means SIGINT reaches the CLI's own handler. It is
+    // sent only while that prompt is provably running (created, not completed), never when idle.
+    let cancelSent = false;
+    let cancelTargetSeenAt: number | undefined;
+    const canceller = setInterval(() => {
+      if (cancelSent || child.pid === undefined) return;
+      void readTrace(tracePath).then((trace) => {
+        const prompts = perPrompt(trace);
+        const target = prompts[CANCELLED_PROMPT];
+        if (cancelSent || prompts.length !== CANCELLED_PROMPT + 1 || target === undefined || target.outcome !== undefined) return;
+        cancelTargetSeenAt ??= Date.now();
+        if (target.streamedBeforeCompletion || Date.now() - cancelTargetSeenAt >= CANCEL_FALLBACK_MS) {
+          cancelSent = true;
+          child.kill("SIGINT");
+        }
+      });
+    }, 250);
     const exitCode = await new Promise<number | null>((resolveExit) => {
       const timer = setTimeout(() => {
         child.kill("SIGTERM");
@@ -119,11 +188,10 @@ async function main(): Promise<number> {
       });
     });
     clearInterval(tracker);
+    clearInterval(canceller);
     const residual = await stopResidualServers(trackedServers);
-    const trace: TraceEntry[] = (await readFile(tracePath, "utf8").catch(() => ""))
-      .split("\n")
-      .filter((line) => line.trim() !== "")
-      .map((line) => JSON.parse(line) as TraceEntry);
+    const trace = await readTrace(tracePath);
+    const prompts = perPrompt(trace);
     const count = (event: string) => trace.filter((entry) => entry.event === event).length;
     const created = trace.flatMap((entry) => (entry.event === "session.created" && entry.sessionID ? [entry.sessionID] : []));
     const deleted = trace.flatMap((entry) => (entry.event === "session.deleted" && entry.verified === true && entry.sessionID ? [entry.sessionID] : []));
@@ -133,18 +201,45 @@ async function main(): Promise<number> {
       row("Harness launch and exit", exitCode === 0, `exit code ${String(exitCode)}`),
       row("Single OpenCode server", count("server.started") === 1 && count("server.lost") === 0, `${count("server.started")} started, ${count("server.lost")} lost`),
       row("Fresh session per prompt", created.length === PROMPTS.length && new Set(created).size === created.length, `${created.length} sessions, ${new Set(created).size} distinct`),
-      row("Prompts completed", outcomes.length === PROMPTS.length && outcomes.every((outcome) => outcome === "answered"), `outcomes: ${outcomes.join(", ") || "none"}`),
+      row(
+        "Prompts completed",
+        outcomes.length === PROMPTS.length && outcomes.every((outcome, index) => outcome === EXPECTED_OUTCOMES[index]),
+        `outcomes: ${outcomes.join(", ") || "none"} (expected ${EXPECTED_OUTCOMES.join(", ")})`,
+      ),
       row("Session deletion", created.length > 0 && created.every((id) => deleted.includes(id)), `${deleted.length} of ${created.length} verified deleted`),
       row("Server cleanup", count("server.stopped") === 1 && residual === 0, `stopped ${count("server.stopped")}, ${trackedServers.size} tracked, ${residual} left running`),
     ];
+    const answered = prompts.filter((prompt) => prompt.outcome === "answered");
+    const streamed = answered.filter((prompt) => prompt.streamedBeforeCompletion).length;
+    const toolNames = prompts[TOOL_PROMPT]?.tools ?? [];
+    const cancelled = prompts[CANCELLED_PROMPT];
+    const after = prompts[CANCELLED_PROMPT + 1];
+    const milestone2 = [
+      row("Streamed before completion", answered.length > 0 && streamed === answered.length, `${streamed} of ${answered.length} answered prompts streamed text before completing`),
+      row("Tool activity observed", toolNames.length > 0, `prompt ${TOOL_PROMPT + 1} tools: ${toolNames.join(", ") || "none"}`),
+      row(
+        "Cancel and continue",
+        cancelSent &&
+          cancelled?.outcome === "cancelled" &&
+          cancelled.sessionID !== undefined &&
+          deleted.includes(cancelled.sessionID) &&
+          after?.outcome === "answered",
+        `SIGINT ${cancelSent ? "sent" : "not sent"}; prompt ${CANCELLED_PROMPT + 1} ${cancelled?.outcome ?? "missing"}, ` +
+          `session ${cancelled?.sessionID !== undefined && deleted.includes(cancelled.sessionID) ? "verified deleted" : "not verified deleted"}; ` +
+          `next prompt ${after?.outcome ?? "missing"}`,
+      ),
+    ];
     // Informational only: exact replies depend on the model, not on the harness.
-    const exact = ["QUODER_ONE", "QUODER_TWO"].filter((sentinel) => stdout.includes(sentinel)).length;
-    process.stdout.write(`Model replies (informational): ${exact} of ${PROMPTS.length} exact\n`);
-    const met = results.every(Boolean);
-    process.stdout.write(`Milestone 1 Exit Criterion: ${met ? "MET" : "NOT MET"}\n`);
-    return met ? 0 : 1;
+    const exact = ["QUODER_ONE", "QUODER_NOTES", "QUODER_AFTER"].filter((sentinel) => stdout.includes(sentinel)).length;
+    process.stdout.write(`Model replies (informational): ${exact} of 3 exact\n`);
+    const m1 = results.every(Boolean);
+    const m2 = m1 && milestone2.every(Boolean);
+    process.stdout.write(`Milestone 1 Exit Criterion: ${m1 ? "MET" : "NOT MET"}\n`);
+    process.stdout.write(`Milestone 2 Exit Criterion: ${m2 ? "MET" : "NOT MET"}\n`);
+    return m2 ? 0 : 1;
   } finally {
     await rm(project, { recursive: true, force: true });
+    await rm(traceDirectory, { recursive: true, force: true });
   }
 }
 
@@ -153,7 +248,7 @@ main().then(
     process.exitCode = code;
   },
   () => {
-    process.stdout.write("Milestone 1 Exit Criterion: NOT MET\n");
+    process.stdout.write("Milestone 1 Exit Criterion: NOT MET\nMilestone 2 Exit Criterion: NOT MET\n");
     process.exitCode = 1;
   },
 );

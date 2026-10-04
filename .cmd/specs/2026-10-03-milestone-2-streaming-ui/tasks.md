@@ -96,12 +96,38 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
     - **Found and fixed:** a closed output pipe crashed Quoder on `EPIPE` and orphaned the server (a defect from Milestone 1). The CLI now terminates cleanly with code 141 on an output error, and the launcher's process-exit hook stops a live server. Details are in `decisions.md`.
     - 303 tests pass (302 before the fix), including 5 new integration tests (stream order without a repeated answer, missed delta, unstreamed answer, mid-stream cancellation, TTY status line within width), 10 live-view unit tests and a rewritten format suite.
 
+## Group 5a: Multi-line prompts (user request, 2026-10-03)
+
+- [x] Shift+Return inserts a line break without submitting | `src/harness/line-keys.ts`, `src/harness/repl.ts`, `src/harness/format.ts`, `tests/`
+  - **Accept**:
+    - In an interactive terminal, Shift+Return (CSI u, modifyOtherKeys, or ESC Return) and Ctrl+J or pasted newlines continue the prompt on a `…` line.
+    - Return sends all lines as one prompt.
+    - Ctrl-C at a continuation line discards the prompt and keeps Quoder running.
+    - Piped input is unchanged.
+    - Raw mode is set and restored by the harness.
+    - `/help` documents the key.
+  - **Completed evidence**:
+    - The first version added 7 tests (313 in total).
+    - Revised the same day (see `decisions.md`): Quoder now requests the kitty keyboard protocol, as OpenCode and Codex do, so Shift+Return works in iTerm2 without configuration. Kitty-encoded keys are decoded back to legacy bytes for readline, the protocol is popped on every exit, and Ctrl+Z no longer suspends.
+    - 325 tests pass, and a real pseudo-terminal check without a model call succeeded.
+    - Manual confirmation in iTerm2 belongs to QA.
+
 ## Group 6: Live acceptance check
 
-- [ ] Extend `verify:harness` | `scripts/verify-harness.ts`
+- [x] Extend `verify:harness` | `scripts/verify-harness.ts`
   - **Accept**:
     - New rows: streamed before completion, tool activity observed (a seeded file is read), and cancel and continue (SIGINT during a long prompt, a verified deletion, and the next prompt answers).
     - The final line becomes `Milestone 2 Exit Criterion: MET/NOT MET`.
+  - **Completed evidence** (implementation only; the live run belongs to QA in Group 7 and needs the user's authorization):
+    - Four prompts run in one harness process. The project is a canonical temporary directory seeded with `notes.txt`, and the trace file is kept outside the project, so the model's tools never see it.
+    - The trace is split per prompt at each `session.created`.
+    - New rows:
+      - **Streamed before completion:** every answered prompt recorded `stream.first-text` before its `prompt.completed`.
+      - **Tool activity observed:** prompt 2 recorded at least one `activity.tool`.
+      - **Cancel and continue:** SIGINT is sent only while prompt 3 is provably running (created and not completed), after its first text or after a 15 s fallback. Prompt 3 must be `cancelled` and its session verified deleted, and prompt 4 must answer.
+    - The expected outcomes are `answered, answered, cancelled, answered`.
+    - Both exit-criterion lines are printed, and the script's exit status follows Milestone 2.
+    - `tsc` passes for the live config, and `build:live` succeeds.
 
 ## Group 7: Review, security review, QA
 

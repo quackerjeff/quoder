@@ -12,6 +12,7 @@ import {
 } from "../opencode-server.js";
 import { PLAIN_THEME, type Theme } from "../ui/style.js";
 import { HELP_TEXT, formatResult } from "./format.js";
+import { DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys, type LineEnding } from "./line-keys.js";
 import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
 import { SessionTracker, runPrompt, type StopRequest, type TurnOutcome } from "./session-runner.js";
@@ -84,6 +85,13 @@ export class Harness {
    */
   #launchAbort: AbortController | undefined;
   readonly #lines: string[] = [];
+  /** How each line readline will report ended (terminal only), in order. */
+  readonly #lineEndings: LineEnding[] = [];
+  /** Lines of a multi-line prompt still being typed (Shift+Return). */
+  readonly #pendingLines: string[] = [];
+  #rawMode = false;
+  /** Restores the terminal's keyboard mode if the process exits without the orderly shutdown. */
+  #keyboardExitHook: (() => void) | undefined;
   readonly #undeletedSessions: string[] = [];
   /** Server problems found while a prompt runs, shown after that prompt's result. */
   readonly #notices: string[] = [];
@@ -122,7 +130,32 @@ export class Harness {
       }
       return;
     }
+    if (this.#pendingLines.length > 0) {
+      this.#discardPendingPrompt();
+      return;
+    }
     this.#requestExit(0);
+  }
+
+  /** Ctrl-C while typing a multi-line prompt discards it and starts again, as a shell does. */
+  #discardPendingPrompt(): void {
+    this.#pendingLines.length = 0;
+    const readline = this.#readline;
+    if (readline === undefined) return;
+    readline.write(null, { ctrl: true, name: "e" });
+    readline.write(null, { ctrl: true, name: "u" });
+    this.#write("\n");
+    readline.setPrompt(this.#mainPrompt);
+    readline.prompt();
+  }
+
+  get #mainPrompt(): string {
+    return `${this.#theme.paint("prompt", this.#options.project.name)} ${this.#theme.paint("accent", "❯")} `;
+  }
+
+  /** Aligns the continuation marker under the prompt's `❯`. */
+  get #continuationPrompt(): string {
+    return `${" ".repeat([...this.#options.project.name].length)} ${this.#theme.paint("dim", "…")} `;
   }
 
   /** SIGTERM or SIGHUP: cancel any running prompt, clean up, and exit with `exitCode`. */
@@ -155,15 +188,27 @@ export class Harness {
     }
     if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
     this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
+    let input = this.#options.input;
+    if (this.#options.terminal) {
+      // Readline sees the keys through this filter, so it no longer puts the terminal in raw mode
+      // itself; Quoder does, and restores it on shutdown.
+      const keys = new LineEndingKeys((ending) => this.#lineEndings.push(ending));
+      input = this.#options.input.pipe(keys);
+      this.#setRawMode(true);
+      this.#setKeyboardProtocol(true);
+    }
     const readline = createInterface({
-      input: this.#options.input,
+      input,
       output: this.#options.output,
       terminal: this.#options.terminal,
-      prompt: `${theme.paint("prompt", project.name)} ${theme.paint("accent", "❯")} `,
+      prompt: this.#mainPrompt,
     });
     this.#readline = readline;
     readline.on("line", (line) => this.#receive(line));
     readline.on("SIGINT", () => this.interrupt());
+    // Ctrl+Z would suspend Quoder with the terminal still in raw mode and the keyboard protocol on,
+    // leaving the shell unusable; a listener stops readline from suspending.
+    readline.on("SIGTSTP", () => undefined);
     readline.on("close", () => {
       this.#inputClosed = true;
       this.#wakeLoop?.();
@@ -178,13 +223,46 @@ export class Harness {
   }
 
   #receive(line: string): void {
+    const ending = this.#options.terminal ? (this.#lineEndings.shift() ?? "submit") : "submit";
     if (this.#exitCode !== undefined) return;
     if (this.#running !== undefined && this.#options.terminal) {
+      this.#pendingLines.length = 0;
       this.#write("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n");
       return;
     }
-    this.#lines.push(line);
+    if (ending === "continue") {
+      this.#pendingLines.push(line);
+      this.#readline?.setPrompt(this.#continuationPrompt);
+      this.#readline?.prompt();
+      return;
+    }
+    const prompt = [...this.#pendingLines.splice(0), line].join("\n");
+    this.#readline?.setPrompt(this.#mainPrompt);
+    this.#lines.push(prompt);
     this.#wakeLoop?.();
+  }
+
+  /** Asks the terminal to report Shift+Return distinctly (see `line-keys.ts`), and undoes it. */
+  #setKeyboardProtocol(enabled: boolean): void {
+    if (enabled === (this.#keyboardExitHook !== undefined)) return;
+    if (enabled) {
+      const output = this.#options.output;
+      this.#keyboardExitHook = () => output.write(DISABLE_KEYBOARD_PROTOCOL);
+      process.once("exit", this.#keyboardExitHook);
+      this.#write(ENABLE_KEYBOARD_PROTOCOL);
+      return;
+    }
+    const hook = this.#keyboardExitHook;
+    if (hook !== undefined) process.removeListener("exit", hook);
+    this.#keyboardExitHook = undefined;
+    this.#write(DISABLE_KEYBOARD_PROTOCOL);
+  }
+
+  #setRawMode(enabled: boolean): void {
+    const input = this.#options.input as Partial<{ isTTY: boolean; setRawMode: (mode: boolean) => unknown }>;
+    if (input.isTTY !== true || typeof input.setRawMode !== "function" || this.#rawMode === enabled) return;
+    input.setRawMode(enabled);
+    this.#rawMode = enabled;
   }
 
   /** The next input line, or undefined once input has ended or an exit was requested. */
@@ -434,6 +512,8 @@ export class Harness {
   async #performShutdown(exitCode: number): Promise<number> {
     this.#launchAbort?.abort();
     this.#readline?.close();
+    this.#setKeyboardProtocol(false);
+    this.#setRawMode(false);
     await this.#startingServer?.catch(() => undefined);
     const server = this.#server;
     this.#server = undefined;

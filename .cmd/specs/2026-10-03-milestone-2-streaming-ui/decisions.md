@@ -63,3 +63,44 @@ Only event names, field names, string lengths, counts and timings were recorded.
 - **Launcher safety net.** `launchAuthenticatedOpenCodeServer` registers a synchronous process-`exit` hook that sends SIGTERM to a still-running server child. The hook is unregistered when the child exits, and is injectable as `onProcessExit` for tests. Any Quoder process exit (an uncaught error, `process.exit`) therefore stops its server. Only a SIGKILL of Quoder itself can still orphan one.
 
 **Verification**: A new launcher test covers the hook. Repeating the closed-pipe run twice left no orphan; 303 tests pass.
+
+## 2026-10-03 — Multi-line prompts with Shift+Return (user request)
+
+**Context**: The developer asked for Shift+Return to insert a line break without submitting the prompt. (They first wrote Command+Return, then corrected it.) Their terminal is iTerm2. Terminals encode Shift+Return in different ways, and by default many send the same `\r` as plain Return.
+
+**Decision**:
+- `src/harness/line-keys.ts` (`LineEndingKeys`) sits between the terminal and readline, in interactive mode only. It reports each line ending in order as `submit` (`\r`, `\r\n`) or `continue`, and forwards `\r` to readline.
+- These count as `continue`: `ESC[13;2u` (CSI u / kitty), `ESC[27;2;13~` (xterm modifyOtherKeys), `ESC \r` (an iTerm2 key mapping, or Option+Return with Option as Meta), and a bare `\n` (Ctrl+J, or newlines in pasted text, so a pasted block becomes one prompt).
+- The harness accumulates continued lines under a dim `…` continuation prompt aligned with `❯`, and submits them joined with `\n` on Return.
+- Ctrl-C at a continuation line discards the unfinished prompt and keeps Quoder running.
+- Because readline now reads through a filter, the harness puts the TTY into raw mode itself and restores it at shutdown.
+- Piped input is unchanged: each line is one prompt.
+- No terminal mode (kitty keyboard protocol, modifyOtherKeys) is switched on. Those modes also re-encode Ctrl+C and Ctrl+D, which readline relies on.
+
+**Verification**:
+- 4 unit tests (each encoding, ordering, pass-through) and 3 integration tests (continuation and submission, Ctrl-C discard, piped lines unchanged). 313 tests pass.
+- A real pseudo-terminal check (`script`, with no model call): `/he`, then `ESC[13;2u`, then `lp` and Return were shown on two lines and submitted as one prompt.
+- If iTerm2 sends a plain `\r` for Shift+Return, the developer adds a key mapping that sends `ESC [13;2u`. This is documented in the README in Group 8.
+
+## 2026-10-03 — Shift+Return without terminal setup: the kitty keyboard protocol (supersedes part of the entry above)
+
+**Context**: The developer pointed out that OpenCode and Codex get Shift+Return in iTerm2 with no configuration. Those tools request the kitty keyboard protocol. The previous entry rejected terminal modes because they re-encode Ctrl+C and Ctrl+D; that is solved by translating keys back, so asking the developer for an iTerm2 key mapping is withdrawn.
+
+**Decision**:
+- In interactive mode, the harness writes `CSI > 1 u` (push the "disambiguate" flag) at startup, and `CSI < u` (pop) at shutdown. A process-`exit` hook pops it if Quoder exits any other way. Terminals without the protocol ignore both.
+- In that mode Shift+Return arrives as `CSI 13;2 u`. `LineEndingKeys` now decodes every `CSI <code>;<mods> u` key into legacy bytes for readline:
+  - plain Return submits; modified Return continues;
+  - Ctrl+letter and Ctrl+`[\]^_` become C0 controls (so Ctrl+C is `\x03` and Ctrl+D is `\x04`);
+  - Esc becomes `\x1b`, Alt+key becomes `ESC key`, Shift+Tab becomes `ESC[Z`, and Alt+Backspace becomes `ESC DEL`;
+  - keys with no legacy encoding are dropped.
+- The legacy encodings (`ESC[27;2;13~`, `ESC \r`, `\n`) are still accepted.
+- Ctrl+Z no longer suspends Quoder: readline's `SIGTSTP` gets a no-op listener. Suspending would leave the shell in raw mode with the keyboard protocol on.
+
+**Verification**:
+- 11 new decoding tests. The integration tests now send kitty-encoded Shift+Return and Ctrl+C, and check that the protocol is pushed and popped. 325 tests pass.
+- A real pseudo-terminal run without a model call: `CSI > 1 u` was written at startup, `/he` with `CSI 13;2 u` and `lp` continued the prompt, a kitty-encoded Ctrl+D (`CSI 100;5 u`) exited, `CSI < u` was written at exit, and no server was left behind.
+- Confirming in iTerm2 itself is part of QA's manual terminal check.
+
+## 2026-10-03 — Cursor navigation in multi-line prompts deferred
+
+**Decision**: The developer asked for cursor navigation across the lines of a multi-line prompt, to be implemented in the future rather than in Milestone 2. It is recorded in `docs/backlog.md`. That file is new: it is the single place for agreed but unscheduled work, and it points to the hardening items carried forward in earlier specs.

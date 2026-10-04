@@ -266,7 +266,7 @@ describe("quoder harness (Milestone 1)", () => {
 
     await expect(run.finished).resolves.toBe(0);
 
-    expect(run.output()).toContain("/exit   Leave Quoder");
+    expect(run.output()).toContain("/exit          Leave Quoder");
     expect(run.output()).toContain("Unknown command.");
     expect(sessionsCreated(run.trace)).toEqual([]);
     expect(run.counts.closed).toBe(1);
@@ -655,5 +655,55 @@ describe("quoder harness live view (Milestone 2)", () => {
     // Status frames never exceed the terminal width (60 columns here).
     const frames = output.split("\r\u001b[2K").map((frame) => frame.split("\n")[0] ?? "");
     for (const frame of frames) expect([...frame.replace(/\u001b\[[0-9;]*m/gu, "")].length).toBeLessThanOrEqual(60);
+  });
+});
+
+describe("multi-line prompts in an interactive terminal", () => {
+  const promptTexts = (run: ReturnType<typeof startHarness>) =>
+    (run.fake.client.v2.session.prompt as unknown as { mock: { calls: Array<[{ prompt: { text: string } }]> } }).mock.calls.map(
+      ([parameters]) => parameters.prompt.text,
+    );
+
+  it("Shift+Return starts a new line under a continuation prompt; Return sends all lines as one prompt", async () => {
+    const run = startHarness({ terminal: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    run.input.write("first line\u001b[13;2u");  // Shift+Return as iTerm2 reports it in the kitty protocol
+    await vi.waitFor(() => expect(run.output()).toContain("           … "));
+    run.input.write("second line\u001b\rthird line\r");
+    await vi.waitFor(() => expect(run.output()).toContain("✓ Done in"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(promptTexts(run)).toEqual(["first line\nsecond line\nthird line"]);
+    // The kitty keyboard protocol is requested at start and popped at exit.
+    expect(run.output()).toContain("\u001b[>1u");
+    expect(run.output().lastIndexOf("\u001b[<u")).toBeGreaterThan(run.output().indexOf("\u001b[>1u"));
+    expect(sessionsCreated(run.trace)).toHaveLength(1);
+  });
+
+  it("Ctrl-C at a continuation line discards the unfinished prompt and keeps Quoder running", async () => {
+    const run = startHarness({ terminal: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    run.input.write("draft\u001b[13;2umore");
+    // Readline positions the cursor after the prompt before echoing typed text.
+    await vi.waitFor(() => expect(run.output()).toMatch(/ … (?:\u001b\[\d+G)?more/u));
+    run.input.write("\u001b[99;5u"); // Ctrl+C as the kitty protocol encodes it
+    run.input.write("real prompt\r");
+    await vi.waitFor(() => expect(run.output()).toContain("✓ Done in"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(promptTexts(run)).toEqual(["real prompt"]);
+  });
+
+  it("treats each piped line as its own prompt", async () => {
+    const run = startHarness();
+    run.input.write("one\ntwo\n");
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(promptTexts(run)).toEqual(["one", "two"]);
   });
 });
