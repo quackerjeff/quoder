@@ -45,9 +45,13 @@ Systems this repo depends on:
   - failure impact: Quoder cannot execute developer prompts
 - An OpenCode-configured model provider
   - purpose: LLM inference used by OpenCode
-  - current topology: provider `ollama` via `@ai-sdk/openai-compatible`, backed by a remote, authenticated HTTPS OpenAI-compatible endpoint (not localhost Ollama); feasibility runs bind `ollama/qwen3-coder:30b` explicitly
+  - current topology: provider `ollama` via `@ai-sdk/openai-compatible`, backed by a remote, authenticated HTTPS OpenAI-compatible endpoint (not localhost Ollama). The `quoder` harness binds `ollama/glm-4.7-flash:latest` by default (`--model` overrides it); feasibility runs bind `ollama/qwen3-coder:30b`
   - contract location: Developer's user-level OpenCode configuration; readiness is checked by `npm run verify:environment`
   - failure impact: OpenCode sessions cannot complete model work
+- Terminal rendering libraries (Milestone 2)
+  - purpose: `marked@18.0.14` (used as a Markdown lexer only) and `highlight.js@11.12.0` (code highlighting). Both are pinned exactly, have no dependencies of their own, and run in an isolated worker thread with a deadline and a memory limit
+  - contract location: `docs/tech.md` ("Live Activity (Milestone 2)", "Dependency Choices")
+  - failure impact: Answers are shown as sanitized plain text instead of formatted Markdown
 - Git
   - purpose: Resolve project identity and capture repository state before and after executions
   - contract location: Git CLI behavior used by the implementation
@@ -97,8 +101,10 @@ Deployment notes:
 ## Operational Risks
 
 Known failure modes or sensitive areas:
-- OpenCode Core V2 contracts are verified only for the pinned 1.18.33. The full nine-capability feasibility still awaits an authoritative, user-authorized `npm run verify:live`.
-- In 1.18.33, model-run shell commands inherit the OpenCode server's credentials. They must be withheld before Quoder forwards real permission decisions (Milestone 1).
+- OpenCode Core V2 contracts are verified only for the pinned 1.18.33. The nine-capability feasibility passed on 2026-10-03 (Milestone 0).
+- In 1.18.33, model-run shell commands inherit the OpenCode server's credentials. They must be withheld before Quoder forwards real permission decisions (Milestone 3).
+- OpenCode 1.18.33 intermittently drops the first prompt on a fresh server (admitted, never started). Quoder detects this within 5 s and retries once in a fresh session.
+- Model and tool output is untrusted and is displayed live. Terminal-escape injection and rendering-based freezes are mitigated by post-lex sanitization, worker-isolated Markdown rendering with deadlines, and linear main-thread text handling (Milestone 2 security review).
 - Session cleanup failures could retain unwanted model context or orphan resources.
 - Permission forwarding errors could weaken user control or block valid work.
 - Crashes or non-atomic state writes could corrupt harness history or preferences.

@@ -1,10 +1,11 @@
 # Quoder
 
 Quoder provides a persistent developer-facing shell while each prompt runs in a
-fresh, disposable OpenCode session. Milestone 1, the minimal `quoder` harness,
-is complete. The Milestone 0 feasibility probe remains as regression evidence.
+fresh, disposable OpenCode session. Milestones 1 (the minimal `quoder` harness)
+and 2 (streaming and live activity) are complete. The Milestone 0 feasibility
+probe remains as regression evidence.
 
-## Using Quoder (Milestone 1)
+## Using Quoder (Milestones 1–2)
 
 Install the pinned dependencies, build, and put `quoder` on your `PATH`:
 
@@ -22,46 +23,83 @@ quoder
 ```
 
 ```text
-Quoder — QuackTrack (/Users/you/Development/QuackTrack)
-Model: ollama/glm-4.7-flash:latest
-Starting OpenCode server…
+Quoder · QuackTrack /Users/you/Development/QuackTrack
+Model ollama/glm-4.7-flash:latest
 Ready. Type /help for help.
 
-QuackTrack > Reply with a one-line summary of this repository.
+QuackTrack ❯ Fix the empty-file check
 Starting fresh OpenCode session…
-…
-Completed in 3.1s.
+⠹ Running cargo test… 12.4s · glm-4.7-flash:latest      (live status line)
+Reading the import code.
+
+✓ ● Read   src/import.rs  212 lines
+✓ ✎ Edit   src/import.rs  +12 −3
+! $ Run    cargo test  exit 101 · test result: FAILED. 46 passed; 1 failed
+
+I added a guard that rejects empty files…               (streamed Markdown)
+
+✓ Done in 41.8s · 3 tools · 1.2k tokens
 ```
 
 How it behaves:
 
 - **Project.** The project is the Git repository root, or the launch directory
-  outside a repository. The prompt shows the project's name.
+  outside a repository, resolved to its real path. The prompt shows the
+  project's name.
 - **One server, a fresh session per prompt.** Quoder starts one authenticated,
   project-local OpenCode server and keeps it for the whole harness session. Each
   prompt runs in a fresh session bound to the model. Afterwards the session is
   deleted and its deletion verified.
+- **Live activity.**
+  - The answer streams as rendered Markdown, with syntax-highlighted code
+    blocks.
+  - Each finished tool gets one line: reads, edits with `+/−` counts, writes,
+    commands with exit code and last output line, and searches.
+  - On an interactive terminal, a status line shows the spinner, the current
+    phase, the elapsed time and the model.
+  - A closing line reports the result, duration, tools and tokens.
+- **Colour.** Colour follows your terminal. `--no-color` or `NO_COLOR` turns it
+  off, and `FORCE_COLOR` forces it on. Piped output is plain, with no cursor
+  control.
+- **Multi-line prompts.**
+  - Shift+Return starts a new line, shown under `…`. It works in iTerm2,
+    kitty, WezTerm and Ghostty with no setup, because Quoder requests the
+    kitty keyboard protocol for the session.
+  - Ctrl+J (or Option+Return set to send Esc) works in any terminal.
+  - Return sends all the lines as one prompt.
+  - A multi-line paste stays one prompt until you press Return.
 - **Model.** The default is `ollama/glm-4.7-flash:latest`. Override it with
   `quoder --model provider/model`.
-- **Commands.** `/help`, and `/exit` or Ctrl-D to leave. Ctrl-C cancels a
-  running prompt (interrupt, settle, delete) and returns to the prompt; at an
-  idle prompt it leaves Quoder. SIGTERM and SIGHUP cancel, clean up, and exit
-  with 143 and 129.
-- **Output.** Model output is cleaned of terminal control sequences before it
-  is displayed.
+- **Commands and keys.**
+  - `/help`; `/exit` or Ctrl-D to leave.
+  - Ctrl-C cancels a running prompt (interrupt, settle, delete), prints
+    "Execution cancelled … Harness session remains active.", and returns to
+    the prompt.
+  - On a `…` line, Ctrl-C discards the draft; at an empty prompt it leaves
+    Quoder.
+  - SIGTERM and SIGHUP cancel, clean up, and exit with 143 and 129.
+  - A closed output pipe exits cleanly with 141.
+- **Safety of displayed text.** Everything from the model or a tool is cleaned
+  of terminal control sequences before it is shown, including Markdown
+  character references such as `&#27;`. Markdown is rendered in a worker
+  thread with a 200 ms deadline per block and a memory cap, so crafted output
+  is shown as plain text instead of freezing or crashing Quoder.
+- **A dropped first prompt.** OpenCode 1.18.33 sometimes accepts the first
+  prompt on a new server and never starts it. Quoder notices within 5 s, says
+  so, and sends the prompt once more in a fresh session.
 
-Known Milestone 1 limitations:
+Known limitations:
 
 - **No permissions are granted.** Any OpenCode permission request is rejected
   and reported, and the model's interactive questions are rejected and shown so
   you can answer in your next prompt. Interactive permission handling arrives
   in Milestone 3.
-- **No streaming yet.** Only the final response is shown. Streaming and live
-  activity display arrive in Milestone 2.
+- **Multi-line editing.** Only the line you are typing can be edited; Up and
+  Down recall earlier prompts. Full multi-line editing is in `docs/backlog.md`.
 - **Server password.** Model-run shell commands can read the OpenCode server's
   password. This is deferred to Milestone 3, before permission decisions are
-  forwarded. Other hardening items are listed in
-  `.cmd/specs/2026-10-03-milestone-1-minimal-harness/decisions.md`.
+  forwarded. Other hardening items are listed in the Milestone 1 and 2 specs'
+  `decisions.md` and in `docs/backlog.md`.
 - **Model nondeterminism.** The model does not always follow instructions
   exactly.
 
@@ -71,10 +109,18 @@ Live acceptance check (contacts the configured model):
 npm run verify:harness
 ```
 
-It runs the built CLI from a disposable project with two prompts. It verifies
-the exit criterion: one server, a distinct and verified-deleted session per
-prompt, a clean exit, and no residual server. QA recorded `Milestone 1 Exit
-Criterion: MET` on 2026-10-03.
+It runs the built CLI from a disposable project with four prompts: two
+answers, a read of a seeded file, and a long prompt that is cancelled with
+SIGINT. It checks:
+
+- one server, and a distinct, verified-deleted session per prompt (two if
+  OpenCode dropped the prompt and Quoder retried);
+- text streamed before each answer, and tool activity;
+- cancel-and-continue;
+- a clean exit, with no residual server.
+
+QA recorded `Milestone 1 Exit Criterion: MET` and `Milestone 2 Exit Criterion:
+MET` on 2026-10-04.
 
 ## Milestone 0 status
 

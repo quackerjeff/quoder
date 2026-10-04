@@ -46,7 +46,7 @@ The dropped-first-prompt behaviour happened again in this run, and the retry han
 
 Tests: 417 pass. Typecheck and build are clean.
 
-## Manual terminal check (iTerm2) — pending the developer
+## Manual terminal check (iTerm2): accepted by the developer on 2026-10-04
 
 To be run by the developer in iTerm2 with the current build (`npm run build`, then restart `quoder`):
 1. Colour banner and the `❯` prompt; the spinner status line while a prompt runs.
@@ -54,3 +54,9 @@ To be run by the developer in iTerm2 with the current build (`npm run build`, th
 3. Shift+Return makes a multi-line prompt; Return sends it. A multi-line paste stays one prompt until Return.
 4. Ctrl-C during a prompt: "Cancelling…", "– Execution cancelled … Harness session remains active."; the next prompt works.
 5. Ctrl-C at a continuation (`…`) line discards the draft; Ctrl-D at an empty prompt exits, and the shell behaves normally afterwards (no stray keyboard modes).
+
+**Result**: The developer tested Quoder manually in iTerm2 and gave their acceptance on 2026-10-04. They asked whether the cursor can move through the lines of a multi-line prompt. Only the current line can be edited; full multi-line editing is deferred in `docs/backlog.md`.
+
+## QA verdict: PASS
+
+The automated acceptance shows `Milestone 1 Exit Criterion: MET` and `Milestone 2 Exit Criterion: MET`, and the developer accepted the manual terminal check.

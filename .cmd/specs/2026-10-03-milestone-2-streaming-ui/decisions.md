@@ -365,3 +365,22 @@ It found one Warning: the plain-text fallback that the isolation relies on runs 
 **Carried forward** (no code change after a passing review):
 - the dead `cancelTargetSeenAt ??=` line in `verify-harness`;
 - a comment noting the narrow, pre-existing race in which the cancel target completes just before SIGINT. That race fails safe, as a false NOT MET.
+
+## 2026-10-04 — Milestone 2 closed
+
+**Context**: All gates passed:
+- **General review:** PASS at cycle 4, plus the QA addendum cycles 5 (FAIL) and 6 (PASS).
+- **Security review:** PASS at cycle 7.
+- **QA:** `verify:harness` met both criteria (`Milestone 1 Exit Criterion: MET`, `Milestone 2 Exit Criterion: MET`), and the developer accepted the manual iTerm2 check on 2026-10-04.
+
+**Decision**: Close the spec.
+- `README.md` documents installation, live activity, colour, multi-line prompts, keys, the safety of displayed text, the dropped-prompt retry, the known limitations and the four-prompt acceptance check.
+- `docs/tech.md` gains "Live Activity (Milestone 2)", and its harness contracts are updated (the 5 s dropped-prompt detection and the new trace events).
+- `SYSTEM_CONTEXT.md` records the rendering dependencies, the harness's default model, and the current operational risks. Two stale items are corrected: Milestone 0 is passed, and withholding server credentials belongs to Milestone 3.
+
+Open items carried forward:
+- `docs/backlog.md`: multi-line cursor navigation, the incremental `scan()`, and early detection of a dead render worker;
+- this file's carried-forward review suggestions;
+- the Milestone 1 items due before or in Milestone 3: server credentials, project-root containment and subagent sessions.
+
+**Rationale**: The Milestone 2 exit criterion is met: "The developer can observe OpenCode activity in real time and safely cancel an execution without exiting the harness". No open item affects session deletion, permission enforcement, cleanup or the safety of displayed text.

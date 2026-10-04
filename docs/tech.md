@@ -287,10 +287,55 @@ Implemented in spec `2026-10-03-milestone-1-minimal-harness`; QA recorded `Miles
 
 **Lifecycle contracts.**
 - **Server.** One server is launched per harness session, with the project root as its working directory, and is confirmed through `server.connected` before use. An unconfirmed monitor fails the start. A server is replaced before the next prompt after an unexpected exit, monitor loss, or a failed reject reply.
-- **Prompt.** Create a session bound to the model and project root, submit, and wait with **no fixed execution timeout**. Every API call is bounded at 30 s, and an idle session with no assistant message fails after 30 s. Classify the turn as answered, permission rejected, question rejected, cancelled, or failed. Interrupt and settle whenever the turn did not end idle, then delete and verify (404). Session IDs whose deletion is unverified are retried on the next server and at shutdown.
+- **Prompt.** Create a session bound to the model and project root, submit, and wait with **no fixed execution timeout**. Every API call is bounded at 30 s. An idle session with no assistant message for 5 s counts as **dropped** (Milestone 2 QA: OpenCode 1.18.33 intermittently drops the first prompt on a fresh server). The session is deleted and verified, and the prompt is sent once more in a fresh session. There is no retry after a cancel, or when the deletion was unverified. A second drop fails. Classify the turn as answered, permission rejected, question rejected, cancelled, or failed. Interrupt and settle whenever the turn did not end idle, then delete and verify (404). Session IDs whose deletion is unverified are retried on the next server and at shutdown.
 - **Input.** One sequential loop consumes lines in order. EOF, `/exit`, and signals reach one memoized shutdown. An exit request during startup aborts the in-progress launch only; a server that is already up is never killed before session cleanup.
 - **Policy.** Milestone 1 never grants a permission: every `permission.v2.asked` for a Quoder session is replied `reject` and reported, and questions are rejected and shown. Requests raised by subagent (`task`) child sessions are not intercepted. Nothing is granted, but the turn may wait until Ctrl-C (recorded for Milestone 3).
-- **Trace.** `QUODER_TRACE_FILE` appends JSON lines containing fixed event names, session IDs, verified flags and outcome kinds only, never prompt or model text. `npm run verify:harness` relies on it.
+- **Trace.** `QUODER_TRACE_FILE` appends JSON lines containing fixed event names, session IDs, verified flags, outcome kinds and tool names only, never prompt or model text. Milestone 2 added `prompt.started`, `prompt.retried`, `stream.first-text` and `activity.tool`. `npm run verify:harness` relies on it.
+
+## Live Activity (Milestone 2)
+
+Implemented in spec `2026-10-03-milestone-2-streaming-ui`. The general review passed at cycle 4 and the security review at cycle 7. QA recorded `Milestone 2 Exit Criterion: MET` on 2026-10-04, and the developer accepted the manual terminal check. The streaming event contract (global stream coverage and tool shapes) is recorded under **Streaming** above.
+
+**Modules.**
+- `src/harness/stream-events.ts` narrows untrusted `session.next.*` payloads into a typed `StreamEvent` union. It has no presentation, so a future full-screen TUI can reuse it.
+- `src/harness/activity.ts` holds the one-line tool summaries: sanitized, truncated, and paths relative to the project.
+- `src/harness/live-view.ts` (`LiveView`) contains:
+  - the TTY status line, redrawn by a 10 Hz ticker, truncated by display columns and erased before permanent output;
+  - Markdown streaming per text block;
+  - the idle flush;
+  - a line per tool when it finishes;
+  - reconciliation of the final step's streamed text with the authoritative answer, which is printed in full if it was missed.
+- `src/harness/format.ts` writes the closing status line.
+- `src/harness/line-keys.ts` (`LineEndingKeys`) handles keyboard input.
+- `src/ui/style.ts` provides theme roles and colour detection.
+- `src/ui/markdown.ts`, `src/ui/highlight.ts` and `src/ui/isolated-render.ts` (with `render-worker.ts` and `render-protocol.ts`) handle rendering.
+
+**Event source.** The run-long global monitor forwards own-session `session.next.*` events (`onSessionEvent`). Streaming is display-only: completion and final-answer selection remain the session runner's job.
+
+**Rendering untrusted Markdown.**
+- `marked` is used only as a lexer. Model text is sanitized before lexing, and every string in the token tree is sanitized again after it, because the lexer decodes references such as `&#27;`.
+- Blocks are printed as they complete, using a line-based scan:
+  - a blank line, a closing fence, or a heading or rule line ends a block;
+  - list items with indented content stay together;
+  - an idle flush never splits a table, a setext heading or the open list item.
+- Each chunk is rendered in a worker thread (`IsolatedMarkdownRenderer`). It has:
+  - a 200 ms `Atomics.wait` deadline per chunk;
+  - a 1 s budget per stream;
+  - a 256 MB heap limit.
+
+  On a timeout, worker death or error, the chunk is shown as sanitized plain text and the worker is replaced. Inside the worker, `RENDER_BUDGET`, nesting caps and a highlighting budget are cheaper first filters.
+- Main-thread text handling is linear, and was checked by fuzzing.
+
+**Keyboard and terminal modes.** In interactive mode Quoder writes `CSI > 1 u` (the kitty keyboard protocol's disambiguate flag) and `CSI ? 2004 h` (bracketed paste) at startup. It reverses both at shutdown and from a process-exit hook. `LineEndingKeys`:
+- decodes kitty-encoded keys back to legacy bytes for readline;
+- marks continuations (Shift/Alt/Ctrl+Return, Ctrl+J, and line breaks inside a paste) with a Ctrl+G mark that the harness classifies per keypress;
+- holds split escape sequences;
+- ends a paste whose end marker is late or lost after 500 ms;
+- passes only Ctrl+C and Ctrl+D while a prompt runs.
+
+Raw mode is owned by the harness, and Ctrl+Z does not suspend.
+
+**Process safety.** Output errors (EPIPE) end Quoder through the orderly shutdown with exit code 141. The launcher's process-exit hook sends SIGTERM to a live server child.
 
 ## Dependency Choices
 

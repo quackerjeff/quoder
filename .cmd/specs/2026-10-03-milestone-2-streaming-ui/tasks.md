@@ -216,14 +216,14 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
 
 ## Group 7: Review, security review, QA
 
-- [ ] Run the general review (up to 3 cycles), the security review and QA (including an authorized `verify:harness` and a manual terminal check) | spec directory
+- [x] Run the general review (up to 3 cycles), the security review and QA (including an authorized `verify:harness` and a manual terminal check) | spec directory
   - **Accept**: The reports are persisted verbatim and all three gates pass.
   - **Progress**:
     - **General review: PASS at cycle 4** (cycles 1–3 FAIL; cycle 4 was authorized by the developer).
     - **Security review: PASS at cycle 7** (cycles 1–6 FAIL; cycles 4–7 were authorized by the developer).
     - Both reports are persisted verbatim in `review.md` and `security-review.md`.
     - **QA, automated:** `verify:harness` run 1 was NOT MET because OpenCode dropped the first prompt. This was diagnosed and fixed in QA Fix Group 1, reviewed in cycles 5 and 6 (PASS). Run 2 met both criteria: `Milestone 2 Exit Criterion: MET`, including a live retry. See `qa.md`.
-    - **QA, manual iTerm2 check:** pending the developer (checklist in `qa.md`).
+    - **QA, manual iTerm2 check:** accepted by the developer on 2026-10-04. QA verdict: PASS (`qa.md`).
 
 ## QA Fix Group 1: Dropped first prompt (QA finding, 2026-10-04)
 
@@ -237,4 +237,5 @@ Groups run in order. No task authorizes a real-model run (Group 1 diagnostics, `
 
 ## Group 8: Documentation and closure
 
-- [ ] Update `README.md`, `docs/tech.md` and `SYSTEM_CONTEXT.md` (material facts only); add a closing decision; remove `currentspec.md`
+- [x] Update `README.md`, `docs/tech.md` and `SYSTEM_CONTEXT.md` (material facts only); add a closing decision; remove `currentspec.md`
+  - **Completed evidence**: All three documents are updated, the "Milestone 2 closed" decision is recorded, and `currentspec.md` is removed.
