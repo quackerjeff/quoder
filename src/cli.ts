@@ -12,28 +12,34 @@ import { packagePath } from "./package-root.js";
 export const DEFAULT_MODEL: ModelRef = { providerID: "ollama", id: "glm-4.7-flash:latest" };
 
 const USAGE = [
-  "Usage: quoder [--model provider/model]",
+  "Usage: quoder [--model provider/model] [--no-color]",
   "",
   "Starts the Quoder harness in the current project. Each prompt runs in a fresh",
   "OpenCode session that is deleted afterwards.",
   "",
   `  --model provider/model   OpenCode model to bind (default: ${DEFAULT_MODEL.providerID}/${DEFAULT_MODEL.id})`,
+  "  --no-color               Disable colour (NO_COLOR is also honoured)",
   "  --help                   Show this help",
   "  --version                Show the Quoder version",
 ].join("\n");
 
 export type CliArguments =
-  | { readonly kind: "run"; readonly model: ModelRef }
+  | { readonly kind: "run"; readonly model: ModelRef; readonly noColor: boolean }
   | { readonly kind: "help" }
   | { readonly kind: "version" }
   | { readonly kind: "error"; readonly message: string };
 
 export function parseArguments(args: readonly string[]): CliArguments {
   let model = DEFAULT_MODEL;
+  let noColor = false;
   for (let index = 0; index < args.length; index++) {
     const argument = args[index];
     if (argument === "--help" || argument === "-h") return { kind: "help" };
     if (argument === "--version") return { kind: "version" };
+    if (argument === "--no-color") {
+      noColor = true;
+      continue;
+    }
     if (argument === "--model" || argument?.startsWith("--model=")) {
       const value = argument === "--model" ? args[++index] : argument.slice("--model=".length);
       const separator = value?.indexOf("/") ?? -1;
@@ -45,7 +51,7 @@ export function parseArguments(args: readonly string[]): CliArguments {
     }
     return { kind: "error", message: `Unknown argument: ${argument ?? ""}` };
   }
-  return { kind: "run", model };
+  return { kind: "run", model, noColor };
 }
 
 /** QUODER_TRACE_FILE receives one JSON line per harness trace event (diagnostics and acceptance). */

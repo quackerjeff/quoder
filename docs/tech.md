@@ -123,6 +123,25 @@ Source: `Session3.events` and `V2SessionEventsData` in the local declarations. T
 
 **Runtime item shape (verified live 2026-10-02/03).** The generated type declares each item as `{ id, event, data: string }`, but at runtime the 1.18.33 SDK yields parsed events `{ id, type, durable, data }`, with `data` as the payload object. Treat the parsed form as authoritative (`sessionStreamEvent`), and accept the declared string form only when it parses to an event. A consumer that `JSON.parse`s `data` never matches; this caused the 2026-10-02 authoritative run's first 120 s stall.
 
+**Live display events on the global stream (verified 2026-10-03, `glm-4.7-flash:latest`).** The run-long global subscription (`client.v2.event.subscribe`) delivers every `session.next.*` display event for a session. Items have the parsed shape `{type, data}`, with `data.sessionID`. The events are:
+- `step.started` and `step.ended` (with `tokens` and `finish`);
+- `text.started`, `text.delta` (`textID`, `delta`, about 5 characters each, about 75 per second) and `text.ended` (full `text`);
+- `tool.input.started`, `.delta` and `.ended`;
+- `tool.called` (`callID`, `tool`, `input`);
+- `tool.success` (`structured`, `content`, `outputPaths`) and `tool.failed` (`error: {type, message}`).
+
+Every display event arrived before the session left `active`. glm via `ollama` emits no `reasoning.*` events.
+
+One step may issue several tool calls in parallel: every `tool.called` comes before any result, and the step's `text.ended` can follow the calls. Verified tool shapes (`input` → `structured`):
+- `read` `{path}` → `{uri, name, content, encoding, mime}`
+- `grep` `{pattern, path?}` → `{value: [...]}`
+- `glob` `{pattern}` → `{value: [{path, type}]}`
+- `bash` `{command, timeout?, description?}` → `{exit, truncated}`, with output in `content[].text`. A non-zero exit is still `tool.success`.
+- `edit` `{path, oldString, newString, replaceAll?}` → `{files: [{file, patch, additions, deletions, status}], replacements}`
+- `write` `{path, content}` → `{operation, target, resource, existed}`
+
+**Session directory must be canonical.** If a session's `directory` differs textually from the server's resolved cwd (for example, `/var/folders/…` versus `/private/var/folders/…` on macOS), the first prompt on a fresh server is admitted and then silently dropped: the session goes idle with no assistant message and no error (reproduced 3 of 3). Pass the `realpath` of the project root both as the server cwd and as the session directory.
+
 ### Permission Request
 
 Core V2 uses ordered `permissions` rules with `action`, `resource`, and `effect`. Official V2 documentation states that an unmatched permission defaults to `ask`; the base policy also asks for external-directory and `.env` access.
@@ -292,6 +311,17 @@ npm install --save-dev --save-exact \
 ```
 
 Runtime dependencies are pinned exactly in `package.json`: `@opencode-ai/sdk@1.18.33` and `opencode-ai@1.18.33`. Do not use a global CLI or the transitive SDK under `~/.config/opencode`.
+
+Milestone 2 presentation dependencies (spec `2026-10-03-milestone-2-streaming-ui`). Both are exact-pinned and have no dependencies or install scripts of their own:
+
+```bash
+npm install --save-exact marked@18.0.14 highlight.js@11.12.0
+```
+
+- `marked` 18.0.14 (MIT) is used only as a Markdown lexer. Quoder renders tokens itself.
+- `highlight.js` 11.12.0 (BSD-3-Clause) highlights code blocks for a fixed set of registered languages.
+- Colour uses Node's built-in `util.styleText` with `validateStream: false`. `src/ui/style.ts` decides colour once, from TTY, `TERM`, `NO_COLOR`, `FORCE_COLOR` and `--no-color`.
+- `marked-terminal` and `shiki` were rejected: they pull in many transitive packages or WebAssembly.
 
 ## Contracts And Integrations
 
