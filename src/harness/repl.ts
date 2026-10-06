@@ -230,11 +230,13 @@ export class Harness {
       return this.#shutdownOnce(1);
     }
     if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
-    // State the boundary explicitly. Without this line a stale build that launches an
-    // unsandboxed server is indistinguishable from a sandboxed one at the prompt, which has
-    // already caused a manual acceptance run to be misread.
+    // Do not claim the sandbox here. OpenCode 1.18.33 has two Bash implementations: one uses the
+    // configured `shell` verbatim, the other passes it through `Shell.preferred()`, which only
+    // accepts recognised shell names and otherwise silently falls back to the default shell.
+    // Quoder's trampoline is not a recognised name, so the boundary does not hold on that path.
+    // Until the trampoline is accepted by both, stating "sandboxed" would be a false assurance.
     this.#write(
-      `${theme.paint("dim", "Model-run tools sandboxed")} ${theme.paint("dim", "·")} ${theme.paint("dim", "macOS Seatbelt: loopback, private config and process inspection denied")}\n`,
+      `${theme.paint("error", "Model-run tool sandbox is NOT verified on this path.")} ${theme.paint("dim", "Treat model-run commands as unconfined; see decisions.md.")}\n`,
     );
     this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
     let input = this.#options.input;

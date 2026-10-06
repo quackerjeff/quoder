@@ -140,3 +140,20 @@
 **Residual gaps, unchanged by this work**: `OPENCODE_SERVER_PASSWORD` remains in the server's own environment, by design, and is now inert rather than hidden. LSP and formatter subprocesses are not covered by `shell` and are not yet asserted against; only local MCP servers are. Linux has no backend and fails closed. `sandbox-exec` is deprecated in its man page though present and working on macOS 26.
 
 **Gate status**: Interactive permission grants remain **default-off**. This change satisfies the Group 3.1 implementation and its model-free verification; Group 7 security review and Group 8 QA have not been re-run against it.
+
+## 2026-10-05 — Boundary does NOT hold on the harness path; Group 3.1 reopened
+
+**Observed**: In a real `quoder` session the user ran `ps -axeww | head -3` and it succeeded, printing live process data, and `curl http://127.0.0.1:4096/config` exited 0. The startup assertion had passed and the resolved `shell` was Quoder's trampoline. The boundary was therefore not in force on the path the harness actually uses.
+
+**Root cause**: OpenCode 1.18.33 contains two Bash command-spawn implementations with different shell resolution.
+
+- One reads `Object.assign({}, ...Config.entries().filter(type === "document")).shell ?? default` and passes it straight to the child process. This path honours Quoder's trampoline, which is why `opencode debug agent --tool bash`, `session.shell`, and the whole `verify:sandbox` suite reported PASS.
+- The other reads `Shell.preferred(config.shell)` and calls `Shell.args(...)`. The bundled `Shell` module exposes `preferred`, `acceptable`, `name`, `login`, `args` over a table keyed by shell *name* (`bash`, `dash`, `fish`, `ksh`, …). A configured shell whose name is not recognised is discarded and the default shell is used, silently. Quoder's trampoline is named `quoder-model-shell`, so it is discarded on that path.
+
+**Consequence**: The verification was sound for the path it exercised and wrong about the path that matters. `verify:sandbox` driving `debug agent --tool bash` is not a proxy for a V2 session prompt. The runtime assertion compounded this by reading `/config` (the V1 resolved document, which reports the trampoline) while the V2 global view at `/global/config` never reports `shell` at all.
+
+**Immediate action**: The startup line now states the sandbox is unverified rather than claiming it is active; a false assurance is worse than none. Group 3.1 is reopened and interactive grants stay default-off.
+
+**Fix direction, not yet implemented or verified**: Name the trampoline so `Shell.preferred` accepts it — for example `<private dir>/bin/bash` — and make the script tolerate the argv `Shell.args`/`Shell.login` actually produce for that name, including a possible `-l` before `-c`. Then re-verify on a real V2 session prompt, not through `debug agent`, and extend the runtime assertion to a source the V2 tool path genuinely consults.
+
+**Process lesson**: Every predicate in `verify:sandbox` was exercised through one invocation path. A negative control proves a suite is sensitive to the control it varies; it cannot reveal that the whole suite addresses the wrong code path. Acceptance needs at least one check driven through the real harness prompt path.
