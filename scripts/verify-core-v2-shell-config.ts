@@ -31,6 +31,19 @@ import {
 } from "../src/opencode-sandbox-assertion.js";
 
 const SENTINEL = "QUODER-SENTINEL-NOT-A-REAL-CREDENTIAL";
+/**
+ * Inverted self-test. With `QUODER_SANDBOX_NEGATIVE_CONTROL=1` the generated Seatbelt profile is
+ * replaced with a permissive one and the run passes only if the sandbox-dependent predicates
+ * fail. This guards against a suite that reports PASS without exercising the boundary; two of
+ * these predicates were originally non-discriminating and were caught this way.
+ */
+const NEGATIVE_CONTROL = process.env.QUODER_SANDBOX_NEGATIVE_CONTROL === "1";
+/** Predicates that must flip to FAIL once the profile is permissive. */
+const SANDBOX_DEPENDENT_LABELS = [
+  "Loopback denied to model-run shell",
+  "Private config unreadable by model-run shell",
+  "Nested sandbox cannot relax the profile",
+] as const;
 const AGENT = "build";
 const TOOL_TIMEOUT_MS = 60_000;
 
@@ -138,6 +151,19 @@ async function stage(label: string, body: () => Promise<boolean>): Promise<boole
   }
 }
 
+/**
+ * Normal runs require every predicate to pass. Negative-control runs require the
+ * sandbox-dependent predicates to fail, which proves the suite is sensitive to the boundary.
+ */
+function verdictExitCode(): number {
+  if (rows.length === 0) return 1;
+  if (!NEGATIVE_CONTROL) return rows.every((row) => row.passed) ? 0 : 1;
+  return SANDBOX_DEPENDENT_LABELS.every((label) => {
+    const row = rows.find((candidate) => candidate.label === label);
+    return row !== undefined && !row.passed;
+  }) ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const scratch = await mkdtemp(join(await realpath(tmpdir()), "quoder-sandbox-accept-"));
   const project = join(scratch, "project");
@@ -163,6 +189,15 @@ async function main(): Promise<number> {
 
     await stage("Tool sandbox prepared", async () => {
       sandbox = await prepareToolSandbox({ sourceConfigDirectory: sourceConfig });
+      if (NEGATIVE_CONTROL) {
+        // Replace the generated profile with a permissive one, leaving everything else identical.
+        // A suite that still passes every predicate here is not testing the sandbox at all, so
+        // this inverted run is what makes the positive run meaningful.
+        await writeFile(sandbox.profilePath, "(version 1)\n(allow default)\n", {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+      }
       return true;
     });
     if (sandbox === undefined || protectedPort === undefined) {
@@ -325,7 +360,7 @@ async function main(): Promise<number> {
       return rejectedWrongShell && rejectedLocalMcp && acceptedSandboxed;
     });
 
-    return rows.every((row) => row.passed) ? 0 : 1;
+    return verdictExitCode();
   } finally {
     listener?.close();
     await sandbox?.remove().catch(() => undefined);
@@ -335,8 +370,19 @@ async function main(): Promise<number> {
       const suffix = row.cause === undefined ? "" : ` (${row.cause})`;
       process.stdout.write(`${row.label}: ${row.passed ? "PASS" : "FAIL"}${suffix}\n`);
     }
-    const verdict = rows.length > 0 && rows.every((row) => row.passed) ? "PASS" : "FAIL";
-    process.stdout.write(`Model-run tool sandbox: ${verdict}\n`);
+    if (NEGATIVE_CONTROL) {
+      for (const label of SANDBOX_DEPENDENT_LABELS) {
+        const row = rows.find((candidate) => candidate.label === label);
+        const flipped = row !== undefined && !row.passed;
+        process.stdout.write(
+          `Negative control expects FAIL: ${label}: ${flipped ? "flipped (good)" : "still passing (bad)"}\n`,
+        );
+      }
+    }
+    const verdict = verdictExitCode() === 0 ? "PASS" : "FAIL";
+    process.stdout.write(
+      `Model-run tool sandbox${NEGATIVE_CONTROL ? " (negative control)" : ""}: ${verdict}\n`,
+    );
   }
 }
 

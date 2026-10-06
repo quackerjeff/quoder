@@ -173,7 +173,7 @@ FAIL — do not enable or release interactive grants until an alternate credenti
 | Project shell override rejected | PASS |
 | Runtime config assertion fails closed | PASS |
 
-**Negative control**: With the Seatbelt profile neutered in the built artifact, the loopback, private-config, and nested-escape predicates correctly report FAIL, so the suite is not vacuously passing. The process-inspection predicate still passes under the control because Seatbelt refuses to exec setuid `/bin/ps` under any profile; it therefore detects an unsandboxed shell rather than the specific rule. This is recorded rather than claimed as rule coverage.
+**Negative control**: `npm run verify:sandbox:negative` replaces the generated Seatbelt profile with a permissive one and inverts the verdict, passing only when the loopback, private-config, and nested-escape predicates report FAIL. Observed: all three flip, so the suite is not vacuously passing. This is a repeatable script rather than a manual patch of the built artifact. The process-inspection predicate still passes under the control because Seatbelt refuses to exec setuid `/bin/ps` under any profile; it therefore detects an unsandboxed shell rather than the specific rule. This is recorded rather than claimed as rule coverage.
 
 **End-to-end against a real authenticated server**: `launchSandboxedOpenCodeServer` started the server, the post-startup assertion passed, `GET /config` confirmed the resolved `shell` is Quoder's trampoline with zero local MCP servers, unauthenticated `/global/health` still returned 401, and the private sandbox directory was removed on close with no leftover scratch directories.
 

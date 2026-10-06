@@ -104,7 +104,8 @@ Known limitations:
   Quoder's private configuration, and process inspection, and that a descendant
   cannot relax. External network access still works. Check it with
   `npm run verify:sandbox`, which drives the real OpenCode Bash tool with no
-  model call. macOS only; other platforms fail closed. Interactive permission
+  model call, and `npm run verify:sandbox:negative`, which disables the profile
+  and passes only if those checks then fail. macOS only; other platforms fail closed. Interactive permission
   grants stay default-off pending the remaining Milestone 3 reviews. Other
   hardening items are listed in the Milestone 1 and 2 specs' `decisions.md`
   and in `docs/backlog.md`.

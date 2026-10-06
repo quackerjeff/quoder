@@ -16,7 +16,8 @@
     "verify:live": "npm run build:live && node .live-build/scripts/verify-live.js",
     "verify:live:smoke": "npm run build:live && node .live-build/scripts/smoke-live.js",
     "verify:harness": "npm run build && npm run build:live && node .live-build/scripts/verify-harness.js",
-    "verify:sandbox": "npm run build:live && node .live-build/scripts/verify-core-v2-shell-config.js"
+    "verify:sandbox": "npm run build:live && node .live-build/scripts/verify-core-v2-shell-config.js",
+    "verify:sandbox:negative": "npm run build:live && QUODER_SANDBOX_NEGATIVE_CONTROL=1 node .live-build/scripts/verify-core-v2-shell-config.js"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.33",
