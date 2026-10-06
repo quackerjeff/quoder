@@ -28,7 +28,7 @@ describe("prompt result formatting", () => {
   it("explains a rejected permission without granting anything", () => {
     const text = formatResult(result({ kind: "permission-rejected", action: "external_directory", resourceCount: 1 }));
     expect(text).toContain("OpenCode asked for permission (external_directory, 1 resource).");
-    expect(text).toContain("the request was not granted and the turn ended");
+    expect(text).toContain("The permission request was rejected; the requested operation did not complete");
     expect(text).toContain("! Stopped after 2.3s");
   });
 

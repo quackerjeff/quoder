@@ -96,10 +96,18 @@ Known limitations:
   in Milestone 3.
 - **Multi-line editing.** Only the line you are typing can be edited; Up and
   Down recall earlier prompts. Full multi-line editing is in `docs/backlog.md`.
-- **Server password.** Model-run shell commands can read the OpenCode server's
-  password. This is deferred to Milestone 3, before permission decisions are
-  forwarded. Other hardening items are listed in the Milestone 1 and 2 specs'
-  `decisions.md` and in `docs/backlog.md`.
+- **Server password.** The OpenCode server's password necessarily stays in the
+  server process's own environment: the pinned OpenCode reads it only from
+  `OPENCODE_SERVER_PASSWORD` and offers no file or descriptor alternative.
+  Quoder therefore makes it useless rather than hidden. Every model-run shell
+  runs under a macOS Seatbelt profile that denies outbound loopback, reads of
+  Quoder's private configuration, and process inspection, and that a descendant
+  cannot relax. External network access still works. Check it with
+  `npm run verify:sandbox`, which drives the real OpenCode Bash tool with no
+  model call. macOS only; other platforms fail closed. Interactive permission
+  grants stay default-off pending the remaining Milestone 3 reviews. Other
+  hardening items are listed in the Milestone 1 and 2 specs' `decisions.md`
+  and in `docs/backlog.md`.
 - **Model nondeterminism.** The model does not always follow instructions
   exactly.
 

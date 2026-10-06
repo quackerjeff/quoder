@@ -12,9 +12,11 @@
     "typecheck": "tsc --noEmit",
     "build:live": "tsc --project tsconfig.live.json",
     "verify:environment": "npm run build:live && node .live-build/scripts/verify-environment.js",
+    "verify:permissions": "npm run build:live && node .live-build/scripts/verify-permissions.js",
     "verify:live": "npm run build:live && node .live-build/scripts/verify-live.js",
     "verify:live:smoke": "npm run build:live && node .live-build/scripts/smoke-live.js",
-    "verify:harness": "npm run build && npm run build:live && node .live-build/scripts/verify-harness.js"
+    "verify:harness": "npm run build && npm run build:live && node .live-build/scripts/verify-harness.js",
+    "verify:sandbox": "npm run build:live && node .live-build/scripts/verify-core-v2-shell-config.js"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.33",

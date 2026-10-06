@@ -28,6 +28,10 @@ interface FakeOptions {
   readonly createGate?: ReturnType<typeof gate>;
   /** Permission replies fail (the server cannot be told to reject). */
   readonly permissionReplyFails?: boolean;
+  readonly permissionSave?: readonly string[];
+  readonly permissionDecisionsEnabled?: boolean;
+  readonly permissionRequestCount?: number;
+  readonly permissionOperation?: "read" | "edit";
   /** Session deletion waits until this gate opens. */
   readonly deleteGate?: ReturnType<typeof gate>;
 }
@@ -44,11 +48,22 @@ interface FakeOptions {
  */
 const fakeOpenCode = (options: FakeOptions = {}) => {
   const calls: string[] = [];
-  const state = { dead: false, monitor: undefined as EventMonitorOptions | undefined };
+  const pendingPermissions = new Set<string>();
+  const pendingPermissionIDs = new Map<string, Set<string>>();
+  const state = {
+    dead: false,
+    monitor: undefined as EventMonitorOptions | undefined,
+    executedOperations: new Set<string>(),
+    resolvePermission: (sessionID: string) => {
+      pendingPermissionIDs.delete(sessionID);
+      return pendingPermissions.delete(sessionID);
+    },
+  };
   let sessions = 0;
   const prompts = new Map<string, string>();
   const interrupted = new Set<string>();
   const deleted = new Set<string>();
+  const permissionReplies = new Map<string, string>();
   const alive = async () => {
     if (state.dead) throw new TypeError("fetch failed");
   };
@@ -83,7 +98,17 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
     const done = (text: string, extra: Record<string, unknown> = {}) =>
       ({ id: `asst-${sessionID}`, type: "assistant", time: { created: 2, completed: 3 }, agent: "build", model: MODEL, content: [{ type: "text", id: "t", text }], ...extra });
     if (dropped.has(sessionID)) return [userMessage];
-    if (prompt.startsWith("permok")) return [userMessage, done(`Answer: ${prompt}`)];
+    if (prompt.startsWith("allowed-command")) {
+      state.executedOperations.add(sessionID);
+      return [userMessage, done("ALLOWED_COMMAND_EXECUTED")];
+    }
+    if (prompt.startsWith("permok") || ["once", "always"].includes(permissionReplies.get(sessionID) ?? "")) {
+      state.executedOperations.add(sessionID);
+      return [userMessage, done(`Answer: ${prompt}\nPROTECTED_OPERATION_EXECUTED`)];
+    }
+    if (permissionReplies.get(sessionID) === "reject") {
+      return [userMessage, { ...done(""), time: { created: 2 }, content: [{ type: "tool", tool: "read" }] }];
+    }
     if (prompt.startsWith("perm") || prompt.startsWith("ask")) {
       return [userMessage, { ...done(""), time: { created: 2 }, content: [{ type: "tool", tool: "read" }] }];
     }
@@ -119,7 +144,21 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
             dropped.add(sessionID);
           }
           if (text.startsWith("perm")) {
-            state.monitor?.onPermissionAsked?.({ sessionID, requestID: `per_${sessionID}`, action: "external_directory", resourceCount: 1 });
+            pendingPermissions.add(sessionID);
+            const ids = new Set<string>();
+            for (let index = 1; index <= (options.permissionRequestCount ?? 1); index++) {
+              const requestID = index === 1 ? `per_${sessionID}` : `per_${sessionID}_${index}`;
+              ids.add(requestID);
+              state.monitor?.onPermissionAsked?.({
+                sessionID,
+                requestID,
+                action: "external_directory",
+                resourceCount: 1,
+                resources: [`/outside/${options.permissionOperation ?? "resource"}/harmless-target`],
+                save: options.permissionSave ?? [],
+              });
+            }
+            pendingPermissionIDs.set(sessionID, ids);
           }
           if (text.startsWith("stream")) streamEvents(sessionID, text);
           if (text.startsWith("ask")) {
@@ -132,7 +171,8 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
         active: vi.fn(async () => {
           await alive();
           const running = [...prompts.keys()].filter((id) => /^(slow|streamslow)/u.test(prompts.get(id) ?? "") && !interrupted.has(id));
-          return result({ data: Object.fromEntries(running.map((id) => [id, { type: "running" }])) });
+          const active = [...new Set([...running, ...pendingPermissions])];
+          return result({ data: Object.fromEntries(active.map((id) => [id, { type: "running" }])) });
         }),
         messages: vi.fn(async (parameters: { sessionID: string }) => {
           await alive();
@@ -142,6 +182,8 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
           await alive();
           calls.push(`interrupt:${parameters.sessionID}`);
           interrupted.add(parameters.sessionID);
+          pendingPermissions.delete(parameters.sessionID);
+          pendingPermissionIDs.delete(parameters.sessionID);
           return result(undefined, 204);
         }),
         get: vi.fn(async (parameters: { sessionID: string }) => {
@@ -151,10 +193,21 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
             : result({ data: { id: parameters.sessionID } });
         }),
         permission: {
-          reply: vi.fn(async (parameters: { requestID: string; reply: string }) => {
+          reply: vi.fn(async (parameters: { sessionID: string; requestID: string; reply: string }) => {
             await alive();
             calls.push(`permission:${parameters.requestID}:${parameters.reply}`);
             if (options.permissionReplyFails) throw new TypeError("fetch failed");
+            permissionReplies.set(parameters.sessionID, parameters.reply);
+            const ids = pendingPermissionIDs.get(parameters.sessionID) ?? new Set();
+            const resolvedIDs = parameters.reply === "reject" ? [...ids] : [parameters.requestID];
+            for (const requestID of resolvedIDs) {
+              state.monitor?.onPermissionReplied?.(parameters.sessionID, requestID);
+              ids.delete(requestID);
+            }
+            if (ids.size === 0) {
+              pendingPermissionIDs.delete(parameters.sessionID);
+              pendingPermissions.delete(parameters.sessionID);
+            }
             return result(undefined, 204);
           }),
         },
@@ -239,6 +292,9 @@ const startHarness = (options: HarnessRunOptions = {}) => {
       }),
       trace: (event) => trace.push(event),
       noResponseTimeoutMs: 300,
+      ...(options.permissionDecisionsEnabled === undefined
+        ? {}
+        : { permissionDecisionsEnabled: options.permissionDecisionsEnabled }),
     },
   );
   const finished = harness.run();
@@ -335,7 +391,7 @@ describe("quoder harness (Milestone 1)", () => {
 
     await expect(run.finished).resolves.toBe(0);
 
-    expect(run.output()).toContain("Quoder could not reject OpenCode's permission request");
+    expect(run.output()).toContain("Quoder could not confirm OpenCode's permission decision");
     expect(run.counts.launched).toBe(2);
     expect(run.output()).toContain("Answer: afterwards");
   });
@@ -533,6 +589,165 @@ describe("quoder harness (Milestone 1)", () => {
 });
 
 describe("quoder harness in an interactive terminal", () => {
+  it("denies requests while the permission decision gate is disabled", async () => {
+    const run = startHarness({ terminal: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("perm read outside\r");
+
+    await vi.waitFor(() => expect(run.calls).toContain("permission:per_ses_1:reject"));
+    expect(run.output()).toContain("Interactive permission decisions are disabled pending security review");
+    expect(run.output()).not.toContain("[A] Allow once");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode asked for permission"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("waits for an explicit Allow once key before the permission request resolves", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode requests permission"));
+    expect(run.output()).toContain("[P] Allow for project (unavailable)");
+    expect(run.output()).toContain("/outside/resource");
+    run.input.write("a");
+
+    await vi.waitFor(() => expect(run.calls).toContain("permission:per_ses_1:once"));
+    await vi.waitFor(() => expect(run.output()).toContain("Answer: perm read outside"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual(["permission:per_ses_1:once"]);
+    expect(run.fake.state.executedOperations.has("ses_1")).toBe(true);
+  });
+
+  it("executes a command configured as allowed without asking for permission", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("allowed-command harmless\r");
+    await vi.waitFor(() => expect(run.output()).toContain("ALLOWED_COMMAND_EXECUTED"));
+
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual([]);
+    expect(run.fake.state.executedOperations.has("ses_1")).toBe(true);
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("shows exact save patterns and permits project approval only when patterns exist", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true, permissionSave: ["/outside/**"] });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("/outside/**"));
+    run.input.write("p");
+
+    await vi.waitFor(() => expect(run.calls).toContain("permission:per_ses_1:always"));
+    await vi.waitFor(() => expect(run.output()).toContain("Answer: perm read outside"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("queues simultaneous requests and clears native sibling rejections", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true, permissionRequestCount: 2 });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode requests permission (1 of 2)"));
+
+    run.input.write("d");
+    await vi.waitFor(() => expect(run.calls).toContain("permission:per_ses_1:reject"));
+    await vi.waitFor(() => expect(run.output()).toContain("Permission reply sent to OpenCode"));
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual(["permission:per_ses_1:reject"]);
+
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("keeps project approval unavailable when OpenCode supplies no save patterns", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode requests permission"));
+    run.input.write("p");
+    await vi.waitFor(() => expect(run.output()).toContain("Allow for project is unavailable"));
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual([]);
+    run.input.write("d");
+    await vi.waitFor(() => expect(run.calls).toContain("permission:per_ses_1:reject"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+    expect(run.fake.state.executedOperations.has("ses_1")).toBe(false);
+  });
+
+  it.each(["read", "edit"] as const)("asks before an outside-project %s and blocks it after denial", async (operation) => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true, permissionOperation: operation });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write(`perm ${operation} outside\r`);
+    await vi.waitFor(() => expect(run.output()).toContain(`/outside/${operation}/harmless-target`));
+    run.input.write("d");
+    await vi.waitFor(() => expect(run.calls).toContain("permission:per_ses_1:reject"));
+    await vi.waitFor(() => expect(run.output()).toContain("requested operation did not complete"));
+
+    expect(run.fake.state.executedOperations.has("ses_1")).toBe(false);
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("cancels a pending permission prompt without sending an approval", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode requests permission"));
+
+    run.input.write("\u0003");
+    await vi.waitFor(() => expect(run.output()).toContain("Execution cancelled after"));
+    run.input.write("\u0003");
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual([]);
+    expect(run.calls).toContain("interrupt:ses_1");
+  });
+
+  it("treats EOF during a permission prompt as cancellation without approving", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode requests permission"));
+
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual([]);
+    expect(run.calls).toContain("interrupt:ses_1");
+  });
+
+  it("stops the prompt when an explicit permission reply cannot be confirmed", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true, permissionReplyFails: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode requests permission"));
+    run.input.write("a");
+
+    await vi.waitFor(() => expect(run.output()).toContain("could not confirm OpenCode's permission decision"));
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual(["permission:per_ses_1:once"]);
+  });
+
+  it("drops a permission request resolved natively before a developer decision", async () => {
+    const run = startHarness({ terminal: true, permissionDecisionsEnabled: true });
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+    run.input.write("perm read outside\r");
+    await vi.waitFor(() => expect(run.output()).toContain("OpenCode requests permission"));
+
+    run.fake.state.resolvePermission("ses_1");
+    run.fake.state.monitor?.onPermissionReplied?.("ses_1", "per_ses_1");
+    await vi.waitFor(() => expect(run.output()).toContain("resolved the permission request before Quoder replied"));
+    expect(run.calls.filter((call) => call.startsWith("permission:"))).toEqual([]);
+
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
   it("refuses typing while busy, cancels on Ctrl-C, hints on a second Ctrl-C, and exits on Ctrl-C when idle", async () => {
     const deleteGate = gate();
     const run = startHarness({ terminal: true, deleteGate });

@@ -188,3 +188,36 @@ describe("review cycle 3 fixes", () => {
     await expect(translate("\u001b", "[200~one\rtwo\u001b[201~\r")).resolves.toBe(`one${CONTINUE}two\r`);
   });
 });
+
+describe("busy permission decision keys", () => {
+  it("routes A/P/D and kitty Escape to the decision handler without forwarding them", async () => {
+    const decisions: string[] = [];
+    const keys = new LineEndingKeys({
+      isBusy: () => true,
+      onBusyDecisionKey: (key) => decisions.push(key),
+    });
+    let forwarded = "";
+    keys.on("data", (chunk: Buffer) => { forwarded += chunk.toString("utf8"); });
+
+    keys.write("aP?d\u001b[27u\u001b[99;5u\u001b[100;5u");
+    keys.end();
+    await new Promise((resolveEnd) => keys.on("end", resolveEnd));
+
+    expect(decisions).toEqual(["a", "p", "d", "escape"]);
+    expect(forwarded).toBe("\u0003\u0004");
+  });
+
+  it("does not treat pasted decision letters as key presses", async () => {
+    const decisions: string[] = [];
+    const keys = new LineEndingKeys({ isBusy: () => true, onBusyDecisionKey: (key) => decisions.push(key) });
+    let forwarded = "";
+    keys.on("data", (chunk: Buffer) => { forwarded += chunk.toString("utf8"); });
+
+    keys.write("\u001b[200~APD\u001b[201~\u001b[99;5u");
+    keys.end();
+    await new Promise((resolveEnd) => keys.on("end", resolveEnd));
+
+    expect(decisions).toEqual([]);
+    expect(forwarded).toBe("\u0003");
+  });
+});

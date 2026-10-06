@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 
 import { opencodeExecutablePath } from "./package-root.js";
+import { assertNoProjectOpenCodePlugins } from "./opencode-project-policy.js";
+import { prepareToolSandbox, type ToolSandbox } from "./opencode-tool-sandbox.js";
+import { assertSandboxedRuntimeConfig } from "./opencode-sandbox-assertion.js";
 
 /**
  * The authenticated, project-local OpenCode server and the bounded lifecycle of the child process
@@ -23,6 +26,37 @@ export interface OwnedChildProcess {
 }
 
 export const SERVER_TERMINATION_TIMEOUT_MS = 2_000;
+
+const shellEnvironmentPluginURL = new URL("./opencode-shell-env-plugin.js", import.meta.url).href;
+
+function configContentWithShellEnvironmentPlugin(env: NodeJS.ProcessEnv): string {
+  let config: Record<string, unknown> = {};
+  const existing = env.OPENCODE_CONFIG_CONTENT;
+  if (existing !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(existing);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("not an object");
+      }
+      config = parsed as Record<string, unknown>;
+    } catch {
+      // Do not echo inline config: it may contain provider credentials.
+      throw new Error("OpenCode OPENCODE_CONFIG_CONTENT must be a JSON object for Quoder to add its shell security hook");
+    }
+  }
+
+  const configuredPlugins = config.plugin ?? [];
+  if (!Array.isArray(configuredPlugins) || configuredPlugins.some((plugin) => typeof plugin !== "string")) {
+    throw new Error("OpenCode OPENCODE_CONFIG_CONTENT has an invalid plugin list");
+  }
+  return JSON.stringify({
+    ...config,
+    // OpenCode applies OPENCODE_CONFIG_CONTENT after the user and project config layers, so this
+    // plugin is registered after other configured plugins. Core V2 Bash 1.18.33 does not invoke
+    // shell.env hooks; this registration is not a credential-isolation boundary for that tool.
+    plugin: [...configuredPlugins, shellEnvironmentPluginURL],
+  });
+}
 
 const waitForOwnedChildExit = async (
   child: OwnedChildProcess,
@@ -61,6 +95,11 @@ export interface AuthenticatedServerOptions {
   readonly acceptCloseOwnership?: (close: () => Promise<void>) => boolean | void;
   /** The server's working directory; defaults to the caller's. The harness passes the project root. */
   readonly cwd?: string;
+  /**
+   * The prepared model-run tool sandbox. When present its private config directory is selected
+   * with `OPENCODE_CONFIG_DIR` so Core V2 Bash resolves Quoder's sandbox trampoline as its shell.
+   */
+  readonly toolSandbox?: Pick<ToolSandbox, "configDirectory" | "shellCommand">;
 }
 
 export function authenticatedServerProcessConfig(options: AuthenticatedServerOptions): {
@@ -69,14 +108,25 @@ export function authenticatedServerProcessConfig(options: AuthenticatedServerOpt
   readonly env: NodeJS.ProcessEnv;
   readonly cwd?: string;
 } {
+  const serverEnvironment = { ...process.env };
+  // OPENCODE_PURE disables external plugins, so remove it to preserve Quoder's configured plugin
+  // behavior. This does not isolate credentials for Core V2 Bash in OpenCode 1.18.33.
+  delete serverEnvironment.OPENCODE_PURE;
   return {
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     executable: opencodeExecutablePath(),
-    args: ["serve", "--pure", "--hostname=127.0.0.1", "--port=0"],
+    args: ["serve", "--hostname=127.0.0.1", "--port=0"],
     env: {
-      ...process.env,
+      ...serverEnvironment,
       OPENCODE_SERVER_USERNAME: options.username,
       OPENCODE_SERVER_PASSWORD: options.password,
+      OPENCODE_CONFIG_CONTENT: configContentWithShellEnvironmentPlugin(process.env),
+      ...(options.toolSandbox === undefined ? {} : {
+        // Core V2 Bash reads `shell` from the filesystem-backed global config document, which
+        // Global.make selects from OPENCODE_CONFIG_DIR. The directory is a private mirror of the
+        // user's configuration, so their real settings are preserved and never modified.
+        OPENCODE_CONFIG_DIR: options.toolSandbox.configDirectory,
+      }),
     },
   };
 }
@@ -141,7 +191,6 @@ const registerProcessExitHook = (hook: () => void): (() => void) => {
 export const SERVER_STARTUP_TIMEOUT_MS = 15_000;
 export const SERVER_TERMINATION_UNCONFIRMED_MESSAGE =
   "Authenticated OpenCode server termination was not confirmed after launch failure";
-
 export const defaultAuthenticatedServerLauncherDependencies: AuthenticatedServerLauncherDependencies = {
   spawnServer: (config) => spawn(
     config.executable,
@@ -165,6 +214,7 @@ export async function launchAuthenticatedOpenCodeServer(
   options: AuthenticatedServerOptions,
   dependencies: AuthenticatedServerLauncherDependencies = defaultAuthenticatedServerLauncherDependencies,
 ): Promise<AuthenticatedServerLaunch> {
+  assertNoProjectOpenCodePlugins(options.cwd ?? process.cwd());
   const child = dependencies.spawnServer(authenticatedServerProcessConfig(options));
   // Last resort: a Quoder process that dies without its orderly shutdown must not orphan the server.
   const unregisterExitHook = (dependencies.onProcessExit ?? registerProcessExitHook)(() => {
@@ -265,4 +315,87 @@ export async function launchAuthenticatedOpenCodeServer(
     return closeThenFail(error);
   }
   return { url: startup.url, close, exited };
+}
+
+/**
+ * Reads the running server's resolved configuration. The body carries provider credentials, so it
+ * is returned to the fail-closed assertion and never logged, traced, or included in an error.
+ */
+export async function readRuntimeOpenCodeConfig(
+  url: string,
+  authorization: string,
+  fetcher: typeof fetch = fetch,
+): Promise<unknown> {
+  const response = await fetcher(new URL("/config", url), {
+    headers: { Authorization: authorization },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error("OpenCode server rejected the resolved configuration request");
+  return response.json();
+}
+
+export interface SandboxedServerDependencies {
+  readonly launch: typeof launchAuthenticatedOpenCodeServer;
+  readonly prepareSandbox: typeof prepareToolSandbox;
+  readonly assertRuntimeConfig: typeof assertSandboxedRuntimeConfig;
+  readonly readRuntimeConfig: (url: string, authorization: string) => Promise<unknown>;
+}
+
+export const defaultSandboxedServerDependencies: SandboxedServerDependencies = {
+  launch: launchAuthenticatedOpenCodeServer,
+  prepareSandbox: prepareToolSandbox,
+  assertRuntimeConfig: assertSandboxedRuntimeConfig,
+  readRuntimeConfig: readRuntimeOpenCodeConfig,
+};
+
+/**
+ * Launches the authenticated server with the model-run tool sandbox in force.
+ *
+ * The sandbox is prepared before launch because Core V2 Bash resolves `shell` from the global
+ * config document, and it is verified after launch because `opencode serve` does not validate
+ * configuration at startup: a config that never took effect would otherwise leave model-run
+ * shells unsandboxed with no error. Any failure terminates the server and removes the sandbox, so
+ * Quoder never runs with a partially applied boundary.
+ */
+export async function launchSandboxedOpenCodeServer(
+  options: Omit<AuthenticatedServerOptions, "toolSandbox">,
+  dependencies: SandboxedServerDependencies = defaultSandboxedServerDependencies,
+): Promise<AuthenticatedServerLaunch> {
+  const sandbox = await dependencies.prepareSandbox();
+  let launch: AuthenticatedServerLaunch;
+  try {
+    launch = await dependencies.launch({ ...options, toolSandbox: sandbox });
+  } catch (error) {
+    await sandbox.remove().catch(() => undefined);
+    throw error;
+  }
+
+  const close = async (): Promise<void> => {
+    try {
+      await launch.close();
+    } finally {
+      await sandbox.remove().catch(() => undefined);
+    }
+  };
+
+  try {
+    await dependencies.assertRuntimeConfig(
+      {
+        readConfig: () => dependencies.readRuntimeConfig(
+          launch.url,
+          basicAuthorizationHeader(options.username, options.password),
+        ),
+      },
+      { shellCommand: sandbox.shellCommand },
+    );
+  } catch (error) {
+    await close().catch(() => undefined);
+    throw error;
+  }
+
+  return {
+    url: launch.url,
+    close,
+    ...(launch.exited === undefined ? {} : { exited: launch.exited }),
+  };
 }

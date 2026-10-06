@@ -3,7 +3,7 @@ import { createInterface, emitKeypressEvents, type Interface } from "node:readli
 
 import type { ModelRef, OpencodeClient } from "@opencode-ai/sdk/v2";
 
-import { startEventMonitor, type EventMonitor } from "../event-monitor.js";
+import { startEventMonitor, type EventMonitor, type PermissionAsked } from "../event-monitor.js";
 import { OpenCodeAdapter } from "../opencode-adapter.js";
 import {
   basicAuthorizationHeader,
@@ -18,11 +18,38 @@ import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
 import { SessionTracker, runPrompt, type StopRequest, type TurnOutcome } from "./session-runner.js";
 import { narrowStreamEvent } from "./stream-events.js";
+import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
 
 export const HARNESS_OPERATION_TIMEOUT_MS = 30_000;
 /** The monitor's subscription lives as long as its server; this only bounds a forgotten one. */
 export const HARNESS_MONITOR_SUBSCRIPTION_MS = 24 * 60 * 60 * 1000;
 const SERVER_USERNAME = "quoder";
+const permissionKey = (sessionID: string, requestID: string): string => `${sessionID}\u0000${requestID}`;
+
+const permissionDisplayText = (value: string): string =>
+  sanitizeForTerminal(value).replace(/\s+/gu, " ").trim();
+
+const wrapPermissionValue = (value: string, width: number, indent = "  "): string => {
+  const words = value.split(/\s+/u);
+  const lines: string[] = [];
+  let line = indent;
+  for (let word of words) {
+    if (line.length > indent.length && line.length + word.length + 1 > width) {
+      lines.push(line);
+      line = indent;
+    }
+    while ([...word].length > width - indent.length) {
+      const room = Math.max(1, width - line.length);
+      line += [...word].slice(0, room).join("");
+      lines.push(line);
+      word = [...word].slice(room).join("");
+      line = indent;
+    }
+    if (word !== "") line += `${line === indent ? "" : " "}${word}`;
+  }
+  if (line !== indent) lines.push(line);
+  return lines.join("\n");
+};
 
 /** Fixed event names with session IDs and outcome kinds only; never prompt or model text. */
 export type HarnessTraceEvent =
@@ -32,7 +59,7 @@ export type HarnessTraceEvent =
   | { readonly event: "monitor.lost" }
   | { readonly event: "session.created"; readonly sessionID: string }
   | { readonly event: "session.deleted"; readonly sessionID: string; readonly verified: boolean }
-  | { readonly event: "permission.rejected"; readonly sessionID: string; readonly replied: boolean }
+  | { readonly event: "permission.replied"; readonly sessionID: string; readonly reply: "once" | "always" | "reject"; readonly replied: boolean }
   | { readonly event: "prompt.completed"; readonly outcome: TurnOutcome["kind"]; readonly elapsedMs: number }
   | { readonly event: "prompt.started" }
   | { readonly event: "prompt.retried" }
@@ -46,6 +73,8 @@ export interface HarnessDependencies {
   readonly operationTimeoutMs?: number;
   /** How long an admitted prompt may stay idle without a response before it counts as dropped. */
   readonly noResponseTimeoutMs?: number;
+  /** Kept off until the Group 7 security review clears the prerequisite boundary. */
+  readonly permissionDecisionsEnabled?: boolean;
   readonly trace?: (event: HarnessTraceEvent) => void;
 }
 
@@ -86,6 +115,8 @@ export class Harness {
   readonly #options: HarnessOptions;
   readonly #dependencies: HarnessDependencies;
   readonly #tracker = new SessionTracker();
+  readonly #permissionQueue: PermissionAsked[] = [];
+  #permissionReplyInFlight: string | undefined;
   /**
    * Aborts a server launch that is still in progress when an exit is requested. Never aborted once
    * a server is up, so a running prompt's session can still be settled and deleted during shutdown.
@@ -134,6 +165,7 @@ export class Harness {
       } else {
         if (this.#view === undefined) this.#write("\nCancelling OpenCode execution…\n");
         else this.#view.cancelling();
+        this.#permissionQueue.length = 0;
         this.#running.abort();
       }
       return;
@@ -158,12 +190,13 @@ export class Harness {
   }
 
   get #mainPrompt(): string {
-    return `${this.#theme.paint("prompt", this.#options.project.name)} ${this.#theme.paint("accent", "❯")} `;
+    return `${this.#theme.paint("prompt", sanitizeLine(this.#options.project.name))} ${this.#theme.paint("accent", "❯")} `;
   }
 
   /** Aligns the continuation marker under the prompt's `❯`. */
   get #continuationPrompt(): string {
-    return `${" ".repeat([...this.#options.project.name].length)} ${this.#theme.paint("dim", "…")} `;
+    const projectName = sanitizeLine(this.#options.project.name);
+    return `${" ".repeat([...projectName].length)} ${this.#theme.paint("dim", "…")} `;
   }
 
   /** SIGTERM or SIGHUP: cancel any running prompt, clean up, and exit with `exitCode`. */
@@ -182,8 +215,10 @@ export class Harness {
   async #main(): Promise<number> {
     const { project, model } = this.#options;
     const theme = this.#theme;
+    const projectName = sanitizeLine(project.name);
+    const projectRoot = sanitizeLine(project.root);
     this.#write(
-      `${theme.paint("prompt", "Quoder")} ${theme.paint("dim", "·")} ${theme.paint("strong", project.name)} ${theme.paint("dim", project.root)}\n` +
+      `${theme.paint("prompt", "Quoder")} ${theme.paint("dim", "·")} ${theme.paint("strong", projectName)} ${theme.paint("dim", projectRoot)}\n` +
         `${theme.paint("dim", "Model")} ${theme.paint("accent", `${model.providerID}/${model.id}`)}\n` +
         `${theme.paint("dim", "Starting OpenCode server…")}\n`,
     );
@@ -204,6 +239,7 @@ export class Harness {
         // While a prompt runs, typing is not echoed over the status line; Return explains why.
         isBusy: () => this.#running !== undefined,
         onReturnWhileBusy: () => this.#notice("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n"),
+        onBusyDecisionKey: (key) => this.#onPermissionKey(key),
       });
       input = this.#options.input.pipe(keys);
       // Registered before readline's own keypress listener, so each Return is classified just
@@ -234,6 +270,10 @@ export class Harness {
     readline.on("SIGTSTP", () => undefined);
     readline.on("close", () => {
       this.#inputClosed = true;
+      if (this.#running !== undefined && !this.#running.signal.aborted) {
+        this.#permissionQueue.length = 0;
+        this.#running.abort();
+      }
       this.#wakeLoop?.();
     });
     readline.prompt();
@@ -264,6 +304,108 @@ export class Harness {
     this.#readline?.setPrompt(this.#mainPrompt);
     this.#lines.push(prompt);
     this.#wakeLoop?.();
+  }
+
+  #onPermissionAsked(server: ServerSession | undefined, permission: PermissionAsked): void {
+    if (
+      this.#dependencies.permissionDecisionsEnabled === true &&
+      this.#options.terminal &&
+      this.#running !== undefined &&
+      !this.#running.signal.aborted
+    ) {
+      if (!this.#permissionQueue.some((item) => permissionKey(item.sessionID, item.requestID) === permissionKey(permission.sessionID, permission.requestID))) {
+        this.#permissionQueue.push(permission);
+      }
+      this.#renderPermissionQueue();
+      return;
+    }
+
+    this.#notice(this.#options.terminal
+      ? "Interactive permission decisions are disabled pending security review; Quoder is denying the request.\n"
+      : "OpenCode requested permission in non-interactive mode; Quoder is denying the request.\n");
+    void this.#replyToPermission(server, permission, "reject", false);
+  }
+
+  #onPermissionKey(key: "a" | "p" | "d" | "escape"): void {
+    if (
+      this.#dependencies.permissionDecisionsEnabled !== true ||
+      !this.#options.terminal ||
+      this.#permissionReplyInFlight !== undefined
+    ) return;
+    const permission = this.#permissionQueue[0];
+    const server = this.#server;
+    if (permission === undefined || server === undefined || server.unhealthy) return;
+
+    if (key === "p" && permission.save.length === 0) {
+      this.#notice("Allow for project is unavailable because OpenCode supplied no saved patterns.\n");
+      this.#renderPermissionQueue();
+      return;
+    }
+    const reply = key === "a" ? "once" : key === "p" ? "always" : "reject";
+    void this.#replyToPermission(server, permission, reply, true);
+  }
+
+  async #replyToPermission(
+    server: ServerSession | undefined,
+    permission: PermissionAsked,
+    reply: "once" | "always" | "reject",
+    interactive: boolean,
+  ): Promise<void> {
+    const key = permissionKey(permission.sessionID, permission.requestID);
+    if (interactive) this.#permissionReplyInFlight = key;
+    try {
+      if (server === undefined) throw new Error("server unavailable");
+      await server.adapter.replyPermission(permission.sessionID, permission.requestID, reply);
+      this.#removeQueuedPermission(key);
+      this.#trace({ event: "permission.replied", sessionID: permission.sessionID, reply, replied: true });
+      if (interactive) {
+        this.#permissionReplyInFlight = undefined;
+        this.#renderPermissionQueue(true);
+      }
+    } catch {
+      this.#removeQueuedPermission(key);
+      if (interactive) this.#permissionReplyInFlight = undefined;
+      this.#permissionQueue.length = 0;
+      this.#trace({ event: "permission.replied", sessionID: permission.sessionID, reply, replied: false });
+      this.#markUnhealthy(server, "Quoder could not confirm OpenCode's permission decision.");
+    }
+  }
+
+  #removeQueuedPermission(key: string): void {
+    const index = this.#permissionQueue.findIndex((item) => permissionKey(item.sessionID, item.requestID) === key);
+    if (index >= 0) this.#permissionQueue.splice(index, 1);
+  }
+
+  #renderPermissionQueue(replySent = false): void {
+    const view = this.#view;
+    if (view === undefined) return;
+    const permission = this.#permissionQueue[0];
+    if (permission === undefined) {
+      if (replySent) view.note("Permission reply sent to OpenCode.\n");
+      return;
+    }
+    const width = Math.max(24, (this.#options.columns?.() ?? 80) - 2);
+    const action = permission.action === undefined ? "unknown" : sanitizeLine(permission.action, 120);
+    const resources = permission.resources.length === 0
+      ? "  (none reported)"
+      : permission.resources.map((resource) => wrapPermissionValue(permissionDisplayText(resource), width)).join("\n");
+    const saved = permission.save.length === 0
+      ? "  (unavailable: no saved patterns)"
+      : permission.save.map((pattern) => wrapPermissionValue(permissionDisplayText(pattern), width)).join("\n");
+    const projectChoice = permission.save.length === 0
+      ? "[P] Allow for project (unavailable)"
+      : "[P] Allow for project";
+    const text = [
+      `OpenCode requests permission (${1} of ${this.#permissionQueue.length})`,
+      `Action: ${action}`,
+      "Requested resources:",
+      resources,
+      "Allow for project would also allow:",
+      saved,
+      `[A] Allow once  ${projectChoice}  [D] Deny  [Esc] Deny`,
+      "",
+    ].join("\n");
+    view.note(text);
   }
 
   /** Asks the terminal to report Shift+Return distinctly (see `line-keys.ts`), and undoes it. */
@@ -428,20 +570,26 @@ export class Harness {
           const event = narrowStreamEvent(raw);
           if (event !== undefined) this.#view?.handle(event);
         },
+        onSessionRegistered: (sessionID, parentID) => {
+          if (parentID !== undefined) this.#tracker.registerChild(sessionID, parentID);
+        },
         onQuestionAsked: (question) => this.#tracker.noteQuestion(question),
         onQuestionRejected: (_question, rejected) => {
           if (!rejected) this.#markUnhealthy(server, "Quoder could not reject the model's question.");
         },
         onPermissionAsked: (permission) => {
-          // Milestone 1 never grants a permission: every request is rejected and reported.
           this.#tracker.notePermission(permission);
-          void adapter.replyPermission(permission.sessionID, permission.requestID, "reject").then(
-            () => this.#trace({ event: "permission.rejected", sessionID: permission.sessionID, replied: true }),
-            () => {
-              this.#trace({ event: "permission.rejected", sessionID: permission.sessionID, replied: false });
-              this.#markUnhealthy(server, "Quoder could not reject OpenCode's permission request.");
-            },
-          );
+          this.#onPermissionAsked(server, permission);
+        },
+        onPermissionReplied: (sessionID, requestID) => {
+          const key = permissionKey(sessionID, requestID);
+          if (key === this.#permissionReplyInFlight) return;
+          const previousLength = this.#permissionQueue.length;
+          this.#removeQueuedPermission(key);
+          if (this.#permissionQueue.length !== previousLength) {
+            if (this.#permissionQueue.length === 0) this.#view?.note("OpenCode resolved the permission request before Quoder replied.\n");
+            else this.#renderPermissionQueue();
+          }
         },
         onEnded: () => {
           this.#trace({ event: "monitor.lost" });

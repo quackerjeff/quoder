@@ -25,6 +25,7 @@ import { Transform, type TransformCallback } from "node:stream";
 
 /** Ctrl+G (BEL): readline binds nothing to it, so it is neither echoed nor inserted. */
 export const CONTINUE_MARK = "\u0007";
+const DECISION_ESCAPE_MARK = "\u0006";
 
 /** Push the kitty keyboard protocol's disambiguate flag and enable bracketed paste. */
 export const ENABLE_KEYBOARD_PROTOCOL = "\u001b[>1u\u001b[?2004h";
@@ -55,9 +56,9 @@ function decodeKittyKey(code: number, modifierField: number): string {
   const alt = (modifiers & ALT) !== 0 ? "\u001b" : "";
   if (code === 13) return modifiers === 0 ? SUBMIT : CONTINUE;
   if (code === KEYPAD_ENTER) return SUBMIT;
-  // Esc alone is dropped: before a Return it would turn the Return into Meta+Return, which
-  // readline does not submit, and Quoder binds nothing to Esc.
-  if (code === 27) return "";
+  // Preserve kitty Escape as an internal decision token. The busy filter consumes it, while
+  // ordinary prompt input still drops it before readline.
+  if (code === 27) return DECISION_ESCAPE_MARK;
   if (code === 9) return (modifiers & SHIFT) !== 0 ? "\u001b[Z" : "\t";
   if (code === 127) return `${alt}\u007f`;
   if ((modifiers & CTRL) !== 0) {
@@ -99,6 +100,8 @@ export interface LineEndingKeysOptions {
   readonly isBusy?: () => boolean;
   /** Called when Return is pressed while busy. */
   readonly onReturnWhileBusy?: () => void;
+  /** Receives A/P/D/Escape decision keys while busy; those keys never reach readline. */
+  readonly onBusyDecisionKey?: (key: "a" | "p" | "d" | "escape") => void;
   /** How long an incomplete escape sequence is held for the rest to arrive (default 50 ms). */
   readonly holdMs?: number;
   /**
@@ -127,6 +130,7 @@ export class LineEndingKeys extends Transform {
   /** After a paste timed out with part of its end marker held: the rest, dropped if it arrives. */
   #lateMarkerRest = "";
   #holdTimer: NodeJS.Timeout | undefined;
+  #decisionCandidates = "";
 
   constructor(options: LineEndingKeysOptions = {}) {
     super();
@@ -137,6 +141,7 @@ export class LineEndingKeys extends Transform {
     this.#clearHold();
     let text = this.#carry + (typeof chunk === "string" ? chunk : this.#decoder.write(chunk));
     this.#carry = "";
+    this.#decisionCandidates = "";
     if (this.#lateMarkerRest !== "" && text.startsWith(this.#lateMarkerRest)) text = text.slice(this.#lateMarkerRest.length);
     this.#lateMarkerRest = "";
     callback(null, this.#deliver(this.#translate(text, true)));
@@ -166,6 +171,7 @@ export class LineEndingKeys extends Transform {
     this.#clearHold();
     const rest = this.#carry + this.#decoder.end();
     this.#carry = "";
+    this.#decisionCandidates = "";
     callback(null, this.#deliver(this.#translate(rest, false)));
   }
 
@@ -181,8 +187,18 @@ export class LineEndingKeys extends Transform {
 
   /** While busy, only Ctrl+C and Ctrl+D reach readline; a Return is reported instead. */
   #deliver(translated: string): string {
-    if (this.#options.isBusy?.() !== true) return translated;
+    if (this.#options.isBusy?.() !== true) return translated.replaceAll(DECISION_ESCAPE_MARK, "");
     if (translated.includes("\r")) this.#options.onReturnWhileBusy?.();
+    const candidates = this.#decisionCandidates
+      // Ignore modified keys (Alt+letter and terminal escape sequences), which include ESC.
+      .replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|.)/gsu, "")
+      .replaceAll(DECISION_ESCAPE_MARK, "\u001b");
+    for (const candidate of candidates) {
+      if (candidate === "\u001b") this.#options.onBusyDecisionKey?.("escape");
+      else if (candidate === "a" || candidate === "A") this.#options.onBusyDecisionKey?.("a");
+      else if (candidate === "p" || candidate === "P") this.#options.onBusyDecisionKey?.("p");
+      else if (candidate === "d" || candidate === "D") this.#options.onBusyDecisionKey?.("d");
+    }
     return translated.match(BUSY_KEYS)?.join("") ?? "";
   }
 
@@ -200,7 +216,7 @@ export class LineEndingKeys extends Transform {
       const index = rest.indexOf(marker);
       if (index === -1) break;
       const segment = rest.slice(0, index);
-      output += this.#pasting ? translatePaste(segment) : translateKeys(segment);
+      output += this.#pasting ? translatePaste(segment) : this.#translateKeys(segment);
       this.#pasting = !this.#pasting;
       rest = rest.slice(index + marker.length);
     }
@@ -211,6 +227,12 @@ export class LineEndingKeys extends Transform {
         rest = rest.slice(0, -partial.length);
       }
     }
-    return output + (this.#pasting ? translatePaste(rest) : translateKeys(rest));
+    return output + (this.#pasting ? translatePaste(rest) : this.#translateKeys(rest));
+  }
+
+  #translateKeys(text: string): string {
+    const translated = translateKeys(text);
+    this.#decisionCandidates += translated;
+    return translated;
   }
 }

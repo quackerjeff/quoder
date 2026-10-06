@@ -19,6 +19,8 @@ export interface PermissionAsked {
   readonly requestID: string;
   readonly action: string | undefined;
   readonly resourceCount: number;
+  readonly resources: readonly string[];
+  readonly save: readonly string[];
 }
 
 export interface EventMonitorOptions {
@@ -38,8 +40,12 @@ export interface EventMonitorOptions {
   readonly onEnded?: () => void;
   /** Called synchronously with each `session.next.*` event (raw) of an own session, for display. */
   readonly onSessionEvent?: (event: { readonly type: string; readonly data: unknown }) => void;
+  /** Called for session metadata events before a child can raise a permission or question event. */
+  readonly onSessionRegistered?: (sessionID: string, parentID: string | undefined) => void;
   /** Called after a permission request has been recorded; the caller decides how to reply. */
   readonly onPermissionAsked?: (permission: PermissionAsked) => void;
+  /** Native replies can resolve sibling requests; callers reconcile their pending queues here. */
+  readonly onPermissionReplied?: (sessionID: string, requestID: string) => void;
 }
 
 export interface EventMonitor {
@@ -88,6 +94,33 @@ export async function startEventMonitor(options: EventMonitorOptions): Promise<E
         confirmConnected();
         continue;
       }
+      if (event.type === "session.created" || event.type === "session.updated") {
+        const sessionID = eventSessionID(event);
+        const info = Reflect.get(event.data, "info");
+        const parentID = typeof info === "object" && info !== null
+          ? Reflect.get(info, "parentID")
+          : undefined;
+        if (sessionID !== undefined) {
+          try {
+            options.onSessionRegistered?.(sessionID, typeof parentID === "string" ? parentID : undefined);
+          } catch {
+            // Session ownership reporting must not end the monitor.
+          }
+        }
+        continue;
+      }
+      if (event.type === "permission.v2.replied") {
+        const sessionID = eventSessionID(event);
+        const requestID = Reflect.get(event.data, "requestID");
+        if (sessionID !== undefined && typeof requestID === "string" && options.isOwnSession(sessionID)) {
+          try {
+            options.onPermissionReplied?.(sessionID, requestID);
+          } catch {
+            // Queue reconciliation is observational and must not end the monitor.
+          }
+        }
+        continue;
+      }
       if (event.type.startsWith("session.next.") && options.onSessionEvent !== undefined) {
         const sessionID = eventSessionID(event);
         if (sessionID !== undefined && options.isOwnSession(sessionID)) {
@@ -109,12 +142,15 @@ export async function startEventMonitor(options: EventMonitorOptions): Promise<E
         for (const wake of waiters) wake();
         const action = Reflect.get(event.data, "action");
         const resources = Reflect.get(event.data, "resources");
+        const save = Reflect.get(event.data, "save");
         try {
           options.onPermissionAsked?.({
             sessionID,
             requestID,
             action: typeof action === "string" ? action : undefined,
             resourceCount: Array.isArray(resources) ? resources.length : 0,
+            resources: Array.isArray(resources) ? resources.filter((value): value is string => typeof value === "string") : [],
+            save: Array.isArray(save) ? save.filter((value): value is string => typeof value === "string") : [],
           });
         } catch {
           // A reporting callback must never end the monitor.

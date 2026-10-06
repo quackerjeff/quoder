@@ -246,7 +246,7 @@ export class OpenCodeAdapter {
   async replyPermission(
     sessionID: string,
     requestID: string,
-    reply: PermissionV2Reply = "once",
+    reply: PermissionV2Reply,
   ): Promise<void> {
     await this.#request("reply to permission request", (signal) =>
       this.#client.v2.session.permission.reply({ sessionID, requestID, reply }, { signal }),

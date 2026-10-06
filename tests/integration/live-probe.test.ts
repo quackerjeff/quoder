@@ -826,7 +826,7 @@ describe("security hardening", () => {
       password: "secret-value",
     });
     expect(config.executable).toBe(join(process.cwd(), "node_modules", ".bin", "opencode"));
-    expect(config.args).toEqual(["serve", "--pure", "--hostname=127.0.0.1", "--port=0"]);
+    expect(config.args).toEqual(["serve", "--hostname=127.0.0.1", "--port=0"]);
     expect(config.args.join(" ")).not.toContain("secret-value");
     expect(config.env).toMatchObject({
       OPENCODE_SERVER_USERNAME: "quoder",
@@ -1182,7 +1182,7 @@ describe("authenticated server startup lifecycle", () => {
 
     expect(server.url).toBe("http://127.0.0.1:4096");
     expect(spawnServer).toHaveBeenCalledWith(expect.objectContaining({
-      args: ["serve", "--pure", "--hostname=127.0.0.1", "--port=0"],
+      args: ["serve", "--hostname=127.0.0.1", "--port=0"],
     }));
     expect(verifyAuthentication).toHaveBeenCalledWith(
       "http://127.0.0.1:4096",

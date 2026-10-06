@@ -37,7 +37,7 @@ const describeOutcome = (outcome: TurnOutcome, theme: Theme): string | undefined
         "warning",
         [
           `OpenCode asked for permission (${describePermission(outcome)}).`,
-          "Quoder cannot grant permissions interactively yet, so the request was not granted and the turn ended.",
+          "The permission request was rejected; the requested operation did not complete.",
         ].join("\n"),
       );
     case "question-rejected": {

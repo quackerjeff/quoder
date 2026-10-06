@@ -68,8 +68,12 @@ The pinned SDK helper does not expose a child-environment or authentication opti
 Local server command:
 
 ```bash
-npx --no-install opencode serve --pure --hostname 127.0.0.1 --port <port>
+npx --no-install opencode serve --hostname 127.0.0.1 --port <port>
 ```
+
+The Quoder launcher omits `--pure` and registers a `shell.env` plugin from a final `OPENCODE_CONFIG_CONTENT` merge. This does not isolate credentials for the Core V2 Bash tool in `opencode-ai@1.18.33`: pinned `packages/core/src/tool/bash.ts` marks plugin `shell.env` support as TODO and creates the child process directly. A bounded user-guided tool-shell probe confirmed that `OPENCODE_CONFIG_CONTENT` and `OPENCODE_SERVER_PASSWORD` were nonempty. A shell trampoline also needs a reliable config channel: Core V2 Bash reads `shell` from filesystem-backed Core V2 `Config.entries()` and passes it to `ChildProcess.make`; the existing inline config merge is not verified as a Core V2 override. Do not claim an inline-config shell wrapper runs for Core V2. Same-user processes can inspect an owned server's environment using `ps eww`, and local MCP child processes also inherit `process.env`. OpenCode 1.18.34 does not fix those paths. Treat runtime isolation as failed until a comprehensive process boundary is implemented and live-verified. Since other plugins execute in the server process and can access its environment, Quoder scans the target and its ancestor OpenCode project layers before launch and rejects project plugin configuration or `.opencode/plugins` / `.opencode/plugin` sources. Project OpenCode settings remain enabled for targets without project plugins. User-level plugins remain trusted.
+
+Group 3 verification: unit coverage confirms project settings without plugin sources are accepted, root/nested/ancestor plugin sources are rejected, and the `shell.env` hook function blanks the server credentials and inherited inline config when called. This does not establish invocation by Core V2 Bash; pinned 1.18.33 source explicitly records that hook integration as TODO, and runtime probing confirmed the two credential/config variables remain nonempty. Authenticated server startup and native save scope/revocation passed no-model runtime checks. Credential isolation remains a release blocker.
 
 ### Project Directory / Location
 
@@ -201,7 +205,20 @@ client.v2.session.permission.reply({
 
 Wire contract: `POST /api/session/{sessionID}/permission/{requestID}/reply`, returning HTTP 204.
 
-Sources: `Permission2.reply` and `V2SessionPermissionReplyData`/responses in the local declarations. Use one-time approval; do not persist an `always` rule. Verified live on 2026-10-02: `reply: "once"` returned HTTP 204, followed by a `permission.v2.replied` event (`reply=once`).
+Sources: `Permission2.reply` and `V2SessionPermissionReplyData`/responses in the local declarations. The Milestone 0/1 probe uses one-time approval. Verified live on 2026-10-02: `reply: "once"` returned HTTP 204, followed by a `permission.v2.replied` event (`reply=once`). Milestone 3 must separately verify before offering persistent approval.
+
+### Milestone 3 Security Prerequisites (research, 2026-10-04)
+
+These are verified findings from the pinned SDK declarations, current harness code, and the Milestone 1 research record. They document the implementation starting point; they do not mean Milestone 3 security hardening is complete.
+
+- The pinned `PermissionV2Reply` declaration is `"once" | "always" | "reject"`. `Permission2.reply` takes `sessionID`, `requestID`, optional `reply`, and optional `message`; the wire route is `POST /api/session/{sessionID}/permission/{requestID}/reply`. The declaration also gives `Permission2.create` a `save?: string[]` field. Source: `node_modules/@opencode-ai/sdk/dist/v2/gen/types.gen.d.ts` and `sdk.gen.d.ts` in SDK 1.18.33.
+- The pinned executable bundle implements `PermissionV2.reply`: `reject` fails the pending request; `once` resolves only that request; `always` with a nonempty `request.save` inserts one saved permission per save pattern using the current OpenCode project ID and the request action, then resolves the request. The permission evaluator loads saved permissions for that same project ID and merges them as allow rules. Evidence: readable bundled source in `node_modules/opencode-ai/bin/opencode.exe` for `opencode-ai@1.18.33` (`PermissionSaved.add/list` and `PermissionV2.configured/ask/assert/reply`); generated types alone do not show this behavior.
+- Therefore, “Allow for project” can only accurately mean “send `always` for this request, saving OpenCode's `request.save` patterns for this action and project.” The UI must show those patterns and must not offer this choice when `save` is empty. It must not imply that persistence is limited to the request's `resources` unless those sets are equal. The sibling-request auto-allow logic is also native OpenCode behavior when saved rules cover their resources.
+- `PermissionSavedInfo` declares `id`, `projectID`, `action`, and `resource`; the generated list accepts a `projectID` query, and the generated remove endpoint deletes by saved-record ID. The runtime source stores saved rows in OpenCode's permission table, keyed by project ID, action, and resource. Project scoping and persistence are confirmed at pinned-bundle source level; the existing live probe verified the `once` response only. A dedicated runtime scenario for `always` is not recorded and should be covered by permission integration/QA without a model prompt.
+- Legacy shell hook behavior does not apply to the Core V2 Bash path used by Quoder. The pinned `packages/core/src/tool/bash.ts` implementation explicitly has a TODO to add plugin `shell.env` augmentation and invokes its child process without that hook. The runtime probe confirmed `OPENCODE_SERVER_PASSWORD` and `OPENCODE_CONFIG_CONTENT` remain nonempty. The function-level hook test proves only the hook's transformation if invoked; it is not isolation evidence. `OPENCODE_PURE` is removed from Quoder's owned server environment, but this does not fix the Core V2 gap. A different credential-isolation mechanism is required before interactive permission grants can be enabled.
+- `SessionV2Info` declares optional `parentID`; generated global session-created/updated events carry session information. Current `startEventMonitor` accepts only session IDs already recognized by its `isOwnSession` predicate, and the harness registers only its top-level session. The child-session event ordering and complete ownership strategy still require verification before relying on this field.
+- `src/harness/project.ts` currently canonicalizes the path returned by `git rev-parse --show-toplevel`, but does not verify that the canonical launch directory is within that root. Prior Milestone 1 security review identified a crafted `core.worktree` redirection risk. Containment must be checked before using the root to scope saved permissions.
+- `OpenCodeAdapter.replyPermission` currently defaults an omitted reply to `"once"`; remove this default before any grant path is connected. Project labels and root paths displayed by the REPL also need `sanitizeLine` before styling.
 
 ### Cancellation
 
@@ -380,7 +397,7 @@ npm install --save-exact marked@18.0.14 highlight.js@11.12.0
 
 - Local CLI invocation: `npx --no-install opencode`.
 - The user-level OpenCode config has no explicit permission policy. Under it, the `external_directory` trigger returned `effect: "ask"` live on 2026-10-02. A model-run `bash` command and the `glob` tool executed without a permission request.
-- **Known limitation for Milestone 1:** in 1.18.33, OpenCode's shell tool inherits the server process environment, so model-run commands can read `OPENCODE_SERVER_PASSWORD` and call the local authenticated server API, including permission replies. The feasibility probe gains no privilege from this, because it already grants `bash` and answers its own request. Before Quoder forwards real user permission decisions, it must keep server credentials out of tool environments, for example with a `shell.env` plugin hook or an upstream fix.
+- **Milestone 3 verification scope:** OpenCode 1.18.33 Core V2 Bash launches child processes without calling plugin `shell.env` hooks (pinned source TODO at `packages/core/src/tool/bash.ts`). The disposable tool-shell probe confirmed `OPENCODE_SERVER_PASSWORD` and `OPENCODE_CONFIG_CONTENT` were nonempty. The shell hook's unit test does not validate this runtime boundary. Credential isolation is failed; the permission decision gate remains default-off until an alternate isolation mechanism is implemented, reviewed, and live-verified.
 - The provider configuration contains an inline authorization credential. It is not reproduced here. Rotate it and move it to an environment/secret mechanism before capturing live probe logs.
 - A sandbox may require localhost-bind permission and writable XDG data/state directories; that is an execution-environment concern, not an OpenCode API limitation.
 
@@ -767,3 +784,50 @@ capability verdict above remains FAIL until that run.
 - [x] Deterministic `ask` action identified from official V2 defaults and the real permission-create API.
 - [x] Cancellation ordering documented without inventing a terminal event.
 - [x] Native Core V2 deletion is absent, but the bundled legacy delete endpoint was verified to remove a Core V2-created session under 1.18.33; post-delete Core V2 lookup returned 404.
+
+## Model-run tool sandbox (OpenCode 1.18.33, macOS)
+
+Confirmed by running the pinned binary; the probe is `npm run verify:sandbox`.
+
+- **The server password cannot be kept out of the server process.** Core V2 reads it only from the
+  environment (`ServerAuth.Config` declares `password: Config.string("OPENCODE_SERVER_PASSWORD")`),
+  and `opencode serve --help` exposes only `--port`, `--hostname`, `--mdns`, `--mdns-domain`,
+  `--cors`, `--pure`, and logging flags. There is no file, descriptor, or socket delivery path, so
+  hiding the credential is not achievable and the boundary must remove the capability to use it.
+- **Core V2 Bash honours a configured `shell`.** A marker file confirmed the configured shell is
+  executed, both when supplied through `OPENCODE_CONFIG_CONTENT` and through project config.
+  Project config has later precedence, so Quoder rejects a project `shell` before launch.
+- **`opencode debug agent <name> --tool bash --params '{...}'` runs the Bash tool with no model.**
+  This is the basis of the deterministic sandbox probe and replaces the earlier model prompt.
+- **`opencode serve` performs no startup configuration validation.** Malformed
+  `OPENCODE_CONFIG_CONTENT`, unknown keys, a wrong-typed `shell`, and a malformed project
+  `opencode.jsonc` all start normally. A config that never took effect fails silently, so Quoder
+  asserts the resolved configuration after startup by reading `GET /config`, which returns the
+  resolved document including `shell` and `mcp`.
+- **`--port=0` is not purely ephemeral.** It prefers 4096 and falls back to an ephemeral port when
+  4096 is held. Concurrent servers on the same and on different projects start without conflict.
+
+### Seatbelt rules that behave unexpectedly
+
+Each of these caused a silent or fatal failure during implementation:
+
+- **Paths must be realpath-resolved.** `(deny file-read* (subpath "/var/..."))` does not match the
+  kernel's `/private/var/...`; the denial is lost with no error and the file is readable.
+- **`env -i` is fatal under `(deny process-info*)`** — SIGTRAP, exit 133, during loader startup.
+  Use `env -u NAME` per variable instead.
+- **`(deny network-inbound ...)` breaks DNS**, because the resolver binds a local socket
+  (`bind: Operation not permitted`). Deny only outbound loopback.
+- **`(deny process-info*)` alone breaks HTTPS.** It must be followed by
+  `(allow process-info* (target self))`.
+- **A sandboxed process cannot relax its profile**: a nested `sandbox-exec` with `(allow default)`
+  fails with `sandbox_apply: Operation not permitted`.
+- **Seatbelt refuses to exec setuid binaries under any profile**, so `/bin/ps` reports
+  `Operation not permitted` inside the sandbox regardless of the rules.
+
+### Process-environment exposure
+
+`ps -axeww` does expose same-user process environments on this host. An unprivileged
+`KERN_PROCARGS2` read does not, so the exposure depends on `/bin/ps` being setuid root. Because
+`webfetch` runs inside the unsandboxed server process and can still reach loopback, the password
+must stay unharvestable as well as unusable from the shell; the sandbox blocks `ps` and denies
+outbound loopback.

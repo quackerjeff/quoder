@@ -72,17 +72,34 @@ export interface PromptResult {
  */
 export class SessionTracker {
   readonly #sessions = new Map<string, { permissions: PermissionAsked[]; questions: QuestionAsked[] }>();
+  readonly #owners = new Map<string, string>();
 
   register(sessionID: string): void {
     this.#sessions.set(sessionID, { permissions: [], questions: [] });
+    this.#owners.set(sessionID, sessionID);
+  }
+
+  /** Registers a session only when its reported parent already belongs to this execution tree. */
+  registerChild(sessionID: string, parentID: string | undefined): boolean {
+    if (parentID === undefined) return false;
+    const owner = this.#owners.get(parentID);
+    if (owner === undefined) return false;
+    if (!this.#sessions.has(sessionID)) this.#sessions.set(sessionID, { permissions: [], questions: [] });
+    this.#owners.set(sessionID, owner);
+    return true;
   }
 
   unregister(sessionID: string): void {
-    this.#sessions.delete(sessionID);
+    for (const [candidate, owner] of this.#owners) {
+      if (owner === sessionID) {
+        this.#owners.delete(candidate);
+        this.#sessions.delete(candidate);
+      }
+    }
   }
 
   owns(sessionID: string): boolean {
-    return this.#sessions.has(sessionID);
+    return this.#owners.has(sessionID);
   }
 
   notePermission(permission: PermissionAsked): void {
@@ -94,11 +111,15 @@ export class SessionTracker {
   }
 
   permissions(sessionID: string): readonly PermissionAsked[] {
-    return this.#sessions.get(sessionID)?.permissions ?? [];
+    return [...this.#sessions]
+      .filter(([candidate]) => this.#owners.get(candidate) === sessionID)
+      .flatMap(([, state]) => state.permissions);
   }
 
   questions(sessionID: string): readonly QuestionAsked[] {
-    return this.#sessions.get(sessionID)?.questions ?? [];
+    return [...this.#sessions]
+      .filter(([candidate]) => this.#owners.get(candidate) === sessionID)
+      .flatMap(([, state]) => state.questions);
   }
 }
 

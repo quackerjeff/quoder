@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { realpath } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -27,10 +27,25 @@ export const gitTopLevel: GitTopLevel = async (directory) => {
   }
 };
 
+async function canonicalPath(path: string): Promise<string> {
+  const resolved = resolve(path);
+  return realpath(resolved).catch(() => resolved);
+}
+
+function containsPath(parent: string, candidate: string): boolean {
+  const relativePath = relative(parent, candidate);
+  return relativePath === "" ||
+    (!isAbsolute(relativePath) && relativePath !== ".." && !relativePath.startsWith(`..${sep}`));
+}
+
 export async function resolveProject(directory: string, topLevel: GitTopLevel = gitTopLevel): Promise<Project> {
-  const resolved = resolve((await topLevel(directory)) ?? directory);
-  // OpenCode silently drops the first prompt on a fresh server when the session directory differs
-  // textually from the server's resolved cwd (verified live), so the root is always canonical.
-  const root = await realpath(resolved).catch(() => resolved);
+  const launchDirectory = await canonicalPath(directory);
+  const gitDirectory = await topLevel(directory);
+  const candidate = gitDirectory === undefined ? launchDirectory : await canonicalPath(gitDirectory);
+  // A crafted .git/config core.worktree can make Git report a root outside the launched tree.
+  // Only accept a canonical Git root that actually contains the canonical launch directory.
+  const root = gitDirectory !== undefined && containsPath(candidate, launchDirectory)
+    ? candidate
+    : launchDirectory;
   return { root, name: basename(root) || root };
 }

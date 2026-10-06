@@ -145,7 +145,7 @@ describe("verified OpenCode 1.18.33 request payloads", () => {
       resources: ["/tmp/quoder-outside"],
       agent: "build",
     });
-    await adapter.replyPermission("session-1", "permission-1");
+    await adapter.replyPermission("session-1", "permission-1", "once");
 
     expect(methods.createPermission).toHaveBeenCalledWith(
       {

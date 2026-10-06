@@ -63,9 +63,28 @@ describe("shared run-long event monitor", () => {
     await settle();
 
     expect(asked).toHaveBeenCalledOnce();
-    expect(asked).toHaveBeenCalledWith({ sessionID: "own", requestID: "p-own", action: "external_directory", resourceCount: 2 });
+    expect(asked).toHaveBeenCalledWith({
+      sessionID: "own",
+      requestID: "p-own",
+      action: "external_directory",
+      resourceCount: 2,
+      resources: ["/a", "/b"],
+      save: [],
+    });
     await expect(monitor.waitForPermissionAsked("own", "p-own", 50)).resolves.toBe("observed");
     await expect(monitor.waitForPermissionAsked("other", "p-other", 20)).resolves.toBe("timeout");
+    await monitor.stop();
+  });
+
+  it("reports native permission replies only for sessions in the owned tree", async () => {
+    const replied = vi.fn();
+    const { events, monitor } = await monitorWith({ onPermissionReplied: replied });
+    events.push(event("permission.v2.replied", { id: "evt1", sessionID: "own", requestID: "p1", reply: "reject" }));
+    events.push(event("permission.v2.replied", { id: "evt2", sessionID: "other", requestID: "p2", reply: "once" }));
+    await settle();
+
+    expect(replied).toHaveBeenCalledOnce();
+    expect(replied).toHaveBeenCalledWith("own", "p1");
     await monitor.stop();
   });
 
@@ -123,6 +142,48 @@ describe("shared run-long event monitor", () => {
 });
 
 describe("monitor reporting for the harness", () => {
+  it("reports child session metadata before later child permission events are filtered", async () => {
+    const owned = new Set(["parent"]);
+    const register = vi.fn((sessionID: string, parentID: string | undefined) => {
+      if (parentID !== undefined && owned.has(parentID)) owned.add(sessionID);
+    });
+    const asked = vi.fn();
+    const { events, monitor } = await monitorWith({
+      isOwnSession: (sessionID) => owned.has(sessionID),
+      onSessionRegistered: register,
+      onPermissionAsked: asked,
+    });
+
+    events.push(event("session.created", {
+      id: "metadata-event",
+      sessionID: "child",
+      info: { id: "child", parentID: "parent" },
+    }));
+    events.push(event("permission.v2.asked", {
+      id: "p-child",
+      sessionID: "child",
+      action: "external_directory",
+      resources: ["/tmp/resource"],
+    }));
+    events.push(event("session.created", {
+      id: "unrelated-event",
+      sessionID: "unrelated-child",
+      info: { id: "unrelated-child", parentID: "unrelated-parent" },
+    }));
+    events.push(event("permission.v2.asked", {
+      id: "p-unrelated",
+      sessionID: "unrelated-child",
+      action: "bash",
+      resources: [],
+    }));
+    await settle();
+
+    expect(register).toHaveBeenCalledWith("child", "parent");
+    expect(asked).toHaveBeenCalledOnce();
+    expect(asked).toHaveBeenCalledWith(expect.objectContaining({ sessionID: "child", requestID: "p-child" }));
+    await monitor.stop();
+  });
+
   it("reports a question when it arrives, before rejecting it", async () => {
     const order: string[] = [];
     const rejectQuestion = vi.fn(async () => {

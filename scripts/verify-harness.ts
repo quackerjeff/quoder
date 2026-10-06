@@ -25,7 +25,7 @@ const execFileAsync = promisify(execFile);
 const RUN_TIMEOUT_MS = 420_000;
 /** Cancel the third prompt once it streams text, or after this long if it has not. */
 const CANCEL_FALLBACK_MS = 15_000;
-const SERVER_COMMAND = "opencode serve --pure --hostname=127.0.0.1 --port=0";
+const SERVER_COMMAND = "opencode serve --hostname=127.0.0.1 --port=0";
 const TRACK_INTERVAL_MS = 500;
 const SEED_FILE = "notes.txt";
 const PROMPTS = [

@@ -81,6 +81,29 @@ const run = (adapter: OpenCodeAdapter, tracker = new SessionTracker(), cancel = 
     ...extra,
   });
 
+describe("session tree ownership", () => {
+  it("associates child sessions with one execution and excludes unrelated sessions", () => {
+    const tracker = new SessionTracker();
+    tracker.register("parent");
+
+    expect(tracker.registerChild("child", "parent")).toBe(true);
+    expect(tracker.registerChild("grandchild", "child")).toBe(true);
+    expect(tracker.registerChild("unrelated", "unknown-parent")).toBe(false);
+    expect(tracker.owns("grandchild")).toBe(true);
+    expect(tracker.owns("unrelated")).toBe(false);
+
+    tracker.notePermission({ sessionID: "child", requestID: "p-child", action: "bash", resourceCount: 1, resources: ["/tmp/x"], save: [] });
+    tracker.noteQuestion({ sessionID: "grandchild", requestID: "q-grandchild", questions: [] });
+    expect(tracker.permissions("parent")).toHaveLength(1);
+    expect(tracker.questions("parent")).toHaveLength(1);
+
+    tracker.unregister("parent");
+    expect(tracker.owns("parent")).toBe(false);
+    expect(tracker.owns("child")).toBe(false);
+    expect(tracker.owns("grandchild")).toBe(false);
+  });
+});
+
 describe("one prompt in one fresh OpenCode session", () => {
   it("answers, then deletes the session it created, binding the model and project directory", async () => {
     const { adapter, calls, raw } = fakeAdapter({ messages: [user("input-1"), assistant("Done.")], runningPolls: 2 });
@@ -112,7 +135,7 @@ describe("one prompt in one fresh OpenCode session", () => {
     const original = tracker.register.bind(tracker);
     vi.spyOn(tracker, "register").mockImplementation((sessionID) => {
       original(sessionID);
-      tracker.notePermission({ sessionID, requestID: "per_1", action: "external_directory", resourceCount: 1 });
+      tracker.notePermission({ sessionID, requestID: "per_1", action: "external_directory", resourceCount: 1, resources: ["/outside"], save: [] });
     });
 
     const result = await run(adapter, tracker);
@@ -232,7 +255,7 @@ describe("one prompt in one fresh OpenCode session", () => {
     const original = tracker.register.bind(tracker);
     vi.spyOn(tracker, "register").mockImplementation((sessionID) => {
       original(sessionID);
-      tracker.notePermission({ sessionID, requestID: "per_1", action: "external_directory", resourceCount: 1 });
+      tracker.notePermission({ sessionID, requestID: "per_1", action: "external_directory", resourceCount: 1, resources: ["/outside"], save: [] });
       tracker.noteQuestion({ sessionID, requestID: "que_1", questions: [{ question: "Sure?", options: [] }] });
     });
 

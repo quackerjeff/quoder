@@ -6,7 +6,7 @@ import { createOpencodeClient, type ModelRef } from "@opencode-ai/sdk/v2";
 
 import { Harness, type HarnessTraceEvent } from "./harness/repl.js";
 import { resolveProject } from "./harness/project.js";
-import { launchAuthenticatedOpenCodeServer } from "./opencode-server.js";
+import { launchSandboxedOpenCodeServer } from "./opencode-server.js";
 import { IsolatedMarkdownRenderer } from "./ui/isolated-render.js";
 import { colorEnabled, createTheme } from "./ui/style.js";
 import { packagePath } from "./package-root.js";
@@ -95,7 +95,8 @@ async function main(): Promise<number> {
       renderMarkdown: (source, theme) => markdown.render(source, theme),
     },
     {
-      launchServer: (options) => launchAuthenticatedOpenCodeServer(options),
+      // The sandboxed launcher keeps a leaked server credential unusable by model-run tools.
+      launchServer: (options) => launchSandboxedOpenCodeServer(options),
       createClient: (baseUrl, authorization) => createOpencodeClient({ baseUrl, headers: { Authorization: authorization } }),
       ...(trace === undefined ? {} : { trace }),
     },
