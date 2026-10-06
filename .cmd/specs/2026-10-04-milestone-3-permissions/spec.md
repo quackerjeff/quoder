@@ -30,7 +30,7 @@ The event monitor is the source of permission requests because `permission.v2.as
 
 Project identity is the canonical project root. Accept a Git-reported root only if the canonical launch directory is that root or a descendant. Project-scoped saved permissions must be confirmed to use this identity and must not apply to other projects.
 
-Reducing the usability of the authenticated server credential by model-callable processes is desirable but optional. Existing research identified an OpenCode `shell.env` hook, but pinned Core V2 Bash does not call it. The macOS Seatbelt approach in Group 3.1 is implemented and covers one of OpenCode's two Bash spawn paths; it does not cover the Core V2 path the harness uses, because `Shell.preferred()` discards a shell whose filename is not a recognised shell name. This is tracked as follow-up hardening and does not block grants. Single-developer, local-only tool: the residual risk is self-approval under prompt injection, which is accepted and documented.
+Reducing the usability of the authenticated server credential by model-callable processes is desirable but optional. Existing research identified an OpenCode `shell.env` hook, but pinned Core V2 Bash does not call it. The macOS Seatbelt approach in Group 3.1 covers a different OpenCode Bash spawn path; it does not cover the Core V2 session path the harness uses, because `Shell.preferred()` discards a shell whose filename is not a recognised shell name. This is tracked as follow-up hardening and does not block grants. For this single-developer, local-only tool, the residual risk is self-approval under prompt injection; it is accepted and documented.
 
 Any persistent preference behavior must be explicit, project-scoped, inspectable, and reversible where the native API supports it. For the pinned version, inspect and remove saved permissions through OpenCode's saved-permission APIs; do not create a parallel Quoder policy store.
 
@@ -74,7 +74,7 @@ Keyboard guidance: `A`, `P`, and `D` are case-insensitive single keypresses. Ret
 
 ## Risks
 
-- Removing `--pure` enables plugin loading. The `shell.env` hook does not run for Core V2 Bash. Quoder rejects project targets with project plugin configuration or plugin directories, preserving other project OpenCode configuration. User-level plugins remain trusted. Runtime credential isolation remains failed; Group 3.1 records the unresolved Seatbelt/configuration integration blocker.
+- Removing `--pure` enables plugin loading. The `shell.env` hook does not run for Core V2 Bash. Quoder rejects project targets with project plugin configuration or plugin directories, preserving other project OpenCode configuration. User-level plugins remain trusted. Runtime credential isolation is not established on the harness path; this is an accepted defense-in-depth gap and does not block permission prompts.
 - A permission event can arrive before a create call returns; monitor registration and pending-request state must not lose it.
 - A child session may request permission before its parent is visibly registered. Child-session tracking must account for event ordering.
 - The persisted `save` patterns may be broader than the immediate request resources. Display their exact scope and require explicit confirmation of it.
@@ -88,7 +88,7 @@ Keyboard guidance: `A`, `P`, and `D` are case-insensitive single keypresses. Ret
 - An ask operation is surfaced and awaits a decision.
 - A denied operation is blocked by OpenCode.
 - Outside-project read and edit requests follow the verified project policy.
-- Model-run shells cannot access the authenticated server credentials.
+- Permission requests are displayed for explicit developer review; credential isolation remains defense in depth and is not an exit gate.
 - Untrusted Git metadata cannot redirect project scope outside the launch directory.
 - Requests from subagent sessions are handled without bypassing OpenCode.
-- General review, security review, and required QA pass; documentation reflects actual behavior.
+- General review, security review, and QA pass for the restated permission-prompt scope; documentation reflects actual behavior and clearly discloses that model-run tools are unconfined.

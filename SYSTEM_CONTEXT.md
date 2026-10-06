@@ -102,7 +102,7 @@ Deployment notes:
 
 Known failure modes or sensitive areas:
 - OpenCode Core V2 contracts are verified only for the pinned 1.18.33. The nine-capability feasibility passed on 2026-10-03 (Milestone 0).
-- In 1.18.33, model-run shell commands inherit the OpenCode server's credentials. They must be withheld before Quoder forwards real permission decisions (Milestone 3).
+- In 1.18.33, model-run shell commands inherit the OpenCode server's credentials, and the Seatbelt trampoline is not honored on the Core V2 session Bash path. Credential isolation is defense in depth, not a gate on the enabled permission prompts; the UI discloses that model-run tools are unconfined. The single-developer, local-only self-approval risk is accepted and documented in the active Milestone 3 decision record.
 - OpenCode 1.18.33 intermittently drops the first prompt on a fresh server (admitted, never started). Quoder detects this within 5 s and retries once in a fresh session.
 - Model and tool output is untrusted and is displayed live. Terminal-escape injection and rendering-based freezes are mitigated by post-lex sanitization, worker-isolated Markdown rendering with deadlines, and linear main-thread text handling (Milestone 2 security review).
 - Session cleanup failures could retain unwanted model context or orphan resources.

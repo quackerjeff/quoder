@@ -1,5 +1,10 @@
 # QA Report: Milestone 3 — Interactive Permission Handling
 
+> The dated cycles below are retained as history. The current verdict is the final
+> 2026-10-06 section, which evaluates the restated scope: permission prompts are enabled,
+> credential isolation is defense in depth, and the UI discloses that model-run tools are
+> unconfined.
+
 ## Cycle 1 — 2026-10-05
 Validating: Group 8 tasks
 

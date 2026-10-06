@@ -121,7 +121,7 @@ Known limitations:
   `npm run verify:sandbox:negative` demonstrate that on the path they exercise.
   That path is not the one the harness uses, so treat the password as readable
   and the boundary as not in force. macOS only; other platforms fail closed.
-  Other hardening items are listed in the Milestone 1 and 2 specs'
+  Other hardening follow-ups are listed in the Milestone 3 spec's
   `decisions.md` and in `docs/backlog.md`.
 - **Model nondeterminism.** The model does not always follow instructions
   exactly.
