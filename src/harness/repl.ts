@@ -73,7 +73,15 @@ export interface HarnessDependencies {
   readonly operationTimeoutMs?: number;
   /** How long an admitted prompt may stay idle without a response before it counts as dropped. */
   readonly noResponseTimeoutMs?: number;
-  /** Kept off until the Group 7 security review clears the prerequisite boundary. */
+  /**
+   * Enables the interactive permission prompt. Defaults to off so non-interactive embedders and
+   * tests keep the deny-by-default behaviour; `cli.ts` turns it on.
+   *
+   * This is deliberately not gated on model-run tool sandboxing. The permission prompt shows what
+   * is about to run and lets you refuse it; it is not a containment boundary, because an approved
+   * Bash command already carries full host-user authority. Credential isolation hardens the prompt
+   * against self-approval but is not a precondition for having one.
+   */
   readonly permissionDecisionsEnabled?: boolean;
   readonly trace?: (event: HarnessTraceEvent) => void;
 }
@@ -230,13 +238,14 @@ export class Harness {
       return this.#shutdownOnce(1);
     }
     if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
-    // Do not claim the sandbox here. OpenCode 1.18.33 has two Bash implementations: one uses the
-    // configured `shell` verbatim, the other passes it through `Shell.preferred()`, which only
-    // accepts recognised shell names and otherwise silently falls back to the default shell.
-    // Quoder's trampoline is not a recognised name, so the boundary does not hold on that path.
-    // Until the trampoline is accepted by both, stating "sandboxed" would be a false assurance.
+    // State the actual posture rather than claiming a boundary. Permission prompts are on, and
+    // an approved Bash command carries full host-user authority: OpenCode's own advisory says
+    // "Bash runs with host-user filesystem, process, and network authority". The model-run tool
+    // sandbox is not in force on the Core V2 Bash path (see decisions.md), so nothing here should
+    // be read as containment.
     this.#write(
-      `${theme.paint("error", "Model-run tool sandbox is NOT verified on this path.")} ${theme.paint("dim", "Treat model-run commands as unconfined; see decisions.md.")}\n`,
+      `${theme.paint("dim", "Permission prompts on")} ${theme.paint("dim", "·")} `
+      + `${theme.paint("dim", "approved commands run with your full user authority; model-run tools are unconfined")}\n`,
     );
     this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
     let input = this.#options.input;
@@ -329,7 +338,7 @@ export class Harness {
     }
 
     this.#notice(this.#options.terminal
-      ? "Interactive permission decisions are disabled pending security review; Quoder is denying the request.\n"
+      ? "Interactive permission decisions are off in this harness configuration; Quoder is denying the request.\n"
       : "OpenCode requested permission in non-interactive mode; Quoder is denying the request.\n");
     void this.#replyToPermission(server, permission, "reject", false);
   }

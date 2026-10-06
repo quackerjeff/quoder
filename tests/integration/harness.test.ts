@@ -589,13 +589,15 @@ describe("quoder harness (Milestone 1)", () => {
 });
 
 describe("quoder harness in an interactive terminal", () => {
-  it("denies requests while the permission decision gate is disabled", async () => {
+  // The CLI enables decisions; this covers the off configuration that embedders and the
+  // non-interactive paths still rely on.
+  it("denies requests when the permission decision gate is not enabled", async () => {
     const run = startHarness({ terminal: true });
     await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
     run.input.write("perm read outside\r");
 
     await vi.waitFor(() => expect(run.calls).toContain("permission:per_ses_1:reject"));
-    expect(run.output()).toContain("Interactive permission decisions are disabled pending security review");
+    expect(run.output()).toContain("Interactive permission decisions are off in this harness configuration");
     expect(run.output()).not.toContain("[A] Allow once");
     await vi.waitFor(() => expect(run.output()).toContain("OpenCode asked for permission"));
     run.input.write("\u0004");

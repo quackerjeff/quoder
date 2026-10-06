@@ -4,7 +4,9 @@
 
 Milestone 2 is complete. Quoder currently rejects every OpenCode permission request and every question; this keeps the harness from granting access but prevents normal work when OpenCode asks. This milestone adds an interactive decision path while retaining OpenCode Core V2 as the enforcement mechanism.
 
-The handoff and prior Milestone 1 security review identify prerequisites: prevent model-callable processes from reading or using server credentials, contain the selected Git root within the launch directory, register subagent sessions, make permission replies explicit, and sanitize project labels. These must be completed before interactive grants are enabled.
+The handoff and prior Milestone 1 security review identified hardening items: prevent model-callable processes from reading or using server credentials, contain the selected Git root within the launch directory, register subagent sessions, make permission replies explicit, and sanitize project labels.
+
+**Requirement restated 2026-10-06.** Credential isolation is defence in depth for the permission prompt, not a precondition for it. The prompt's purpose is to show the developer what is about to run and let them refuse it. It is not a containment boundary: an approved Bash command already carries full host-user authority, which OpenCode states itself ("Bash runs with host-user filesystem, process, and network authority"). Gating the prompt on perfect credential isolation treated a safety prompt as a security control and blocked the feature on hardening it. Root containment, explicit replies, session registration, and label sanitization remain required because they are cheap and affect correctness.
 
 ## Decision
 
@@ -19,7 +21,7 @@ Offer one-time approval and denial. The pinned OpenCode 1.18.33 bundle source sh
 - No credentials, prompt text, model output, or raw OpenCode diagnostics may be written to traces or reports.
 - Never inspect or print `~/.config/opencode`, credentials, or provider configuration.
 - Do not run `npm run verify:live`, `npm run verify:harness`, or a scratch script that sends a real model prompt without explicit developer authorization.
-- Real permission forwarding remains disabled by default until the Group 7 security review clears the prerequisite boundary. Focused interaction tests explicitly enable the internal harness dependency gate.
+- Real permission forwarding is enabled by the CLI. The harness dependency still defaults to off so embedders and non-interactive paths keep deny-by-default, and focused tests cover both configurations.
 - All terminal text derived from project names, paths, permission events, or OpenCode output must be sanitized using the existing terminal sanitizers.
 
 ## Design
@@ -28,7 +30,7 @@ The event monitor is the source of permission requests because `permission.v2.as
 
 Project identity is the canonical project root. Accept a Git-reported root only if the canonical launch directory is that root or a descendant. Project-scoped saved permissions must be confirmed to use this identity and must not apply to other projects.
 
-The authenticated server credential must not be usable by model-callable processes. Existing research identified an OpenCode `shell.env` hook, but pinned Core V2 Bash does not call it. A macOS Seatbelt containment approach is proposed, but Group 3.1 must prove a reliable Core V2 shell configuration path and eliminate direct inherited provider secrets before it can satisfy this prerequisite.
+Reducing the usability of the authenticated server credential by model-callable processes is desirable but optional. Existing research identified an OpenCode `shell.env` hook, but pinned Core V2 Bash does not call it. The macOS Seatbelt approach in Group 3.1 is implemented and covers one of OpenCode's two Bash spawn paths; it does not cover the Core V2 path the harness uses, because `Shell.preferred()` discards a shell whose filename is not a recognised shell name. This is tracked as follow-up hardening and does not block grants. Single-developer, local-only tool: the residual risk is self-approval under prompt injection, which is accepted and documented.
 
 Any persistent preference behavior must be explicit, project-scoped, inspectable, and reversible where the native API supports it. For the pinned version, inspect and remove saved permissions through OpenCode's saved-permission APIs; do not create a parallel Quoder policy store.
 

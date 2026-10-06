@@ -95,9 +95,11 @@ async function main(): Promise<number> {
       renderMarkdown: (source, theme) => markdown.render(source, theme),
     },
     {
-      // The sandboxed launcher keeps a leaked server credential unusable by model-run tools.
+      // The sandboxed launcher is defence in depth for the permission prompt, not a precondition
+      // for it. It does not yet cover the Core V2 Bash path; see the active spec's decisions.md.
       launchServer: (options) => launchSandboxedOpenCodeServer(options),
       createClient: (baseUrl, authorization) => createOpencodeClient({ baseUrl, headers: { Authorization: authorization } }),
+      permissionDecisionsEnabled: true,
       ...(trace === undefined ? {} : { trace }),
     },
   );

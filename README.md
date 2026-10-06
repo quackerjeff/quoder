@@ -2,8 +2,12 @@
 
 Quoder provides a persistent developer-facing shell while each prompt runs in a
 fresh, disposable OpenCode session. Milestones 1 (the minimal `quoder` harness)
-and 2 (streaming and live activity) are complete. The Milestone 0 feasibility
-probe remains as regression evidence.
+and 2 (streaming and live activity) are complete, and Milestone 3 adds
+interactive permission prompts. The Milestone 0 feasibility probe remains as
+regression evidence.
+
+Quoder is a single-developer local tool. It reviews what the model is about to
+do; it does not contain it. See "Known limitations".
 
 ## Using Quoder (Milestones 1–2)
 
@@ -90,25 +94,35 @@ How it behaves:
 
 Known limitations:
 
-- **No permissions are granted.** Any OpenCode permission request is rejected
-  and reported, and the model's interactive questions are rejected and shown so
-  you can answer in your next prompt. Interactive permission handling arrives
-  in Milestone 3.
+- **Permission prompts, not containment.** OpenCode permission requests are
+  shown so you can Allow once, Allow for project, or Deny. Approving a command
+  runs it with your full user authority — OpenCode's own advisory puts it as
+  "Bash runs with host-user filesystem, process, and network authority" — so the
+  prompt is a review step, not a sandbox. The model's interactive questions are
+  still rejected and shown so you can answer in your next prompt.
+- **Model-run tools are unconfined.** Quoder ships a macOS Seatbelt boundary for
+  model-run shells, but it does not cover the Core V2 Bash path the harness uses:
+  OpenCode's `Shell.preferred()` discards a configured shell whose filename is
+  not a recognised shell name. Treat anything the model runs as having your
+  authority, including the ability to read the OpenCode server password from the
+  process environment and reply to its own permission request. For a
+  single-developer local tool this is an accepted risk, recorded in the
+  Milestone 3 spec's `decisions.md`; the main exposure is prompt injection from
+  untrusted repository or web content.
 - **Multi-line editing.** Only the line you are typing can be edited; Up and
   Down recall earlier prompts. Full multi-line editing is in `docs/backlog.md`.
-- **Server password.** The OpenCode server's password necessarily stays in the
-  server process's own environment: the pinned OpenCode reads it only from
-  `OPENCODE_SERVER_PASSWORD` and offers no file or descriptor alternative.
-  Quoder therefore makes it useless rather than hidden. Every model-run shell
-  runs under a macOS Seatbelt profile that denies outbound loopback, reads of
-  Quoder's private configuration, and process inspection, and that a descendant
-  cannot relax. External network access still works. Check it with
-  `npm run verify:sandbox`, which drives the real OpenCode Bash tool with no
-  model call, and `npm run verify:sandbox:negative`, which disables the profile
-  and passes only if those checks then fail. macOS only; other platforms fail closed. Interactive permission
-  grants stay default-off pending the remaining Milestone 3 reviews. Other
-  hardening items are listed in the Milestone 1 and 2 specs' `decisions.md`
-  and in `docs/backlog.md`.
+- **Server password.** The OpenCode server's password stays in the server
+  process's own environment: the pinned OpenCode reads it only from
+  `OPENCODE_SERVER_PASSWORD` and offers no file or descriptor alternative, and
+  same-user `ps` can read it. Quoder ships a Seatbelt profile intended to make
+  it useless rather than hidden — denying outbound loopback, reads of Quoder's
+  private configuration, and process inspection, in a way a descendant cannot
+  relax — and `npm run verify:sandbox` plus
+  `npm run verify:sandbox:negative` demonstrate that on the path they exercise.
+  That path is not the one the harness uses, so treat the password as readable
+  and the boundary as not in force. macOS only; other platforms fail closed.
+  Other hardening items are listed in the Milestone 1 and 2 specs'
+  `decisions.md` and in `docs/backlog.md`.
 - **Model nondeterminism.** The model does not always follow instructions
   exactly.
 
@@ -136,9 +150,10 @@ MET` on 2026-10-04.
 **Capability verdict: PASS. Milestone 0 is passed (authoritative
 `npm run verify:live`, 2026-10-03: all nine predicates PASS; see "Milestone 0
 Live Result — 2026-10-03 authoritative PASS" in `docs/tech.md`).** Milestone 1 is
-complete (see above). Before Quoder forwards real permission decisions
-(Milestone 3), keep the OpenCode server's credentials out of model-run tool
-environments.
+complete (see above). Milestone 3 forwards real permission decisions; keeping
+the server's credentials away from model-run tools is tracked as follow-up
+hardening rather than a precondition, for the reasons in the Milestone 3 spec's
+`decisions.md`.
 
 Earlier authoritative run, 2026-10-03, 8 of 9 PASS: Permission handling failed
 because of the permission-event subscription race, which has since been fixed.

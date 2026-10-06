@@ -831,3 +831,24 @@ Each of these caused a silent or fatal failure during implementation:
 `webfetch` runs inside the unsandboxed server process and can still reach loopback, the password
 must stay unharvestable as well as unusable from the shell; the sandbox blocks `ps` and denies
 outbound loopback.
+
+## Permission grants enabled; sandbox scope correction (2026-10-06)
+
+- **Grants are enabled.** `src/cli.ts` supplies `permissionDecisionsEnabled: true`. The
+  `HarnessDependencies` flag still defaults to off so embedders and non-interactive paths keep
+  deny-by-default behaviour, and tests cover both configurations.
+- **Credential isolation is defence in depth, not a precondition.** The permission prompt is a
+  review affordance, not a containment boundary: an approved Bash command carries full host-user
+  authority by OpenCode's own advisory. Rationale and accepted residual risk are in
+  `.cmd/specs/2026-10-04-milestone-3-permissions/decisions.md`.
+- **OpenCode 1.18.33 has two Bash spawn paths with different shell resolution.** One passes the
+  configured `shell` through verbatim; the other calls `Shell.preferred(config.shell)`, which
+  accepts only recognised shell names from a built-in table (`bash`, `dash`, `fish`, `ksh`, …) and
+  otherwise silently falls back to the default shell. Quoder's trampoline is named
+  `quoder-model-shell`, so it is discarded on that second path, which is the one a Core V2 session
+  prompt uses. `npm run verify:sandbox` passes because it drives
+  `opencode debug agent --tool bash`, which takes the first path. It is regression evidence for
+  that path only, not for the harness.
+- **`/config` reports the V1 resolved document.** It reported Quoder's trampoline even when the
+  Core V2 tool path ignored it, while `/global/config` never reports `shell` at all. A runtime
+  assertion that reads `/config` therefore cannot prove the V2 tool path is sandboxed.

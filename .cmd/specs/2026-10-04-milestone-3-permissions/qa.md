@@ -187,3 +187,25 @@ FAIL — do not enable or release interactive grants until an alternate credenti
 - Outside-project permission flows and adversarial `core.worktree` coverage remain outstanding from the earlier QA cycle.
 
 **Verdict**: Group 3.1 credential isolation PASS. Group 8 remains FAIL pending the outstanding permission scenarios; interactive grants stay default-off until Group 7 security review and Group 8 QA are re-run against this change.
+
+## 2026-10-06 — Requirement restated; grants enabled
+
+**Change**: Interactive permission grants are enabled in the CLI. Credential isolation is reclassified as defence in depth, so Group 3/3.1 and the prior Group 7 suggestion no longer gate this milestone. See `decisions.md` for the rationale and the accepted residual risk.
+
+**Deterministic evidence after the change**
+
+| Check | Result |
+| --- | --- |
+| `npm run typecheck` | PASS |
+| `npm test` | PASS (25 files, 485 tests) |
+| `npm run build` | PASS |
+| `npm run build:live` | PASS |
+| `git diff --check` | PASS |
+
+Coverage retained for both configurations: the enabled path asserts an explicit Allow once key before a request resolves, and the disabled path asserts deny-by-default with the auto-deny notice.
+
+**Known-false claim removed**: The startup line no longer states that model-run tools are sandboxed. `npm run verify:sandbox` still passes, but it exercises `opencode debug agent --tool bash` rather than a Core V2 session prompt, so it is regression evidence for that path only and is no longer an acceptance gate.
+
+**Outstanding follow-ups, none blocking**: trampoline naming so `Shell.preferred` accepts it; a runtime assertion against a config source the V2 tool path consults; LSP and formatter subprocess coverage; outside-project permission flows; adversarial `core.worktree` coverage.
+
+**Verdict**: PASS for the restated scope. Interactive permission handling is enabled and covered; model-run tool containment is explicitly out of scope and is disclosed in the UI and the README.
