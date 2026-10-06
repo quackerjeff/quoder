@@ -230,6 +230,12 @@ export class Harness {
       return this.#shutdownOnce(1);
     }
     if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
+    // State the boundary explicitly. Without this line a stale build that launches an
+    // unsandboxed server is indistinguishable from a sandboxed one at the prompt, which has
+    // already caused a manual acceptance run to be misread.
+    this.#write(
+      `${theme.paint("dim", "Model-run tools sandboxed")} ${theme.paint("dim", "·")} ${theme.paint("dim", "macOS Seatbelt: loopback, private config and process inspection denied")}\n`,
+    );
     this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
     let input = this.#options.input;
     if (this.#options.terminal) {
