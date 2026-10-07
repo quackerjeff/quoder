@@ -10,7 +10,7 @@ Keep this file concise, factual, and current.
 - Service or application name: Quoder (working product name; PRD title: OpenCode Stateless Harness)
 - Primary language(s): TypeScript (Node 24, ESM)
 - Primary framework(s): OpenCode SDK/API (`@opencode-ai/sdk@1.18.33`, Core V2) with project-local `opencode-ai@1.18.33`, pinned exactly
-- Deployable unit: the local `quoder` command-line harness (`dist/cli.js`, installed with `npm link`)
+- Deployable unit: the local `quoder` command-line harness (`dist/cli.js` and its native diff reader, installed with `npm link`)
 
 ## Business Capability
 
@@ -28,6 +28,7 @@ Primary user or system served:
 - Harness state, context building, execution records, and project-level preferences
 - The adapter boundary through which Quoder drives OpenCode sessions
 - Git before/after inspection and user-facing execution summaries
+- Read-only final diff viewing, including safe untracked-text inspection
 
 ## What This Repo Does Not Own
 
@@ -56,6 +57,11 @@ Systems this repo depends on:
   - purpose: Resolve project identity and capture repository state before and after executions
   - contract location: Git CLI behavior used by the implementation
   - failure impact: Project launch or change reporting is unavailable
+- POSIX C compiler (`cc`) at build/test time
+  - purpose: Build the directory-relative native helper used to read untracked diff files without following symlinked path components
+  - supported build targets: macOS and Linux; QA validated macOS only so far
+  - contract location: `native/read-untracked.c` and `scripts/build-native-reader.mjs`
+  - failure impact: `npm run build` and `npm test` cannot build the safe untracked-file reader
 
 ## Downstream Consumers
 
@@ -96,7 +102,7 @@ Deployment environments:
 
 Deployment notes:
 - The initial product is local-first and has no cloud deployment requirement.
-- Packaging, distribution, CI, and supported platform decisions remain open.
+- Packaging, distribution, CI, and supported platform decisions remain open. The native untracked-diff reader is enabled for macOS/Linux builds; only macOS has been validated.
 
 ## Operational Risks
 

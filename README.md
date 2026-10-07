@@ -1,15 +1,14 @@
 # Quoder
 
 Quoder provides a persistent developer-facing shell while each prompt runs in a
-fresh, disposable OpenCode session. Milestones 1 (the minimal `quoder` harness)
-and 2 (streaming and live activity) are complete, and Milestone 3 adds
-interactive permission prompts. The Milestone 0 feasibility probe remains as
-regression evidence.
+fresh, disposable OpenCode session. Milestones 1–4 provide the harness,
+streaming and live activity, interactive permission prompts, and read-only Git
+awareness. The Milestone 0 feasibility probe remains as regression evidence.
 
 Quoder is a single-developer local tool. It reviews what the model is about to
 do; it does not contain it. See "Known limitations".
 
-## Using Quoder (Milestones 1–2)
+## Using Quoder (Milestones 1–4)
 
 Install the pinned dependencies, build, and put `quoder` on your `PATH`:
 
@@ -18,6 +17,10 @@ npm ci
 npm run build
 npm link
 ```
+
+Building the safe untracked-diff reader requires a POSIX C compiler (`cc`). The
+native reader has been built and validated on macOS; Linux is enabled by the
+build but has not yet been QA validated.
 
 Run it from any project directory:
 
@@ -54,6 +57,17 @@ How it behaves:
   project-local OpenCode server and keeps it for the whole harness session. Each
   prompt runs in a fresh session bound to the model. Afterwards the session is
   deleted and its deletion verified.
+- **Git awareness.** After each prompt, Quoder summarizes repository status
+  observed before and after execution. Changes already present before the
+  prompt are labeled pre-existing; the summary does not claim who made a
+  change. In a TTY, choose `v` to inspect the final diff or Return to continue.
+  The viewer shows 40 lines at a time (`n` next, `p` previous, `q` or Escape to
+  leave); leaving returns to the choice. In piped output, Quoder prints the
+  bounded diff automatically. Clean repositories have no empty diff choice.
+  Binary data and unsafe untracked paths are omitted, terminal controls are
+  sanitized, and the displayed diff is limited to 1 MiB. Outside a Git
+  repository or when Git inspection fails, Quoder reports that state without
+  preventing the prompt from running.
 - **Live activity.**
   - The answer streams as rendered Markdown, with syntax-highlighted code
     blocks.

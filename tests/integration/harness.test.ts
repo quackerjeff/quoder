@@ -4,6 +4,8 @@ import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import { describe, expect, it, vi } from "vitest";
 
 import type { EventMonitorOptions } from "../../src/event-monitor.js";
+import type { GitSnapshot, GitSnapshotResult } from "../../src/harness/git-state.js";
+import type { GitDiffDocument } from "../../src/harness/git-diff.js";
 import { Harness, type HarnessTraceEvent } from "../../src/harness/repl.js";
 import type { AuthenticatedServerOptions } from "../../src/opencode-server.js";
 import { createTheme, type Theme } from "../../src/ui/style.js";
@@ -14,6 +16,17 @@ const PROJECT = { root: "/work/QuackTrack", name: "QuackTrack" };
 const response = (status = 200): Response => new Response(null, { status });
 const result = <T>(data: T, status = 200) => ({ data, error: undefined, response: response(status) });
 const failedResult = (error: unknown, status: number) => ({ data: undefined, error, response: response(status) });
+
+const gitSnapshot = (paths: GitSnapshot["paths"] = [], trackedFiles = 0): GitSnapshot => ({
+  kind: "available",
+  root: PROJECT.root,
+  head: "0123456789abcdef0123456789abcdef01234567",
+  branch: "main",
+  branchState: "attached",
+  paths,
+  untrackedPaths: paths.filter(({ kind }) => kind === "untracked").map(({ path }) => path),
+  trackedDiff: { files: trackedFiles, additions: trackedFiles === 0 ? 0 : 2, deletions: trackedFiles === 0 ? 0 : 1, binaryFiles: 0 },
+});
 
 const gate = () => {
   let release: () => void = () => undefined;
@@ -234,6 +247,8 @@ interface HarnessRunOptions extends FakeOptions {
   readonly launchGate?: ReturnType<typeof gate>;
   readonly monitorUnconfirmed?: boolean;
   readonly theme?: Theme;
+  readonly gitSnapshots?: readonly GitSnapshotResult[];
+  readonly gitDiff?: GitDiffDocument;
 }
 
 const startHarness = (options: HarnessRunOptions = {}) => {
@@ -247,6 +262,18 @@ const startHarness = (options: HarnessRunOptions = {}) => {
   const trace: HarnessTraceEvent[] = [];
   const exits: Array<() => void> = [];
   const launchOptions: AuthenticatedServerOptions[] = [];
+  let gitSnapshotIndex = 0;
+  const gitCaptures: string[] = [];
+  const defaultGitSnapshot: GitSnapshotResult = {
+    kind: "available",
+    root: PROJECT.root,
+    head: "0123456789abcdef0123456789abcdef01234567",
+    branch: "main",
+    branchState: "attached",
+    paths: [],
+    untrackedPaths: [],
+    trackedDiff: { files: 0, additions: 0, deletions: 0, binaryFiles: 0 },
+  };
   const counts = { launched: 0, closed: 0, monitorsStopped: 0 };
   const harness = new Harness(
     {
@@ -291,6 +318,15 @@ const startHarness = (options: HarnessRunOptions = {}) => {
         };
       }),
       trace: (event) => trace.push(event),
+      captureGitSnapshot: vi.fn(async (root: string) => {
+        fake.calls.push(`git:capture:${gitSnapshotIndex}`);
+        gitCaptures.push(root);
+        const snapshots = options.gitSnapshots ?? [defaultGitSnapshot];
+        const snapshot = snapshots[Math.min(gitSnapshotIndex, snapshots.length - 1)] ?? defaultGitSnapshot;
+        gitSnapshotIndex++;
+        return snapshot;
+      }),
+      ...(options.gitDiff === undefined ? {} : { captureGitDiff: vi.fn(async () => options.gitDiff!) }),
       noResponseTimeoutMs: 300,
       ...(options.permissionDecisionsEnabled === undefined
         ? {}
@@ -298,7 +334,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
     },
   );
   const finished = harness.run();
-  return { harness, finished, input, output: () => text, trace, calls: fake.calls, fake, exits, counts, launchOptions };
+  return { harness, finished, input, output: () => text, trace, calls: fake.calls, fake, exits, counts, launchOptions, gitCaptures };
 };
 
 const sessionsCreated = (trace: readonly HarnessTraceEvent[]) =>
@@ -318,11 +354,125 @@ describe("quoder harness (Milestone 1)", () => {
     expect(run.launchOptions[0]?.cwd).toBe("/work/QuackTrack");
     expect(sessionsCreated(run.trace)).toEqual(["ses_1", "ses_2"]);
     expect(sessionsDeleted(run.trace)).toEqual(["ses_1", "ses_2"]);
+    expect(run.gitCaptures).toEqual([PROJECT.root, PROJECT.root, PROJECT.root, PROJECT.root]);
     expect(run.calls).toContain("create:ses_1:/work/QuackTrack");
     expect(run.output()).toContain("QuackTrack ❯ ");
     expect(run.output()).toContain("Answer: first question");
     expect(run.output()).toContain("Answer: second question");
     expect(run.trace.at(-1)).toEqual({ event: "server.stopped" });
+  });
+
+  it.each([
+    ["answered", "plain answer", false],
+    ["permission-rejected", "perm denied", false],
+    ["failed", "boom failed", false],
+    ["cancelled", "slow stop", true],
+  ] as const)("captures post-prompt Git state after a %s outcome", async (_outcome, prompt, cancel) => {
+    const run = startHarness();
+    if (cancel) {
+      run.input.write(`${prompt}\n`);
+      await vi.waitFor(() => expect(run.calls).toContain("prompt:ses_1"));
+      run.harness.interrupt();
+      run.input.end();
+    } else {
+      run.input.end(`${prompt}\n`);
+    }
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.gitCaptures).toEqual([PROJECT.root, PROJECT.root]);
+    expect(run.output()).toContain("Git changes observed: none");
+    expect(run.calls.indexOf("git:capture:0")).toBeLessThan(run.calls.indexOf("prompt:ses_1"));
+    expect(run.calls.indexOf("git:capture:1")).toBeGreaterThan(run.calls.indexOf("delete:ses_1"));
+  });
+
+  it("keeps prompt execution working when both Git captures fail", async () => {
+    const unavailable: GitSnapshotResult = { kind: "unavailable", root: PROJECT.root, reason: "command-failed" };
+    const run = startHarness({ gitSnapshots: [unavailable] });
+    run.input.end("answer despite Git failure\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Answer: answer despite Git failure");
+    expect(run.output()).toContain("Git state unavailable after the prompt: Git inspection failed.");
+    expect(run.gitCaptures).toEqual([PROJECT.root, PROJECT.root]);
+  });
+
+  it("summarizes status changes observed across one prompt and keeps pre-existing paths separate", async () => {
+    const before = gitSnapshot([
+      { path: "baseline.ts", indexStatus: ".", worktreeStatus: "M", submoduleStatus: "N...", kind: "tracked" },
+    ]);
+    const after = gitSnapshot([
+      { path: "baseline.ts", indexStatus: ".", worktreeStatus: "M", submoduleStatus: "N...", kind: "tracked" },
+      { path: "new.ts", indexStatus: "?", worktreeStatus: "?", submoduleStatus: "N...", kind: "untracked" },
+    ], 1);
+    const run = startHarness({ gitSnapshots: [before, after] });
+    run.input.end("answer with changes\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Git changes observed: 1 path (1 added)");
+    expect(run.output()).toContain("new.ts");
+    expect(run.output()).toContain("Pre-existing changes: 1 file");
+    expect(run.output()).toContain("baseline.ts");
+    expect(run.output()).toContain("Final tracked diff: 1 tracked file (+2 -1)");
+  });
+
+  it("offers a paged TTY diff viewer and returns to the continue choice", async () => {
+    const before = gitSnapshot();
+    const after = gitSnapshot([{ path: "new.ts", indexStatus: "?", worktreeStatus: "?", submoduleStatus: "N...", kind: "untracked" }]);
+    const run = startHarness({
+      terminal: true,
+      gitSnapshots: [before, after],
+      gitDiff: { kind: "available", text: `${"diff line\n".repeat(45)}`, truncated: false, omittedBytes: undefined },
+    });
+    run.input.write("show changes\r");
+    await vi.waitFor(() => expect(run.output()).toContain("View diff [v] / Continue [Enter]"));
+    run.input.write("v");
+    await vi.waitFor(() => expect(run.output()).toContain("Diff 1/2 [n]ext"));
+    run.input.write("n");
+    await vi.waitFor(() => expect(run.output()).toContain("Diff 2/2 [n]ext"));
+    run.input.write("p");
+    await vi.waitFor(() => expect(run.output()).toContain("Diff 1/2 [n]ext"));
+    run.input.write("q");
+    await vi.waitFor(() => expect(run.output()).toContain("View diff [v] / Continue [Enter]"));
+    run.input.write("\r\u0004");
+    await expect(run.finished).resolves.toBe(0);
+    expect(run.output()).toContain("diff line");
+  });
+
+  it("prints the sanitized diff automatically in piped mode", async () => {
+    const before = gitSnapshot();
+    const after = gitSnapshot([{ path: "new.ts", indexStatus: "?", worktreeStatus: "?", submoduleStatus: "N...", kind: "untracked" }]);
+    const run = startHarness({
+      gitSnapshots: [before, after],
+      gitDiff: { kind: "available", text: "diff\u001b[31mred\u001b[0m\n", truncated: true, omittedBytes: 123 },
+    });
+    run.input.end("show changes\n");
+    await expect(run.finished).resolves.toBe(0);
+    expect(run.output()).toContain("diffred");
+    expect(run.output()).toContain("123 bytes omitted");
+    expect(run.output()).not.toContain("\u001b[31m");
+  });
+
+  it("does not offer an empty diff choice for a clean TTY repository", async () => {
+    const clean = gitSnapshot();
+    const run = startHarness({ terminal: true, gitSnapshots: [clean, clean] });
+    run.input.write("no changes\r");
+    await vi.waitFor(() => expect(run.output()).toContain("Repository state: clean"));
+    expect(run.output()).not.toContain("View diff [v]");
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("keeps Ctrl-C exit behavior while waiting at the diff choice", async () => {
+    const before = gitSnapshot();
+    const after = gitSnapshot([{ path: "new.ts", indexStatus: "?", worktreeStatus: "?", submoduleStatus: "N...", kind: "untracked" }]);
+    const run = startHarness({ terminal: true, gitSnapshots: [before, after] });
+    run.input.write("show changes\r");
+    await vi.waitFor(() => expect(run.output()).toContain("View diff [v] / Continue [Enter]"));
+    run.input.write("\u0003");
+    await expect(run.finished).resolves.toBe(0);
   });
 
   it("handles /help, unknown commands, blank lines, and /exit without creating sessions", async () => {
@@ -1032,5 +1182,8 @@ describe("prompts OpenCode drops (Milestone 2 QA)", () => {
     expect(events.filter((event) => event === "prompt.started")).toHaveLength(2);
     expect(events.filter((event) => event === "prompt.retried")).toHaveLength(1);
     expect(events.filter((event) => event === "prompt.completed")).toHaveLength(2);
+    expect(run.gitCaptures).toHaveLength(4);
+    expect(run.calls.indexOf("git:capture:1")).toBeGreaterThan(run.calls.indexOf("delete:ses_2"));
+    expect(run.calls.indexOf("git:capture:1")).toBeLessThan(run.calls.indexOf("git:capture:2"));
   });
 });

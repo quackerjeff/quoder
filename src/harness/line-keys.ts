@@ -102,6 +102,9 @@ export interface LineEndingKeysOptions {
   readonly onReturnWhileBusy?: () => void;
   /** Receives A/P/D/Escape decision keys while busy; those keys never reach readline. */
   readonly onBusyDecisionKey?: (key: "a" | "p" | "d" | "escape") => void;
+  /** Diff choice/viewer is a short-lived raw-key interaction while the prompt is idle. */
+  readonly isDiffInteraction?: () => boolean;
+  readonly onDiffInteractionKey?: (key: "v" | "n" | "p" | "q" | "enter" | "escape" | "ctrl-c" | "ctrl-d") => void;
   /** How long an incomplete escape sequence is held for the rest to arrive (default 50 ms). */
   readonly holdMs?: number;
   /**
@@ -187,6 +190,24 @@ export class LineEndingKeys extends Transform {
 
   /** While busy, only Ctrl+C and Ctrl+D reach readline; a Return is reported instead. */
   #deliver(translated: string): string {
+    if (this.#options.isDiffInteraction?.() === true) {
+      const candidates = this.#decisionCandidates
+        .replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|.)/gsu, "")
+        .replaceAll(DECISION_ESCAPE_MARK, "\u001b");
+      for (const candidate of candidates) {
+        if (candidate === "\u001b") this.#options.onDiffInteractionKey?.("escape");
+        else if (candidate === "v" || candidate === "V") this.#options.onDiffInteractionKey?.("v");
+        else if (candidate === "n" || candidate === "N") this.#options.onDiffInteractionKey?.("n");
+        else if (candidate === "p" || candidate === "P") this.#options.onDiffInteractionKey?.("p");
+        else if (candidate === "q" || candidate === "Q") this.#options.onDiffInteractionKey?.("q");
+        else continue;
+        return "";
+      }
+      if (translated.includes("\r")) this.#options.onDiffInteractionKey?.("enter");
+      if (translated.includes("\u0003")) this.#options.onDiffInteractionKey?.("ctrl-c");
+      if (translated.includes("\u0004")) this.#options.onDiffInteractionKey?.("ctrl-d");
+      return "";
+    }
     if (this.#options.isBusy?.() !== true) return translated.replaceAll(DECISION_ESCAPE_MARK, "");
     if (translated.includes("\r")) this.#options.onReturnWhileBusy?.();
     const candidates = this.#decisionCandidates

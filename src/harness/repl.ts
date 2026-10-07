@@ -12,7 +12,9 @@ import {
 } from "../opencode-server.js";
 import type { MarkdownRenderer } from "../ui/markdown.js";
 import { PLAIN_THEME, type Theme } from "../ui/style.js";
-import { HELP_TEXT, formatResult } from "./format.js";
+import { formatGitDiff, formatGitDiffFailure, formatGitDiffPage, HELP_TEXT, formatGitSummary, formatResult } from "./format.js";
+import { captureGitDiff, hasInspectableGitDiff, type GitDiffResult } from "./git-diff.js";
+import { captureGitSnapshot, compareGitSnapshots, type GitComparison, type GitSnapshotResult } from "./git-state.js";
 import { CONTINUE_MARK, DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys } from "./line-keys.js";
 import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
@@ -24,6 +26,7 @@ export const HARNESS_OPERATION_TIMEOUT_MS = 30_000;
 /** The monitor's subscription lives as long as its server; this only bounds a forgotten one. */
 export const HARNESS_MONITOR_SUBSCRIPTION_MS = 24 * 60 * 60 * 1000;
 const SERVER_USERNAME = "quoder";
+type DiffKey = "v" | "n" | "p" | "q" | "enter" | "escape" | "ctrl-c" | "ctrl-d" | "exit";
 const permissionKey = (sessionID: string, requestID: string): string => `${sessionID}\u0000${requestID}`;
 
 const permissionDisplayText = (value: string): string =>
@@ -83,6 +86,11 @@ export interface HarnessDependencies {
    * against self-approval but is not a precondition for having one.
    */
   readonly permissionDecisionsEnabled?: boolean;
+  /** Injectable for harness tests; production uses the bounded Git snapshot implementation. */
+  readonly captureGitSnapshot?: (root: string) => Promise<GitSnapshotResult>;
+  /** Injectable for harness tests; production compares the captured endpoint snapshots. */
+  readonly compareGitSnapshots?: typeof compareGitSnapshots;
+  readonly captureGitDiff?: typeof captureGitDiff;
   readonly trace?: (event: HarnessTraceEvent) => void;
 }
 
@@ -153,6 +161,8 @@ export class Harness {
   #exitCode: number | undefined;
   #finished: Promise<number> | undefined;
   #shutdown: Promise<number> | undefined;
+  #diffInteraction: "choice" | "viewer" | undefined;
+  #diffKeyResolver: ((key: DiffKey) => void) | undefined;
 
   constructor(options: HarnessOptions, dependencies: HarnessDependencies) {
     this.#options = options;
@@ -217,6 +227,7 @@ export class Harness {
     this.#exitCode ??= exitCode;
     this.#lines.length = 0;
     this.#launchAbort?.abort();
+    this.#diffKeyResolver?.("exit");
     this.#wakeLoop?.();
   }
 
@@ -257,6 +268,8 @@ export class Harness {
         isBusy: () => this.#running !== undefined,
         onReturnWhileBusy: () => this.#notice("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n"),
         onBusyDecisionKey: (key) => this.#onPermissionKey(key),
+        isDiffInteraction: () => this.#diffInteraction !== undefined,
+        onDiffInteractionKey: (key) => this.#onDiffInteractionKey(key),
       });
       input = this.#options.input.pipe(keys);
       // Registered before readline's own keypress listener, so each Return is classified just
@@ -287,6 +300,7 @@ export class Harness {
     readline.on("SIGTSTP", () => undefined);
     readline.on("close", () => {
       this.#inputClosed = true;
+      this.#diffKeyResolver?.("exit");
       if (this.#running !== undefined && !this.#running.signal.aborted) {
         this.#permissionQueue.length = 0;
         this.#running.abort();
@@ -483,6 +497,7 @@ export class Harness {
     const controller = new AbortController();
     this.#running = controller;
     const theme = this.#theme;
+    const beforeGit = await this.#captureGitState();
     this.#write(`${theme.paint("dim", "Starting fresh OpenCode session…")}\n`);
     const view = new LiveView({
       theme,
@@ -504,6 +519,12 @@ export class Harness {
       } catch {
         view.finish();
         this.#write(`${theme.paint("error", "Could not start the OpenCode server; the prompt was not run.")}\n\n`);
+        const afterGit = await this.#captureGitState();
+        const comparison = await this.#compareGitState(beforeGit, afterGit);
+        this.#write(formatGitSummary(comparison, theme));
+        this.#view = undefined;
+        this.#running = undefined;
+        await this.#presentGitDiff(comparison);
         return;
       }
       const result = await runPrompt({
@@ -528,15 +549,115 @@ export class Harness {
       this.#trace({ event: "prompt.completed", outcome: result.outcome.kind, elapsedMs: result.elapsedMs });
       const stats = view.finish(result);
       this.#write(`\n${formatResult(result, theme, stats)}\n`);
+      const afterGit = await this.#captureGitState();
+      const comparison = await this.#compareGitState(beforeGit, afterGit);
+      this.#write(`${formatGitSummary(comparison, theme)}\n`);
       for (const notice of this.#notices.splice(0)) {
         const alreadyShown = result.outcome.kind === "failed" && result.outcome.reason.startsWith(notice);
         if (!alreadyShown) this.#write(`${theme.paint("warning", `Note: ${notice} A new OpenCode server will start with your next prompt.`)}\n\n`);
       }
+      this.#view = undefined;
+      this.#running = undefined;
+      await this.#presentGitDiff(comparison);
     } finally {
       view.finish();
       this.#view = undefined;
       this.#running = undefined;
     }
+  }
+
+  async #captureGitState(): Promise<GitSnapshotResult> {
+    try {
+      return await (this.#dependencies.captureGitSnapshot ?? captureGitSnapshot)(this.#options.project.root);
+    } catch {
+      return { kind: "unavailable", root: this.#options.project.root, reason: "command-failed" };
+    }
+  }
+
+  async #compareGitState(before: GitSnapshotResult, after: GitSnapshotResult) {
+    try {
+      return await (this.#dependencies.compareGitSnapshots ?? compareGitSnapshots)(before, after);
+    } catch {
+      return {
+        kind: "unavailable" as const,
+        before,
+        after: { kind: "unavailable" as const, root: this.#options.project.root, reason: "command-failed" as const },
+        observedChanges: [],
+        preExistingPaths: [],
+        resolvedPaths: [],
+        headChanged: false,
+        branchChanged: false,
+        committedDiff: undefined,
+      };
+    }
+  }
+
+  #onDiffInteractionKey(key: Exclude<DiffKey, "exit">): void {
+    if (key === "ctrl-c") {
+      this.interrupt();
+      return;
+    }
+    if (key === "ctrl-d") {
+      this.#requestExit(0);
+      return;
+    }
+    this.#diffKeyResolver?.(key);
+  }
+
+  async #waitForDiffKey(mode: "choice" | "viewer", prompt: string): Promise<DiffKey> {
+    if (this.#exitCode !== undefined || this.#inputClosed) return "exit";
+    this.#diffInteraction = mode;
+    const readline = this.#readline;
+    if (readline !== undefined) {
+      readline.setPrompt(prompt);
+      readline.prompt();
+    }
+    const key = await new Promise<DiffKey>((resolveKey) => {
+      this.#diffKeyResolver = resolveKey;
+    });
+    this.#diffKeyResolver = undefined;
+    this.#diffInteraction = undefined;
+    return key;
+  }
+
+  async #presentGitDiff(comparison: GitComparison): Promise<void> {
+    if (!hasInspectableGitDiff(comparison) || this.#exitCode !== undefined) return;
+    const capture = this.#dependencies.captureGitDiff ?? captureGitDiff;
+    if (!this.#options.terminal) {
+      const result = await capture(comparison).catch((): GitDiffResult => ({ kind: "unavailable", reason: "command-failed" }));
+      this.#write(result.kind === "available" ? formatGitDiff(result) : formatGitDiffFailure(result, this.#theme));
+      return;
+    }
+
+    let document: Extract<GitDiffResult, { kind: "available" }> | undefined;
+    for (;;) {
+      const key = await this.#waitForDiffKey("choice", "View diff [v] / Continue [Enter]: ");
+      if (key === "exit" || key === "ctrl-c" || key === "ctrl-d") break;
+      this.#write("\n");
+      if (key === "enter") break;
+      if (key !== "v") continue;
+      if (document === undefined) {
+        const result = await capture(comparison).catch((): GitDiffResult => ({ kind: "unavailable", reason: "command-failed" }));
+        if (result.kind === "unavailable") {
+          this.#write(formatGitDiffFailure(result, this.#theme));
+          continue;
+        }
+        document = result;
+      }
+      let page = 0;
+      for (;;) {
+        const view = formatGitDiffPage(document, page);
+        page = view.page;
+        this.#write(view.text);
+        const pageKey = await this.#waitForDiffKey("viewer", `Diff ${view.page + 1}/${view.pages} [n]ext / [p]revious / [q]uit: `);
+        if (pageKey === "exit" || pageKey === "ctrl-c" || pageKey === "ctrl-d") return;
+        this.#write("\n");
+        if (pageKey === "q" || pageKey === "escape") break;
+        if (pageKey === "n" || pageKey === "enter") page = Math.min(view.pages - 1, page + 1);
+        if (pageKey === "p") page = Math.max(0, page - 1);
+      }
+    }
+    this.#readline?.setPrompt(this.#mainPrompt);
   }
 
   /** Stops the running prompt for a harness reason; the outcome reports `message`. */

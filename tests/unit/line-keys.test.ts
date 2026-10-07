@@ -221,3 +221,22 @@ describe("busy permission decision keys", () => {
     expect(forwarded).toBe("\u0003");
   });
 });
+
+describe("diff navigation keys", () => {
+  it("routes view, navigation, leave, Enter, Escape, and existing exit keys without inserting them", async () => {
+    const decisions: string[] = [];
+    const keys = new LineEndingKeys({
+      isDiffInteraction: () => true,
+      onDiffInteractionKey: (key) => decisions.push(key),
+    });
+    let forwarded = "";
+    keys.on("data", (chunk: Buffer) => { forwarded += chunk.toString("utf8"); });
+
+    for (const key of ["v", "n", "p", "q", "\r", "\u001b[27u", "\u001b[99;5u", "\u001b[100;5u"]) keys.write(key);
+    keys.end();
+    await new Promise((resolveEnd) => keys.on("end", resolveEnd));
+
+    expect(decisions).toEqual(["v", "n", "p", "q", "enter", "escape", "ctrl-c", "ctrl-d"]);
+    expect(forwarded).toBe("");
+  });
+});

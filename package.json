@@ -7,8 +7,8 @@
   },
   "type": "module",
   "scripts": {
-    "build": "tsc --project tsconfig.build.json",
-    "test": "vitest run",
+    "build": "tsc --project tsconfig.build.json && node scripts/build-native-reader.mjs",
+    "test": "node scripts/build-native-reader.mjs && vitest run",
     "typecheck": "tsc --noEmit",
     "build:live": "tsc --project tsconfig.live.json",
     "verify:environment": "npm run build:live && node .live-build/scripts/verify-environment.js",

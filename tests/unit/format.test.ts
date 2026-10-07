@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { formatResult } from "../../src/harness/format.js";
+import { formatGitSummary, formatResult } from "../../src/harness/format.js";
+import { compareGitSnapshots, type GitSnapshot } from "../../src/harness/git-state.js";
 import type { PromptResult, TurnOutcome } from "../../src/harness/session-runner.js";
 import { createTheme } from "../../src/ui/style.js";
 
@@ -82,5 +83,64 @@ describe("rejections reported alongside other outcomes", () => {
       { rejectedPermissions: [{ action: "external_directory", resourceCount: 1 }] },
     ));
     expect(text).not.toContain("Note:");
+  });
+});
+
+describe("Git change summary formatting", () => {
+  const snapshot = (paths: GitSnapshot["paths"], trackedFiles = 0): GitSnapshot => ({
+    kind: "available",
+    root: "/work/project",
+    head: "0123456789abcdef0123456789abcdef01234567",
+    branch: "main",
+    branchState: "attached",
+    paths,
+    untrackedPaths: paths.filter(({ kind }) => kind === "untracked").map(({ path }) => path),
+    trackedDiff: { files: trackedFiles, additions: trackedFiles === 0 ? 0 : 3, deletions: trackedFiles === 0 ? 0 : 2, binaryFiles: 0 },
+  });
+
+  it("shows status transitions separately from pre-existing paths and sanitizes path text", async () => {
+    const before = snapshot([
+      { path: "baseline.ts", indexStatus: ".", worktreeStatus: "M", submoduleStatus: "N...", kind: "tracked" },
+    ]);
+    const after = snapshot([
+      { path: "baseline.ts", indexStatus: ".", worktreeStatus: "M", submoduleStatus: "N...", kind: "tracked" },
+      { path: "new\u001b[2J\tfile.ts", indexStatus: "?", worktreeStatus: "?", submoduleStatus: "N...", kind: "untracked" },
+    ], 1);
+    const formatted = formatGitSummary(await compareGitSnapshots(before, after));
+
+    expect(formatted).toContain("Git changes observed: 1 path (1 added)");
+    expect(formatted).toContain("new file.ts");
+    expect(formatted).toContain("Pre-existing changes: 1 file");
+    expect(formatted).toContain("baseline.ts");
+    expect(formatted).toContain("Final tracked diff: 1 tracked file (+3 -2)");
+    expect(formatted).not.toMatch(/[\u001b\u0000-\u0008\u000b-\u001f]/u);
+  });
+
+  it("reports a clean repository without an empty diff prompt", async () => {
+    const clean = snapshot([]);
+    expect(formatGitSummary(await compareGitSnapshots(clean, clean))).toBe(
+      "Git changes observed: none\nRepository state: clean\n",
+    );
+  });
+
+  it("reports non-repository and inspection failures as unavailable", async () => {
+    const noRepository = { kind: "unavailable", root: "/tmp/project", reason: "not-repository" } as const;
+    const outputLimit = { kind: "unavailable", root: "/tmp/project", reason: "output-limit" } as const;
+    expect(formatGitSummary(await compareGitSnapshots(noRepository, noRepository))).toContain(
+      "Repository state unavailable: project is not a Git repository.",
+    );
+    expect(formatGitSummary(await compareGitSnapshots(snapshot([]), outputLimit))).toContain(
+      "Git state unavailable after the prompt: Git inspection exceeded its output limit.",
+    );
+  });
+
+  it("sanitizes repository-provided branch and HEAD values", async () => {
+    const before = snapshot([]);
+    const after = { ...snapshot([]), head: "bad\u001b[2Jhash", branch: "main\u202e" };
+    const formatted = formatGitSummary(await compareGitSnapshots(before, after));
+
+    expect(formatted).toContain("HEAD changed: 0123456789abcdef0123456789abcdef01234567 → badhash");
+    expect(formatted).toContain("Branch changed: main → main");
+    expect(formatted).not.toMatch(/[\u001b\u0000-\u0008\u000b-\u001f\u202a-\u202e]/u);
   });
 });
