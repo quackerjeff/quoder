@@ -18,6 +18,10 @@ import {
   formatGitDiffPage,
   formatProjectMemory,
   formatProjectMemoryFailure,
+  EXECUTION_HISTORY_HELP_TEXT,
+  formatExecutionHistoryFailure,
+  formatExecutionHistoryList,
+  formatExecutionHistoryRecord,
   HELP_TEXT,
   PROJECT_MEMORY_HELP_TEXT,
   formatGitSummary,
@@ -26,6 +30,15 @@ import {
 import { captureGitDiff, hasInspectableGitDiff, type GitDiffResult } from "./git-diff.js";
 import { captureGitSnapshot, compareGitSnapshots, type GitComparison, type GitSnapshotResult } from "./git-state.js";
 import { buildHarnessContext, createPreviousExecutionSummary } from "./context-builder.js";
+import {
+  createExecutionHistoryStore,
+  EXECUTION_HISTORY_ID_PATTERN,
+  type ExecutionHistoryRecord,
+  type ExecutionHistoryStore,
+  type HistoryCommand,
+  type HistoryPermissionDecision,
+  type HistoryToolActivity,
+} from "./execution-history.js";
 import { CONTINUE_MARK, DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys } from "./line-keys.js";
 import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
@@ -114,6 +127,8 @@ export interface HarnessDependencies {
   readonly trace?: (event: HarnessTraceEvent) => void;
   /** Injectable project-memory store factory for harness tests and embedders. */
   readonly createProjectMemoryStore?: (projectRoot: string) => ProjectMemoryStore;
+  /** Injectable history store for tests and embedders; production uses Quoder's local store. */
+  readonly createExecutionHistoryStore?: (project: Project) => ExecutionHistoryStore;
 }
 
 export interface HarnessOptions {
@@ -153,6 +168,7 @@ export class Harness {
   readonly #options: HarnessOptions;
   readonly #dependencies: HarnessDependencies;
   readonly #memoryStore: ProjectMemoryStore | undefined;
+  readonly #historyStore: ExecutionHistoryStore | undefined;
   readonly #tracker = new SessionTracker();
   readonly #permissionQueue: PermissionAsked[] = [];
   #permissionReplyInFlight: string | undefined;
@@ -173,6 +189,15 @@ export class Harness {
   readonly #undeletedSessions: string[] = [];
   /** Server problems found while a prompt runs, shown after that prompt's result. */
   readonly #notices: string[] = [];
+  #activeHistory: {
+    readonly id: string;
+    readonly startedAt: number;
+    readonly permissions: HistoryPermissionDecision[];
+    readonly permissionIndexes: Map<string, number>;
+    readonly commands: HistoryCommand[];
+    readonly toolActivity: HistoryToolActivity[];
+    attempts: number;
+  } | undefined;
   #wakeLoop: (() => void) | undefined;
   #readline: Interface | undefined;
   #server: ServerSession | undefined;
@@ -197,6 +222,11 @@ export class Harness {
     } catch {
       this.#memoryStore = undefined;
       this.#memoryUnavailable = "io-error";
+    }
+    try {
+      this.#historyStore = (dependencies.createExecutionHistoryStore ?? createExecutionHistoryStore)(options.project);
+    } catch {
+      this.#historyStore = undefined;
     }
   }
 
@@ -300,6 +330,7 @@ export class Harness {
       const reason = this.#memoryUnavailable ?? "io-error";
       this.#write(`${theme.paint("warning", `${formatProjectMemoryFailure(reason)} Prompts continue without memory; use /memory clear to reset or retry.`)}\n`);
     }
+    this.#write(`${theme.paint("dim", "Execution history is stored locally and may contain verbatim prompts, context, commands, and responses. Quoder does not redact secrets; other processes running as your user may be able to read it. Type /history help for retention and deletion controls.")}\n`);
     this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
     let input = this.#options.input;
     if (this.#options.terminal) {
@@ -380,6 +411,17 @@ export class Harness {
   }
 
   #onPermissionAsked(server: ServerSession | undefined, permission: PermissionAsked): void {
+    const key = permissionKey(permission.sessionID, permission.requestID);
+    const activeHistory = this.#activeHistory;
+    if (activeHistory !== undefined && !activeHistory.permissionIndexes.has(key)) {
+      activeHistory.permissionIndexes.set(key, activeHistory.permissions.length);
+      activeHistory.permissions.push({
+        action: permission.action ?? null,
+        resourceCount: permission.resources.length,
+        reply: "not-replied",
+        replied: false,
+      });
+    }
     if (
       this.#dependencies.permissionDecisionsEnabled === true &&
       this.#options.terminal &&
@@ -429,6 +471,7 @@ export class Harness {
     try {
       if (server === undefined) throw new Error("server unavailable");
       await server.adapter.replyPermission(permission.sessionID, permission.requestID, reply);
+      this.#recordPermissionReply(key, reply, true);
       this.#removeQueuedPermission(key);
       this.#trace({ event: "permission.replied", sessionID: permission.sessionID, reply, replied: true });
       if (interactive) {
@@ -436,12 +479,21 @@ export class Harness {
         this.#renderPermissionQueue(true);
       }
     } catch {
+      this.#recordPermissionReply(key, reply, false);
       this.#removeQueuedPermission(key);
       if (interactive) this.#permissionReplyInFlight = undefined;
       this.#permissionQueue.length = 0;
       this.#trace({ event: "permission.replied", sessionID: permission.sessionID, reply, replied: false });
       this.#markUnhealthy(server, "Quoder could not confirm OpenCode's permission decision.");
     }
+  }
+
+  #recordPermissionReply(key: string, reply: "once" | "always" | "reject", replied: boolean): void {
+    const capture = this.#activeHistory;
+    const index = capture?.permissionIndexes.get(key);
+    if (capture === undefined || index === undefined) return;
+    const current = capture.permissions[index];
+    if (current !== undefined) capture.permissions[index] = { ...current, reply, replied };
   }
 
   #removeQueuedPermission(key: string): void {
@@ -531,6 +583,10 @@ export class Harness {
       await this.#handleMemoryCommand(input);
       return true;
     }
+    if (input === "/history" || input.startsWith("/history ")) {
+      await this.#handleHistoryCommand(input);
+      return true;
+    }
     if (input.startsWith("/")) {
       this.#write("Unknown command. Type /help for the commands Quoder supports.\n\n");
       return true;
@@ -562,6 +618,86 @@ export class Harness {
   #memoryMessage(message: string, warning = false): void {
     const painted = warning ? this.#theme.paint("warning", message) : this.#theme.paint("success", message);
     this.#write(`${painted}\n\n`);
+  }
+
+  #historyMessage(message: string, warning = false): void {
+    const painted = warning ? this.#theme.paint("warning", message) : this.#theme.paint("success", message);
+    this.#write(`${painted}\n\n`);
+  }
+
+  #historyUnavailable(reason?: import("./execution-history.js").HistoryUnavailableReason): void {
+    this.#historyMessage(reason === undefined ? "Execution history is unavailable." : formatExecutionHistoryFailure(reason), true);
+  }
+
+  async #handleHistoryCommand(input: string): Promise<void> {
+    const command = input.slice("/history".length).trim();
+    const store = this.#historyStore;
+    if (store === undefined) {
+      this.#historyUnavailable("io-error");
+      return;
+    }
+    try {
+      if (command === "" || command === "help") {
+        if (command === "help") this.#write(`${EXECUTION_HISTORY_HELP_TEXT}\n\n`);
+        else {
+          const result = await store.list();
+          if (result.status === "unavailable") this.#historyUnavailable(result.reason);
+          else this.#write(`${formatExecutionHistoryList(result.records, this.#theme)}\n`);
+        }
+        return;
+      }
+      if (command === "retention") {
+        const result = await store.retention();
+        if (result.status === "unavailable") this.#historyUnavailable(result.reason);
+        else this.#historyMessage(`Maximum completed execution records: ${result.maxCompletedRecords}.`);
+        return;
+      }
+      const retention = command.match(/^retention\s+(\S+)$/u);
+      if (retention !== null) {
+        const rawCount = retention[1] ?? "";
+        const count = /^\d+$/u.test(rawCount) ? Number(rawCount) : Number.NaN;
+        if (!Number.isInteger(count) || count < 1 || count > 1_000) {
+          this.#historyMessage("Retention must be a whole number from 1 through 1,000.", true);
+          return;
+        }
+        const result = await store.setRetention(count);
+        if (!result.ok) this.#historyUnavailable(result.reason);
+        else this.#historyMessage(`Execution history retention set to ${count} completed records.`);
+        return;
+      }
+      if (command === "clear all") {
+        const result = await store.clearAll();
+        if (result.status === "unavailable") this.#historyUnavailable(result.reason);
+        else this.#historyMessage(`Cleared ${result.deleted} execution history record${result.deleted === 1 ? "" : "s"}.`);
+        return;
+      }
+      const clear = command.match(/^clear\s+(\S+)$/u);
+      if (clear !== null) {
+        const id = clear[1] ?? "";
+        if (!EXECUTION_HISTORY_ID_PATTERN.test(id)) {
+          this.#historySyntax();
+          return;
+        }
+        const result = await store.delete(id);
+        if (result.status === "unavailable") this.#historyUnavailable(result.reason);
+        else this.#historyMessage(result.status === "deleted" ? "Execution history record deleted." : "No history record with that ID.", result.status === "missing");
+        return;
+      }
+      if (!EXECUTION_HISTORY_ID_PATTERN.test(command)) {
+        this.#historySyntax();
+        return;
+      }
+      const result = await store.get(command);
+      if (result.status === "unavailable") this.#historyUnavailable(result.reason);
+      else if (result.status === "missing") this.#historyMessage("No history record with that ID.", true);
+      else this.#write(`${formatExecutionHistoryRecord(result.record, this.#theme)}\n`);
+    } catch {
+      this.#historyUnavailable("io-error");
+    }
+  }
+
+  #historySyntax(): void {
+    this.#historyMessage("Usage: /history [<id>|help|retention [<count>]|clear <id|all>]", true);
   }
 
   async #saveProjectMemory(memory: ProjectMemory, success: string): Promise<void> {
@@ -736,6 +872,21 @@ export class Harness {
     this.#running = controller;
     const theme = this.#theme;
     const beforeGit = await this.#captureGitState();
+    const memory = this.#memory ?? emptyProjectMemory();
+    const harnessContext = buildHarnessContext(prompt, memory, beforeGit);
+    const startedAt = Date.now();
+    const historyStart = await this.#beginHistory(prompt, harnessContext.context, beforeGit, startedAt);
+    if (historyStart !== undefined) {
+      this.#activeHistory = {
+        id: historyStart.id,
+        startedAt,
+        permissions: [],
+        permissionIndexes: new Map(),
+        commands: [],
+        toolActivity: [],
+        attempts: 1,
+      };
+    }
     this.#write(`${theme.paint("dim", "Starting fresh OpenCode session…")}\n`);
     const view = new LiveView({
       theme,
@@ -747,10 +898,17 @@ export class Harness {
       ...(this.#options.renderMarkdown === undefined ? {} : { render: this.#options.renderMarkdown }),
       onFirstText: () => this.#trace({ event: "stream.first-text" }),
       onToolFinished: (tool) => this.#trace({ event: "activity.tool", tool }),
+      onToolRecorded: (activity, command) => {
+        const capture = this.#activeHistory;
+        if (capture === undefined) return;
+        capture.toolActivity.push(activity);
+        if (command !== undefined) capture.commands.push(command);
+      },
     });
     this.#view = view;
     this.#trace({ event: "prompt.started" });
     try {
+      view.note(`${theme.paint("dim", `Harness context: ${harnessContext.contextCharacters} chars · Prompt: ${harnessContext.promptCharacters} chars`)}\n`);
       let server: ServerSession;
       try {
         server = await this.#ensureServer();
@@ -760,14 +918,12 @@ export class Harness {
         const afterGit = await this.#captureGitState();
         const comparison = await this.#compareGitState(beforeGit, afterGit);
         this.#write(formatGitSummary(comparison, theme));
+        await this.#completeHistory("failed", null, comparison, "server-start");
         this.#view = undefined;
         this.#running = undefined;
         await this.#presentGitDiff(comparison);
         return;
       }
-      const memory = this.#memory ?? emptyProjectMemory();
-      const harnessContext = buildHarnessContext(prompt, memory, beforeGit);
-      view.note(`${theme.paint("dim", `Harness context: ${harnessContext.contextCharacters} chars · Prompt: ${harnessContext.promptCharacters} chars`)}\n`);
       const result = await runPrompt({
         adapter: server.adapter,
         tracker: this.#tracker,
@@ -777,6 +933,7 @@ export class Harness {
         cancel: controller.signal,
         ...(this.#dependencies.noResponseTimeoutMs === undefined ? {} : { noResponseTimeoutMs: this.#dependencies.noResponseTimeoutMs }),
         onRetry: () => {
+          if (this.#activeHistory !== undefined) this.#activeHistory.attempts = 2;
           this.#trace({ event: "prompt.retried" });
           view.note(`${theme.paint("dim", "OpenCode did not start on the prompt; sending it again in a fresh session…")}\n`);
         },
@@ -793,6 +950,12 @@ export class Harness {
       const afterGit = await this.#captureGitState();
       const comparison = await this.#compareGitState(beforeGit, afterGit);
       this.#write(`${formatGitSummary(comparison, theme)}\n`);
+      const status = result.outcome.kind;
+      await this.#completeHistory(
+        status,
+        result.outcome.kind === "answered" ? result.outcome.text : null,
+        comparison,
+      );
       if (result.outcome.kind === "answered" && this.#memory?.automaticSummary === true && this.#memoryStore !== undefined) {
         const updated = {
           ...this.#memory,
@@ -814,10 +977,89 @@ export class Harness {
       this.#running = undefined;
       await this.#presentGitDiff(comparison);
     } finally {
+      this.#activeHistory = undefined;
       view.finish();
       this.#view = undefined;
       this.#running = undefined;
     }
+  }
+
+  async #beginHistory(
+    prompt: string,
+    injectedContext: string,
+    before: GitSnapshotResult,
+    startedAt: number,
+  ): Promise<ExecutionHistoryRecord | undefined> {
+    const store = this.#historyStore;
+    if (store === undefined) {
+      this.#historyWarning("begin", "io-error");
+      return undefined;
+    }
+    try {
+      const result = await store.begin({
+        startedAt: new Date(startedAt).toISOString(),
+        branch: before.kind === "available" ? before.branch ?? null : null,
+        startingHead: before.kind === "available" ? before.head ?? null : null,
+        model: { providerID: this.#options.model.providerID, id: this.#options.model.id },
+        agent: null,
+        prompt,
+        injectedContext,
+      });
+      if (result.status === "created") return result.record;
+      this.#historyWarning("begin", result.reason);
+    } catch {
+      this.#historyWarning("begin", "io-error");
+    }
+    return undefined;
+  }
+
+  async #completeHistory(
+    status: "answered" | "permission-rejected" | "question-rejected" | "cancelled" | "failed",
+    finalResponse: string | null,
+    comparison: GitComparison,
+    failureStage?: "server-start",
+  ): Promise<void> {
+    const store = this.#historyStore;
+    const capture = this.#activeHistory;
+    if (store === undefined || capture === undefined) return;
+    const filesChanged = comparison.kind === "available"
+      ? {
+        status: "available" as const,
+        paths: comparison.observedChanges.map((change) => ({
+          kind: change.kind,
+          path: change.path,
+          previousPath: change.previousPath ?? null,
+        })),
+        reason: null,
+      }
+      : {
+        status: "unavailable" as const,
+        paths: [],
+        reason: comparison.before.kind === "unavailable"
+          ? comparison.before.reason
+          : comparison.after.kind === "unavailable" ? comparison.after.reason : "command-failed",
+      };
+    try {
+      const result = await store.complete(capture.id, {
+        finishedAt: new Date().toISOString(),
+        durationMs: Math.max(0, Date.now() - capture.startedAt),
+        status,
+        permissionDecisions: capture.permissions,
+        commands: capture.commands,
+        toolActivity: capture.toolActivity,
+        filesChanged,
+        finalResponse,
+        attempts: failureStage === "server-start" ? 0 : capture.attempts,
+        ...(failureStage === undefined ? {} : { failureStage }),
+      });
+      if (!result.ok) this.#historyWarning("complete", result.reason);
+    } catch {
+      this.#historyWarning("complete", "io-error");
+    }
+  }
+
+  #historyWarning(operation: "begin" | "complete", reason: string): void {
+    this.#write(`${this.#theme.paint("warning", `Execution history ${operation} failed (${reason}); the prompt outcome is unchanged.`)}\n`);
   }
 
   async #captureGitState(): Promise<GitSnapshotResult> {

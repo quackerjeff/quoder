@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { formatGitSummary, formatResult } from "../../src/harness/format.js";
+import { formatExecutionHistoryList, formatExecutionHistoryRecord } from "../../src/harness/format.js";
+import type { ExecutionHistoryRecord } from "../../src/harness/execution-history.js";
 import { compareGitSnapshots, type GitSnapshot } from "../../src/harness/git-state.js";
 import type { PromptResult, TurnOutcome } from "../../src/harness/session-runner.js";
 import { createTheme } from "../../src/ui/style.js";
@@ -12,6 +14,30 @@ const result = (outcome: TurnOutcome, overrides: Partial<PromptResult> = {}): Pr
   rejectedQuestions: [],
   sessionDeleted: true,
   elapsedMs: 2_345,
+  ...overrides,
+});
+
+const historyRecord = (overrides: Partial<ExecutionHistoryRecord> = {}): ExecutionHistoryRecord => ({
+  version: 1,
+  id: "a".repeat(32),
+  startedAt: "2026-10-07T12:00:00.000Z",
+  finishedAt: "2026-10-07T12:00:01.000Z",
+  durationMs: 1_000,
+  project: { name: "QuackTrack", root: "/work/QuackTrack" },
+  branch: "main",
+  startingHead: "0123456789abcdef0123456789abcdef01234567",
+  model: { providerID: "ollama", id: "test-model" },
+  agent: null,
+  prompt: "please inspect",
+  injectedContext: "<context>safe</context>",
+  permissionDecisions: [{ action: "bash", resourceCount: 1, reply: "once", replied: true }],
+  commands: [{ command: "printf harmless", status: "succeeded" }],
+  toolActivity: [{ tool: "bash", status: "succeeded" }],
+  filesChanged: { status: "available", paths: [{ kind: "added", path: "new.txt", previousPath: null }], reason: null },
+  finalResponse: "Answer",
+  status: "answered",
+  attempts: 1,
+  failureStage: null,
   ...overrides,
 });
 
@@ -56,6 +82,28 @@ describe("prompt result formatting", () => {
   it("colours with theme roles and keeps model text free of escape sequences", () => {
     const text = formatResult(result({ kind: "failed", reason: "bad\u001b]0;x\u0007" }), createTheme(true));
     expect(text).toBe("\u001b[31mThe prompt did not complete: bad\u001b[39m\n\n\u001b[31m✗ Failed after 2.3s\u001b[39m\n");
+  });
+});
+
+describe("execution history formatting", () => {
+  it("shows an empty list and labels in-progress rows without reading their bodies", () => {
+    expect(formatExecutionHistoryList([])).toBe("No execution history yet.\n");
+    expect(formatExecutionHistoryList([{ id: "b".repeat(32), startedAt: "2026-10-07T12:00:00.000Z", status: "in-progress" }]))
+      .toContain("in progress / possibly interrupted");
+  });
+
+  it("shows full detail without clipping and sanitizes multiline and terminal-control input", () => {
+    const longResponse = "R".repeat(300);
+    const text = formatExecutionHistoryRecord(historyRecord({
+      prompt: "first line\nFinal response: forged\u001b[2J",
+      finalResponse: longResponse,
+      model: { providerID: "provider\nInjected label", id: "model\u001b]0;title\u0007" },
+    }));
+    expect(text).toContain("Developer prompt:\n  first line\n  Final response: forged");
+    expect(text).toContain(`Final response:\n  ${longResponse}`);
+    expect(text).toContain("Model provider:\n  provider\n  Injected label");
+    expect(text).not.toMatch(/[\u001b\u0007]/u);
+    expect(text).not.toContain("…");
   });
 });
 

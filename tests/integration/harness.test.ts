@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { EventMonitorOptions } from "../../src/event-monitor.js";
 import type { GitSnapshot, GitSnapshotResult } from "../../src/harness/git-state.js";
 import type { GitDiffDocument } from "../../src/harness/git-diff.js";
+import type { BeginExecutionHistoryInput, CompleteExecutionHistoryInput, ExecutionHistoryRecord, ExecutionHistoryStore } from "../../src/harness/execution-history.js";
 import { HARNESS_CONTEXT_MAX_CODE_POINTS } from "../../src/harness/context-builder.js";
 import {
   emptyProjectMemory,
@@ -99,6 +100,10 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
     emit("tool.called", { ...base, assistantMessageID: `step-${sessionID}`, callID: "c1", tool: "read", input: { path: `${PROJECT.root}/notes.txt` } });
     emit("text.ended", { ...base, assistantMessageID: `step-${sessionID}`, textID: "t1", text: "Reading the file.\n\n" });
     emit("tool.success", { ...base, assistantMessageID: `step-${sessionID}`, callID: "c1", structured: { content: "alpha\nbeta\n" }, content: [], outputPaths: [] });
+    if (text.startsWith("streamhistory-tools")) {
+      emit("tool.called", { ...base, assistantMessageID: `step-${sessionID}`, callID: "c-history", tool: "bash", input: { command: "printf harmless" } });
+      emit("tool.success", { ...base, assistantMessageID: `step-${sessionID}`, callID: "c-history", structured: { exit: 0 }, content: [] });
+    }
     emit("step.ended", { ...base, assistantMessageID: `step-${sessionID}`, finish: "tool-calls", cost: 0, tokens: { input: 900, output: 40, reasoning: 0, cache: { read: 0, write: 0 } } });
     if (text.startsWith("streamslow")) {
       emit("step.started", { ...base, assistantMessageID: `slow-${sessionID}`, agent: "build", model: MODEL });
@@ -262,6 +267,80 @@ interface HarnessRunOptions extends FakeOptions {
   readonly initialMemory?: ProjectMemoryLoadResult;
   readonly memorySaveResult?: ProjectMemoryWriteResult;
   readonly memoryClearResult?: ProjectMemoryWriteResult;
+  readonly historyBeginFails?: boolean;
+  readonly historyCompleteFails?: boolean;
+  readonly historyListFails?: boolean;
+}
+
+function fakeExecutionHistoryStore(options: Pick<HarnessRunOptions, "historyBeginFails" | "historyCompleteFails" | "historyListFails"> = {}) {
+  const record: ExecutionHistoryRecord = {
+    version: 1,
+    id: "a".repeat(32),
+    startedAt: "2026-10-07T12:00:00.000Z",
+    finishedAt: null,
+    durationMs: null,
+    project: PROJECT,
+    branch: "main",
+    startingHead: "0123456789abcdef0123456789abcdef01234567",
+    model: MODEL,
+    agent: null,
+    prompt: "",
+    injectedContext: "",
+    permissionDecisions: [],
+    commands: [],
+    toolActivity: [],
+    filesChanged: null,
+    finalResponse: null,
+    status: "in-progress",
+    attempts: 0,
+    failureStage: null,
+  };
+  const completed: CompleteExecutionHistoryInput[] = [];
+  const begun: Array<Parameters<ExecutionHistoryStore["begin"]>[0]> = [];
+  let storedRecord: ExecutionHistoryRecord | undefined;
+  let maxCompletedRecords = 100;
+  const store: ExecutionHistoryStore = {
+    directory: "/tmp/quoder-test-history",
+    begin: vi.fn(async (input: BeginExecutionHistoryInput) => {
+      begun.push(input);
+      if (options.historyBeginFails) return { status: "unavailable" as const, reason: "io-error" as const };
+      const created = { ...record, ...input };
+      storedRecord = created;
+      return { status: "created" as const, record: created };
+    }),
+    complete: vi.fn(async (id, input) => {
+      completed.push(input);
+      if (options.historyCompleteFails) return { ok: false as const, reason: "io-error" as const };
+      if (storedRecord?.id === id) storedRecord = { ...storedRecord, ...input };
+      return { ok: true as const };
+    }),
+    list: vi.fn(async () => options.historyListFails
+      ? { status: "unavailable" as const, reason: "io-error" as const }
+      : {
+        status: "available" as const,
+        records: storedRecord === undefined ? [] : [{ id: storedRecord.id, startedAt: storedRecord.startedAt, status: storedRecord.status }],
+      }),
+    get: vi.fn(async (id: string) => {
+      const found = storedRecord;
+      return found?.id === id ? { status: "found" as const, record: found } : { status: "missing" as const };
+    }),
+    retention: vi.fn(async () => ({ status: "available" as const, maxCompletedRecords })),
+    setRetention: vi.fn(async (count) => {
+      maxCompletedRecords = count;
+      return { ok: true as const };
+    }),
+    delete: vi.fn(async (id) => {
+      if (storedRecord?.id !== id) return { status: "missing" as const };
+      storedRecord = undefined;
+      return { status: "deleted" as const };
+    }),
+    clearAll: vi.fn(async () => {
+      const deleted = storedRecord === undefined ? 0 : 1;
+      storedRecord = undefined;
+      return { status: "cleared" as const, deleted };
+    }),
+  };
+  return { store, begun, completed };
 }
 
 function fakeProjectMemoryStore(options: Pick<HarnessRunOptions, "initialMemory" | "memorySaveResult" | "memoryClearResult"> = {}) {
@@ -290,6 +369,7 @@ function fakeProjectMemoryStore(options: Pick<HarnessRunOptions, "initialMemory"
 const startHarness = (options: HarnessRunOptions = {}) => {
   const fake = fakeOpenCode(options);
   const memory = fakeProjectMemoryStore(options);
+  const history = fakeExecutionHistoryStore(options);
   const input = new PassThrough();
   const output = new PassThrough();
   let text = "";
@@ -345,6 +425,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
       }),
       createClient: vi.fn(() => fake.client),
       createProjectMemoryStore: vi.fn(() => memory.store),
+      createExecutionHistoryStore: vi.fn(() => history.store),
       startMonitor: vi.fn(async (monitorOptions: EventMonitorOptions) => {
         fake.state.monitor = monitorOptions;
         return {
@@ -372,7 +453,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
     },
   );
   const finished = harness.run();
-  return { harness, finished, input, output: () => text, trace, calls: fake.calls, fake, exits, counts, launchOptions, gitCaptures, memory };
+  return { harness, finished, input, output: () => text, trace, calls: fake.calls, fake, exits, counts, launchOptions, gitCaptures, memory, history };
 };
 
 const sessionsCreated = (trace: readonly HarnessTraceEvent[]) =>
@@ -381,6 +462,154 @@ const sessionsDeleted = (trace: readonly HarnessTraceEvent[]) =>
   trace.flatMap((event) => (event.event === "session.deleted" && event.verified ? [event.sessionID] : []));
 
 describe("quoder harness (Milestone 1)", () => {
+  it("serves history help, empty list, and retention locally in piped mode", async () => {
+    const run = startHarness();
+    run.input.end("/history\n/history help\n/history retention\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("No execution history yet.");
+    expect(run.output()).toContain("Quoder does not detect or redact secrets");
+    expect(run.output()).toContain("Maximum completed execution records: 100");
+    expect(run.output()).toContain("/history clear all");
+    expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+
+  it("lists, displays, changes retention, and deletes a record through local commands", async () => {
+    const run = startHarness();
+    const id = "a".repeat(32);
+    run.input.end(`capture a run\n/history\n/history ${id}\n/history retention\n/history retention 4\n/history clear ${id}\n/history\n/history ${"b".repeat(32)}\n/history nope\n/exit\n`);
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain(id);
+    expect(run.output()).toContain("Developer prompt:\n  capture a run");
+    expect(run.output()).toContain("Final response:\n  Answer: capture a run");
+    expect(run.output()).toContain("Execution history retention set to 4 completed records.");
+    expect(run.output()).toContain("Execution history record deleted.");
+    expect(run.output()).toContain("No history record with that ID.");
+    expect(run.output()).toContain("Usage: /history [<id>|help|retention [<count>]|clear <id|all>]");
+    expect(run.output()).toContain("No execution history yet.");
+    expect(run.history.store.setRetention).toHaveBeenCalledWith(4);
+    expect(run.history.store.delete).toHaveBeenCalledWith(id);
+    expect(sessionsCreated(run.trace)).toEqual(["ses_1"]);
+  });
+
+  it("rejects invalid retention without mutation and clears all records", async () => {
+    const run = startHarness();
+    run.input.end(`capture a run\n/history retention 1001\n/history clear all\n/history\n/exit\n`);
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Retention must be a whole number from 1 through 1,000.");
+    expect(run.history.store.setRetention).not.toHaveBeenCalled();
+    expect(run.output()).toContain("Cleared 1 execution history record.");
+    expect(run.output()).toContain("No execution history yet.");
+  });
+
+  it("reports unavailable history with a fixed sanitized message and keeps the REPL usable", async () => {
+    const run = startHarness({ historyListFails: true });
+    run.input.end("/history\nanswer still works\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Execution history is unavailable: history storage could not be accessed.");
+    expect(run.output()).toContain("Answer: answer still works");
+  });
+
+  it("routes history list, detail, and deletion commands through the interactive TTY input path", async () => {
+    const run = startHarness({ terminal: true });
+    const id = "a".repeat(32);
+    await vi.waitFor(() => expect(run.output()).toContain("QuackTrack ❯ "));
+
+    run.input.write("capture in terminal\r");
+    await vi.waitFor(() => expect(run.history.completed).toHaveLength(1));
+    run.input.write("/history\r");
+    await vi.waitFor(() => expect(run.output()).toContain(id));
+    run.input.write(`/history ${id}\r`);
+    await vi.waitFor(() => expect(run.output()).toContain("Developer prompt:\n  capture in terminal"));
+    run.input.write(`/history clear ${id}\r`);
+    await vi.waitFor(() => expect(run.output()).toContain("Execution history record deleted."));
+    run.input.write("/history\r");
+    await vi.waitFor(() => expect(run.output()).toContain("No execution history yet."));
+    run.input.write("\u0004");
+
+    await expect(run.finished).resolves.toBe(0);
+    expect(sessionsCreated(run.trace)).toEqual(["ses_1"]);
+    expect(run.history.store.get).toHaveBeenCalledWith(id);
+    expect(run.history.store.delete).toHaveBeenCalledWith(id);
+  });
+
+  it("captures one full run record with normalized activity and observed Git changes", async () => {
+    const after = gitSnapshot([{ path: "notes.txt", indexStatus: "?", worktreeStatus: "?", submoduleStatus: "N...", kind: "untracked" }]);
+    const run = startHarness({ gitSnapshots: [gitSnapshot(), after] });
+    run.input.end("streamhistory-tools inspect this\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.history.begun).toHaveLength(1);
+    expect(run.history.begun[0]).toMatchObject({
+      prompt: "streamhistory-tools inspect this",
+      branch: "main",
+      startingHead: gitSnapshot().head,
+      model: MODEL,
+    });
+    expect(run.history.completed).toHaveLength(1);
+    expect(run.history.completed[0]).toMatchObject({
+      status: "answered",
+      finalResponse: "Streamed **answer** done.",
+      attempts: 1,
+      commands: [{ command: "printf harmless", status: "succeeded" }],
+      toolActivity: [
+        { tool: "read", status: "succeeded" },
+        { tool: "bash", status: "succeeded" },
+      ],
+      filesChanged: { status: "available", paths: [{ kind: "added", path: "notes.txt", previousPath: null }] },
+    });
+  });
+
+  it("keeps dropped-prompt retries in one history record and counts both attempts", async () => {
+    const run = startHarness();
+    run.input.end("drop this prompt\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.history.begun).toHaveLength(1);
+    expect(run.history.completed).toHaveLength(1);
+    expect(run.history.completed[0]).toMatchObject({ status: "answered", attempts: 2 });
+    expect(sessionsCreated(run.trace)).toEqual(["ses_1", "ses_2"]);
+  });
+
+  it("captures denied permission summaries without storing resource values", async () => {
+    const run = startHarness();
+    run.input.end("perm denied\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.history.completed[0]?.permissionDecisions).toEqual([
+      { action: "external_directory", resourceCount: 1, reply: "reject", replied: true },
+    ]);
+  });
+
+  it("keeps initial server startup behavior unchanged and history write failures from changing prompt results", async () => {
+    const startupFailure = startHarness({ launchFails: true });
+    startupFailure.input.end("not submitted\n");
+    await expect(startupFailure.finished).resolves.toBe(1);
+    expect(startupFailure.history.begun).toHaveLength(0);
+
+    const writeFailure = startHarness({ historyCompleteFails: true });
+    writeFailure.input.end("still answered\n");
+    await expect(writeFailure.finished).resolves.toBe(0);
+    expect(writeFailure.output()).toContain("Answer: still answered");
+    expect(writeFailure.output()).toContain("Execution history complete failed (io-error)");
+
+    const beginFailure = startHarness({ historyBeginFails: true });
+    beginFailure.input.end("also answered\n");
+    await expect(beginFailure.finished).resolves.toBe(0);
+    expect(beginFailure.output()).toContain("Answer: also answered");
+    expect(beginFailure.output()).toContain("Execution history begin failed (io-error)");
+  });
+
   it("runs several prompts on one server in the project root, each in its own fresh session that is then deleted", async () => {
     const run = startHarness();
     run.input.write("first question\nsecond question\n");
@@ -422,6 +651,11 @@ describe("quoder harness (Milestone 1)", () => {
     expect(run.output()).toContain("Git changes observed: none");
     expect(run.calls.indexOf("git:capture:0")).toBeLessThan(run.calls.indexOf("prompt:ses_1"));
     expect(run.calls.indexOf("git:capture:1")).toBeGreaterThan(run.calls.indexOf("delete:ses_1"));
+    expect(run.history.completed[0]).toMatchObject({
+      status: _outcome,
+      finalResponse: _outcome === "answered" ? "Answer: plain answer" : null,
+      attempts: 1,
+    });
   });
 
   it("keeps prompt execution working when both Git captures fail", async () => {
@@ -788,6 +1022,7 @@ describe("quoder harness (Milestone 1)", () => {
 
     expect(run.output()).toContain("  Which language? (Rust)");
     expect(sessionsDeleted(run.trace)).toEqual(["ses_1"]);
+    expect(run.history.completed[0]).toMatchObject({ status: "question-rejected", finalResponse: null, attempts: 1 });
   });
 
   it("reports a model step error and continues with the next prompt", async () => {

@@ -538,15 +538,19 @@ The harness should not automatically commit changes in the initial implementatio
 
 ## FR-11 — Execution History
 
-Every execution must receive a unique run identifier.
+Every submitted developer execution must receive a unique run identifier and a
+durable, inspectable record. The record describes the execution observed by
+Quoder; it does not prove who authored the repository changes.
 
 Example:
 
 ```text
-Run #0042
+Run ID: 0123456789abcdef0123456789abcdef
 ```
 
-Execution records should contain:
+Execution records contain the following fields when available. Agent is null
+when the harness does not select one; Git metadata and file changes are
+explicitly unavailable when capture fails.
 
 ```text
 Run ID
@@ -565,6 +569,28 @@ Final response
 Execution status
 Duration
 ```
+
+The initial record is stored before prompt submission. A record that remains
+unfinished after process interruption is shown as “in progress / possibly
+interrupted”; Quoder does not infer that it crashed because another process may
+still own the run. A retry of a dropped prompt remains one Quoder run, with the
+attempt count recorded.
+
+History is stored outside the target project in per-project local state. It
+contains verbatim developer prompts, injected context, Bash command strings,
+and final responses, without reliable secret redaction. Quoder discloses this
+at startup and in `/history help`. Restrictive file permissions reduce
+accidental exposure but do not isolate records from other processes running as
+the same user. Records omit credentials, session IDs, complete SDK/event
+payloads, and tool stdout/stderr.
+
+The `/history` command lists the ten most recent records without bodies;
+`/history <id>` displays one record. `/history retention` reports the limit,
+and `/history retention <count>` configures 1–1,000 completed records (default
+100). `/history clear <id>` deletes one record; `/history clear all` clears
+this project's records while preserving retention settings. In-progress
+records do not count toward retention. Storage failures do not change prompt
+outcomes, and incomplete records are not silently marked complete.
 
 ---
 
@@ -1040,53 +1066,76 @@ response stays out of future prompts.
 
 ---
 
-# Milestone 6 — Execution History
+# Milestone 6 — Execution History (implemented 2026-10-07)
 
 ## Goal
 
-Provide a complete audit trail of agent activity.
+Provide durable, inspectable records of each Quoder execution using the
+metadata available at the harness boundary. Records describe observed activity
+and repository endpoint changes; they are not proof of attribution and are not
+replayable OpenCode transcripts.
 
 ## Features
 
-Persist execution records.
+Persist versioned, project-scoped execution records outside the target
+repository. Capture prompt lifecycle outcomes, permission summaries, exact
+Bash command strings and statuses, compact tool activity, observed file
+changes, and final responses for answered runs. Do not persist credentials,
+session IDs, tool output, or complete OpenCode event payloads.
 
-Provide commands such as:
+Provide sanitized local commands:
 
 ```text
 /history
-/history 42
+/history <id>
+/history help
+/history retention [<count>]
+/history clear <id|all>
 ```
 
 Example:
 
 ```text
-Run #42
-
-Model: GLM
-Agent: coder
+Execution history record
+ID: 0123456789abcdef0123456789abcdef
+Schema version: 1
+Started: 2026-10-07T21:29:01.674Z
+Finished: (in progress / possibly interrupted)
+Duration: (unavailable)
+Project name: Example
+Project root: /path/to/project
 Branch: feature/import
 Starting HEAD: 8a31c2d
-
-Prompt:
-Add duplicate flight detection.
-
-Changed:
-  src/import.rs
-  tests/import_test.rs
-
+Model provider: ollama
+Model ID: example-model
+Agent: (unavailable)
+Status: in progress / possibly interrupted
+Attempts: 0
+Failure stage: (none)
+Developer prompt:
+  Add duplicate flight detection.
+Injected context:
+  (context supplied for this run)
+Permission decisions:
+  (none)
 Commands:
-  cargo test
-
-Result:
-  PASS
-
-Duration:
-  2m 14s
+  (none)
+Tool activity:
+  (none)
+Observed file changes:
+  (unavailable while run is in progress)
+Final response:
+  (unavailable while execution is in progress)
 ```
 
 ## Exit Criteria
 
-Every OpenCode execution can be inspected after completion.
+Every submitted execution has a unique ID and can be inspected after
+completion; an interrupted execution remains visibly in progress until it is
+deleted or otherwise finalized. List, detail, retention, and deletion work in
+TTY and piped input modes. Storage is bounded and recoverable, the sensitivity
+and same-user access limitations are disclosed, and history storage failure
+does not change execution outcomes.
 
 ---
 

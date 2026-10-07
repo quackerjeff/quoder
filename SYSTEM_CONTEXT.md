@@ -17,7 +17,7 @@ Keep this file concise, factual, and current.
 This repository exists to:
 - Preserve a continuous developer experience while using a fresh OpenCode session for every prompt
 - Supply compact, persistent harness context to disposable OpenCode sessions
-- Surface execution activity, permission requests, history, and repository changes without replacing OpenCode
+- Surface execution activity, permission requests, durable execution history, and repository changes without replacing OpenCode
 
 Primary user or system served:
 - A developer using OpenCode with local Ollama-hosted coding models under constrained VRAM
@@ -77,7 +77,7 @@ Source-of-truth contracts for this repo:
 
 - Product requirements: `docs/requirements.md`
 - Verified OpenCode integration patterns: `docs/tech.md`
-- Harness state and execution-record schemas: not yet designed
+- Persistent-state and execution-history contracts: `docs/tech.md`; implementation in `src/harness/project-memory.ts` and `src/harness/execution-history.ts`
 
 Rules:
 - do not guess contracts
@@ -87,7 +87,7 @@ Rules:
 ## Data and State
 
 Persistent state owned here:
-- None yet. Milestone 1 keeps no persistent harness state; harness context and execution history arrive in Milestones 5–6
+- Per-project context memory and execution history, stored in Quoder's local user state directory outside target repositories; each feature uses a separate state subtree and its own schema/retention rules.
 
 Important invariants:
 - Each submitted prompt uses a new OpenCode session.
@@ -113,7 +113,7 @@ Known failure modes or sensitive areas:
 - Model and tool output is untrusted and is displayed live. Terminal-escape injection and rendering-based freezes are mitigated by post-lex sanitization, worker-isolated Markdown rendering with deadlines, and linear main-thread text handling (Milestone 2 security review).
 - Session cleanup failures could retain unwanted model context or orphan resources.
 - Permission forwarding errors could weaken user control or block valid work.
-- Crashes or non-atomic state writes could corrupt harness history or preferences.
+- A process interruption can leave a valid execution-history record in progress; Quoder labels it as possibly interrupted rather than guessing. Atomic state writes protect saved context and history records from partial publication, but same-user processes are not isolated from their contents.
 
 Observability references:
 - Structured local logging is planned for a later milestone; no current observability artifacts exist.

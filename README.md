@@ -1,14 +1,15 @@
 # Quoder
 
 Quoder provides a persistent developer-facing shell while each prompt runs in a
-fresh, disposable OpenCode session. Milestones 1–4 provide the harness,
-streaming and live activity, interactive permission prompts, and read-only Git
-awareness. The Milestone 0 feasibility probe remains as regression evidence.
+fresh, disposable OpenCode session. Milestones 1–6 provide the harness,
+streaming and live activity, interactive permission prompts, read-only Git
+awareness, persistent project context, and execution history. The Milestone 0
+feasibility probe remains as regression evidence.
 
 Quoder is a single-developer local tool. It reviews what the model is about to
 do; it does not contain it. See "Known limitations".
 
-## Using Quoder (Milestones 1–4)
+## Using Quoder (Milestones 1–6)
 
 Install the pinned dependencies, build, and put `quoder` on your `PATH`:
 
@@ -88,8 +89,25 @@ How it behaves:
   - A multi-line paste stays one prompt until you press Return.
 - **Model.** The default is `ollama/glm-4.7-flash:latest`. Override it with
   `quoder --model provider/model`.
+- **Execution history.** Quoder stores one record for each submitted run,
+  outside the project in per-project local state. `/history` lists the ten
+  most recent IDs, timestamps, and statuses; `/history <id>` shows a record,
+  and `/history help` lists all controls. `/history retention` shows the
+  completed-record limit (default 100); `/history retention <count>` sets it
+  from 1 to 1,000. `/history clear <id>` deletes one record; `clear all` clears
+  this project's records. In-progress records are retained until
+  finalized or deleted, and after a restart are labeled “in progress / possibly
+  interrupted.”
+
+  History includes verbatim prompts, injected context, Bash command strings,
+  and answered responses; Quoder does not detect or redact secrets in those
+  fields. The startup notice and `/history help` disclose this sensitivity.
+  Private file permissions do not protect records from other processes running
+  as the same user. Records omit credentials, session IDs, tool output, and
+  complete OpenCode event payloads. Recorded Git paths describe observed
+  before/after state and do not prove authorship.
 - **Commands and keys.**
-  - `/help`; `/exit` or Ctrl-D to leave.
+  - `/help`; `/memory help`; `/history help`; `/exit` or Ctrl-D to leave.
   - Ctrl-C cancels a running prompt (interrupt, settle, delete), prints
     "Execution cancelled … Harness session remains active.", and returns to
     the prompt.

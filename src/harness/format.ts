@@ -5,6 +5,7 @@ import type { TurnStats } from "./live-view.js";
 import type { PromptResult, RejectedPermission, TurnOutcome } from "./session-runner.js";
 import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
 import type { MemoryUnavailableReason, ProjectMemory } from "./project-memory.js";
+import type { ExecutionHistoryRecord, ExecutionHistorySummary, HistoryUnavailableReason } from "./execution-history.js";
 
 const seconds = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
 
@@ -296,6 +297,108 @@ export function formatProjectMemoryFailure(reason: MemoryUnavailableReason, oper
   return `Could not ${operation} project memory: ${memoryFailureText[reason]}.`;
 }
 
+const historyFailureText: Record<HistoryUnavailableReason, string> = {
+  corrupt: "the stored record is malformed",
+  "unsupported-version": "the stored data uses an unsupported version",
+  "invalid-data": "the stored data did not pass validation",
+  oversized: "the stored data exceeds the size limit",
+  "unsafe-path": "the history path is unsafe",
+  "io-error": "history storage could not be accessed",
+};
+
+export function formatExecutionHistoryFailure(reason: HistoryUnavailableReason): string {
+  return `Execution history is unavailable: ${historyFailureText[reason]}.`;
+}
+
+const historyStatus = (status: ExecutionHistorySummary["status"]): string =>
+  status === "in-progress" ? "in progress / possibly interrupted" : status;
+
+export function formatExecutionHistoryList(records: readonly ExecutionHistorySummary[], theme: Theme = PLAIN_THEME): string {
+  if (records.length === 0) return "No execution history yet.\n";
+  return `${theme.paint("strong", "Execution history (10 most recent)")}\n${records.map((record) =>
+    `  ${record.id}  ${sanitizeForTerminal(record.startedAt)}  ${historyStatus(record.status)}`,
+  ).join("\n")}\n`;
+}
+
+const historyValueLines = (value: string): string[] =>
+  sanitizeForTerminal(value).split("\n").map((line) => `  ${line}`);
+
+const historyField = (label: string, value: string | null): string[] =>
+  value === null ? [`${label}: (unavailable)`] : [`${label}:`, ...historyValueLines(value)];
+
+/** Full record view. Values are sanitized but never clipped; field labels remain separate from data. */
+export function formatExecutionHistoryRecord(record: ExecutionHistoryRecord, theme: Theme = PLAIN_THEME): string {
+  const lines = [
+    theme.paint("strong", "Execution history record"),
+    `ID: ${record.id}`,
+    `Schema version: ${record.version}`,
+    `Started: ${sanitizeForTerminal(record.startedAt)}`,
+    `Finished: ${record.finishedAt === null ? "(in progress / possibly interrupted)" : sanitizeForTerminal(record.finishedAt)}`,
+    `Duration: ${record.durationMs === null ? "(unavailable)" : `${record.durationMs} ms`}`,
+    ...historyField("Project name", record.project.name),
+    ...historyField("Project root", record.project.root),
+    ...historyField("Branch", record.branch),
+    ...historyField("Starting HEAD", record.startingHead),
+    ...historyField("Model provider", record.model.providerID),
+    ...historyField("Model ID", record.model.id),
+    ...historyField("Agent", record.agent),
+    `Status: ${historyStatus(record.status)}`,
+    `Attempts: ${record.attempts}`,
+    `Failure stage: ${record.failureStage ?? "(none)"}`,
+    ...historyField("Developer prompt", record.prompt),
+    ...historyField("Injected context", record.injectedContext),
+    "Permission decisions:",
+  ];
+  if (record.permissionDecisions.length === 0) lines.push("  (none)");
+  for (const [index, decision] of record.permissionDecisions.entries()) {
+    lines.push(`  ${index + 1}. resources=${decision.resourceCount ?? "(unavailable)"}; reply=${decision.reply}; replied=${decision.replied}`);
+    lines.push(...historyField("     action", decision.action));
+  }
+  lines.push("Commands:");
+  if (record.commands.length === 0) lines.push("  (none)");
+  for (const [index, command] of record.commands.entries()) {
+    lines.push(`  ${index + 1}. status=${command.status}`, ...historyValueLines(command.command));
+  }
+  lines.push("Tool activity:");
+  if (record.toolActivity.length === 0) lines.push("  (none)");
+  for (const activity of record.toolActivity) {
+    lines.push(`  status=${activity.status}`);
+    lines.push(...historyField("  tool", activity.tool));
+  }
+  lines.push("Observed file changes:");
+  if (record.filesChanged === null) lines.push("  (unavailable while run is in progress)");
+  else if (record.filesChanged.status === "unavailable") {
+    lines.push("  unavailable; reason:", ...historyValueLines(record.filesChanged.reason ?? "unknown").map((line) => `  ${line}`));
+  }
+  else if (record.filesChanged.paths.length === 0) lines.push("  (none observed)");
+  else for (const change of record.filesChanged.paths) {
+    lines.push(`  ${change.kind}:`);
+    lines.push(...historyValueLines(change.path));
+    if (change.previousPath !== null) lines.push("    previous path:", ...historyValueLines(change.previousPath).map((line) => `  ${line}`));
+  }
+  lines.push(...historyField(
+    "Final response",
+    record.finalResponse === null && record.status === "in-progress"
+      ? "(unavailable while execution is in progress)"
+      : record.finalResponse,
+  ));
+  return `${lines.join("\n")}\n`;
+}
+
+export const EXECUTION_HISTORY_HELP_TEXT = [
+  "Execution history is stored locally outside the project and may contain verbatim prompts, context, commands, and responses.",
+  "Quoder does not detect or redact secrets in these fields. Other processes running as your user may be able to read them.",
+  "History is per project. The default retention is 100 completed records; set it from 1 to 1,000. In-progress runs are retained until they finish.",
+  "Use clear controls to remove records. Stored records are not proof that a run authored observed Git changes.",
+  "",
+  "  /history                         List the ten most recent runs",
+  "  /history <id>                    Show one complete record",
+  "  /history retention               Show the completed-record limit",
+  "  /history retention <count>       Set the completed-record limit (1–1,000)",
+  "  /history clear <id>              Delete one run",
+  "  /history clear all               Delete all runs for this project",
+].join("\n");
+
 export const PROJECT_MEMORY_HELP_TEXT = [
   "Project memory is stored locally outside the project. Other processes running as your user may be able to read it.",
   "Automatic summaries save bounded request/response excerpts verbatim; Quoder does not detect or redact secrets.",
@@ -323,6 +426,8 @@ export const HELP_TEXT = [
   "  /help          Show this help",
   "  /memory help   Inspect or manage persistent project context",
   "  /memory        Inspect or manage persistent project context",
+  "  /history help  Inspect or manage execution history",
+  "  /history       List recent executions",
   "  /exit          Leave Quoder (Ctrl-D also works)",
   "  Shift+Return   Start a new line; Return sends the prompt",
   "",

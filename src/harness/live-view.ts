@@ -4,6 +4,7 @@ import { renderActivity, runningLabel, summarizeCall, summarizeResult, type Tool
 import type { PromptResult } from "./session-runner.js";
 import type { StreamEvent } from "./stream-events.js";
 import { sanitizeLine } from "./terminal-text.js";
+import type { HistoryCommand, HistoryToolActivity } from "./execution-history.js";
 
 /** Totals for the final status line. */
 export interface TurnStats {
@@ -26,6 +27,8 @@ export interface LiveViewOptions {
   readonly render?: MarkdownRenderer;
   readonly onFirstText?: () => void;
   readonly onToolFinished?: (tool: string) => void;
+  /** Receives only normalized tool identity, the exact Bash command when applicable, and outcome. */
+  readonly onToolRecorded?: (activity: HistoryToolActivity, command?: HistoryCommand) => void;
   readonly now?: () => number;
   readonly frameMs?: number;
   readonly idleFlushMs?: number;
@@ -283,6 +286,21 @@ export class LiveView {
     this.#permanent(`${this.#lastKind === "text" ? "\n" : ""}${renderActivity(line, this.#options.theme)}\n`, "tool");
     this.#toolCount++;
     this.#options.onToolFinished?.(sanitizeLine(running.tool, 40));
+    const status = outcome.kind === "cancelled"
+      ? "cancelled"
+      : outcome.kind === "failed"
+        ? "failed"
+        : running.tool === "bash"
+          ? typeof outcome.structured.exit === "number"
+            ? outcome.structured.exit === 0 ? "succeeded" : "failed"
+            : "unknown"
+          : "succeeded";
+    this.#options.onToolRecorded?.(
+      { tool: running.tool, status },
+      running.tool === "bash" && typeof running.input?.command === "string"
+        ? { command: running.input.command, status: status === "succeeded" || status === "failed" || status === "cancelled" ? status : "unknown" }
+        : undefined,
+    );
     this.#phase = this.#tools.size > 0 ? this.#runningPhase() : "Thinking";
   }
 
