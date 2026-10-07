@@ -6,6 +6,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { EventMonitorOptions } from "../../src/event-monitor.js";
 import type { GitSnapshot, GitSnapshotResult } from "../../src/harness/git-state.js";
 import type { GitDiffDocument } from "../../src/harness/git-diff.js";
+import {
+  emptyProjectMemory,
+  type ProjectMemory,
+  type ProjectMemoryLoadResult,
+  type ProjectMemoryStore,
+  type ProjectMemoryWriteResult,
+} from "../../src/harness/project-memory.js";
 import { Harness, type HarnessTraceEvent } from "../../src/harness/repl.js";
 import type { AuthenticatedServerOptions } from "../../src/opencode-server.js";
 import { createTheme, type Theme } from "../../src/ui/style.js";
@@ -249,10 +256,37 @@ interface HarnessRunOptions extends FakeOptions {
   readonly theme?: Theme;
   readonly gitSnapshots?: readonly GitSnapshotResult[];
   readonly gitDiff?: GitDiffDocument;
+  readonly initialMemory?: ProjectMemoryLoadResult;
+  readonly memorySaveResult?: ProjectMemoryWriteResult;
+  readonly memoryClearResult?: ProjectMemoryWriteResult;
+}
+
+function fakeProjectMemoryStore(options: Pick<HarnessRunOptions, "initialMemory" | "memorySaveResult" | "memoryClearResult"> = {}) {
+  let loadResult = options.initialMemory ?? { status: "missing" as const, memory: emptyProjectMemory() };
+  const saved: ProjectMemory[] = [];
+  const store: ProjectMemoryStore = {
+    filePath: "/tmp/quoder-test-state/Quoder/context/project.json",
+    load: vi.fn(async () => loadResult),
+    save: vi.fn(async (memory) => {
+      const result = options.memorySaveResult ?? { ok: true as const };
+      if (result.ok) {
+        saved.push(memory);
+        loadResult = { status: "loaded", memory };
+      }
+      return result;
+    }),
+    clear: vi.fn(async () => {
+      const result = options.memoryClearResult ?? { ok: true as const };
+      if (result.ok) loadResult = { status: "loaded", memory: emptyProjectMemory() };
+      return result;
+    }),
+  };
+  return { store, saved, get currentLoadResult() { return loadResult; } };
 }
 
 const startHarness = (options: HarnessRunOptions = {}) => {
   const fake = fakeOpenCode(options);
+  const memory = fakeProjectMemoryStore(options);
   const input = new PassThrough();
   const output = new PassThrough();
   let text = "";
@@ -307,6 +341,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
         };
       }),
       createClient: vi.fn(() => fake.client),
+      createProjectMemoryStore: vi.fn(() => memory.store),
       startMonitor: vi.fn(async (monitorOptions: EventMonitorOptions) => {
         fake.state.monitor = monitorOptions;
         return {
@@ -334,7 +369,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
     },
   );
   const finished = harness.run();
-  return { harness, finished, input, output: () => text, trace, calls: fake.calls, fake, exits, counts, launchOptions, gitCaptures };
+  return { harness, finished, input, output: () => text, trace, calls: fake.calls, fake, exits, counts, launchOptions, gitCaptures, memory };
 };
 
 const sessionsCreated = (trace: readonly HarnessTraceEvent[]) =>
@@ -485,6 +520,202 @@ describe("quoder harness (Milestone 1)", () => {
     expect(run.output()).toContain("Unknown command.");
     expect(sessionsCreated(run.trace)).toEqual([]);
     expect(run.counts.closed).toBe(1);
+  });
+
+  it("discloses local project memory at startup and documents its sensitive-data controls", async () => {
+    const run = startHarness();
+    run.input.end("/memory help\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Project context memory is stored locally");
+    expect(run.output()).toContain("automatic previous-result summary on");
+    expect(run.output()).toContain("does not detect or redact secrets");
+    expect(run.output()).toContain("/memory auto off");
+    expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+
+  it("supports inspecting, setting, appending, removing, toggling, and clearing memory without starting sessions", async () => {
+    const run = startHarness();
+    run.input.end([
+      "/memory",
+      "/memory objective Add safe CSV import",
+      "/memory task Validate headers",
+      "/memory add decision Keep the parser dependency-free",
+      "/memory add constraint Do not persist Git diffs",
+      "/memory add issue Add malformed-row coverage",
+      "/memory remove decision 1",
+      "/memory auto off",
+      "/memory clear task",
+      "/memory clear issues",
+      "/memory show",
+      "/exit",
+    ].join("\n"));
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.memory.saved).toHaveLength(9);
+    expect(run.memory.currentLoadResult).toMatchObject({
+      status: "loaded",
+      memory: {
+        objective: "Add safe CSV import",
+        task: null,
+        decisions: [],
+        constraints: ["Do not persist Git diffs"],
+        unresolvedIssues: [],
+        automaticSummary: false,
+      },
+    });
+    expect(run.output()).toContain("Project memory");
+    expect(run.output()).toContain("Constraint 1 saved.");
+    expect(run.output()).toContain("Decision 1 removed.");
+    expect(run.output()).toContain("Task cleared.");
+    expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+
+  it("requires explicit whole-memory reset before changing corrupt saved state", async () => {
+    const run = startHarness({ initialMemory: { status: "unavailable", reason: "corrupt" } });
+    run.input.end("/memory show\n/memory objective Should not save\n/memory clear\n/memory show\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("saved project memory is malformed");
+    expect(run.output()).toContain("use /memory clear to reset or retry");
+    expect(run.memory.store.save).not.toHaveBeenCalled();
+    expect(run.memory.store.clear).toHaveBeenCalledTimes(1);
+    expect(run.memory.currentLoadResult).toMatchObject({ status: "loaded", memory: emptyProjectMemory() });
+    expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+
+  it("supports clearing each memory category and resetting all fields to defaults", async () => {
+    const initial = {
+      ...emptyProjectMemory(),
+      objective: "Objective",
+      task: "Task",
+      decisions: ["Decision"],
+      constraints: ["Constraint"],
+      unresolvedIssues: ["Issue"],
+      previousExecution: {
+        requestExcerpt: "Request",
+        responseExcerpt: "Response",
+        requestTruncated: false,
+        responseTruncated: false,
+      },
+      automaticSummary: false,
+    };
+    const run = startHarness({ initialMemory: { status: "loaded", memory: initial } });
+    run.input.end([
+      "/memory remove constraint 1",
+      "/memory remove issue 1",
+      "/memory auto on",
+      "/memory clear objective",
+      "/memory clear decisions",
+      "/memory clear constraints",
+      "/memory clear summary",
+      "/memory clear task",
+      "/memory clear",
+      "/memory show",
+      "/exit",
+    ].join("\n"));
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Constraint 1 removed.");
+    expect(run.output()).toContain("Issue 1 removed.");
+    expect(run.output()).toContain("Automatic previous-result summaries enabled.");
+    expect(run.output()).toContain("Objective cleared.");
+    expect(run.output()).toContain("Decisions cleared.");
+    expect(run.output()).toContain("Constraints cleared.");
+    expect(run.output()).toContain("Previous summary cleared.");
+    expect(run.memory.store.clear).toHaveBeenCalledTimes(1);
+    expect(run.memory.currentLoadResult).toEqual({ status: "loaded", memory: emptyProjectMemory() });
+  });
+
+  it("does not claim a memory update was saved when storage rejects it", async () => {
+    const original = { ...emptyProjectMemory(), objective: "Previously saved" };
+    const run = startHarness({
+      initialMemory: { status: "loaded", memory: original },
+      memorySaveResult: { ok: false, reason: "io-error" },
+    });
+    run.input.end("/memory objective New value\n/memory show\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Could not save project memory: project memory could not be accessed. No changes were saved.");
+    expect(run.output()).toContain("Objective: Previously saved");
+    expect(run.output()).not.toContain("Objective saved.");
+    expect(run.memory.saved).toEqual([]);
+    expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+
+  it("continues prompts when memory cannot be loaded or reset", async () => {
+    const run = startHarness({
+      initialMemory: { status: "unavailable", reason: "io-error" },
+      memoryClearResult: { ok: false, reason: "io-error" },
+    });
+    run.input.end("/memory clear\nordinary prompt despite memory error\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("project memory could not be accessed");
+    expect(run.output()).toContain("Answer: ordinary prompt despite memory error");
+    expect(run.memory.saved).toEqual([]);
+    expect(sessionsCreated(run.trace)).toEqual(["ses_1"]);
+    expect(sessionsDeleted(run.trace)).toEqual(["ses_1"]);
+  });
+
+  it("rejects empty, oversized, and out-of-range memory commands", async () => {
+    const run = startHarness();
+    run.input.end([
+      "/memory objective",
+      "/memory add decision",
+      `/memory task ${"🙂".repeat(501)}`,
+      "/memory remove issue 0",
+      "/memory typo",
+      "/exit",
+    ].join("\n"));
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Memory values cannot be empty");
+    expect(run.output()).toContain("Memory entries cannot be empty");
+    expect(run.output()).toContain("exceeds 500 Unicode characters");
+    expect(run.output()).toContain("memory item number does not exist");
+    expect(run.output()).toContain("Unknown memory command");
+    expect(run.memory.saved).toEqual([]);
+    expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+
+  it("sanitizes terminal control sequences in saved memory when showing it", async () => {
+    const run = startHarness({
+      initialMemory: {
+        status: "loaded",
+        memory: { ...emptyProjectMemory(), objective: "\u001b[31munsafe\u001b[0m" },
+      },
+    });
+    run.input.end("/memory show\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Objective: unsafe");
+    expect(run.output()).not.toContain("\u001b[31m");
+    expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+
+  it("handles memory commands from a TTY without changing cancellation behavior", async () => {
+    const run = startHarness({ terminal: true });
+    run.input.write("/memory task Keep persistent state\r");
+    await vi.waitFor(() => expect(run.output()).toContain("Task saved."));
+    run.input.write("slow stop\r");
+    await vi.waitFor(() => expect(run.calls).toContain("prompt:ses_1"));
+    run.harness.interrupt();
+    run.input.write("\u0004");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.memory.currentLoadResult).toMatchObject({ status: "loaded", memory: { task: "Keep persistent state" } });
+    expect(run.output()).toContain("Execution cancelled");
+    expect(sessionsDeleted(run.trace)).toEqual(["ses_1"]);
   });
 
   it.each([

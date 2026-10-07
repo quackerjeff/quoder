@@ -12,12 +12,31 @@ import {
 } from "../opencode-server.js";
 import type { MarkdownRenderer } from "../ui/markdown.js";
 import { PLAIN_THEME, type Theme } from "../ui/style.js";
-import { formatGitDiff, formatGitDiffFailure, formatGitDiffPage, HELP_TEXT, formatGitSummary, formatResult } from "./format.js";
+import {
+  formatGitDiff,
+  formatGitDiffFailure,
+  formatGitDiffPage,
+  formatProjectMemory,
+  formatProjectMemoryFailure,
+  HELP_TEXT,
+  PROJECT_MEMORY_HELP_TEXT,
+  formatGitSummary,
+  formatResult,
+} from "./format.js";
 import { captureGitDiff, hasInspectableGitDiff, type GitDiffResult } from "./git-diff.js";
 import { captureGitSnapshot, compareGitSnapshots, type GitComparison, type GitSnapshotResult } from "./git-state.js";
 import { CONTINUE_MARK, DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys } from "./line-keys.js";
 import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
+import {
+  createProjectMemoryStore,
+  emptyProjectMemory,
+  PROJECT_MEMORY_MAX_CODE_POINTS,
+  PROJECT_MEMORY_MAX_LIST_ITEMS,
+  type MemoryUnavailableReason,
+  type ProjectMemory,
+  type ProjectMemoryStore,
+} from "./project-memory.js";
 import { SessionTracker, runPrompt, type StopRequest, type TurnOutcome } from "./session-runner.js";
 import { narrowStreamEvent } from "./stream-events.js";
 import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
@@ -92,6 +111,8 @@ export interface HarnessDependencies {
   readonly compareGitSnapshots?: typeof compareGitSnapshots;
   readonly captureGitDiff?: typeof captureGitDiff;
   readonly trace?: (event: HarnessTraceEvent) => void;
+  /** Injectable project-memory store factory for harness tests and embedders. */
+  readonly createProjectMemoryStore?: (projectRoot: string) => ProjectMemoryStore;
 }
 
 export interface HarnessOptions {
@@ -130,6 +151,7 @@ interface ServerSession {
 export class Harness {
   readonly #options: HarnessOptions;
   readonly #dependencies: HarnessDependencies;
+  readonly #memoryStore: ProjectMemoryStore | undefined;
   readonly #tracker = new SessionTracker();
   readonly #permissionQueue: PermissionAsked[] = [];
   #permissionReplyInFlight: string | undefined;
@@ -163,10 +185,18 @@ export class Harness {
   #shutdown: Promise<number> | undefined;
   #diffInteraction: "choice" | "viewer" | undefined;
   #diffKeyResolver: ((key: DiffKey) => void) | undefined;
+  #memory: ProjectMemory | undefined;
+  #memoryUnavailable: MemoryUnavailableReason | undefined;
 
   constructor(options: HarnessOptions, dependencies: HarnessDependencies) {
     this.#options = options;
     this.#dependencies = dependencies;
+    try {
+      this.#memoryStore = (dependencies.createProjectMemoryStore ?? createProjectMemoryStore)(options.project.root);
+    } catch {
+      this.#memoryStore = undefined;
+      this.#memoryUnavailable = "io-error";
+    }
   }
 
   /** Runs until the developer exits; resolves with the process exit code. */
@@ -236,6 +266,7 @@ export class Harness {
     const theme = this.#theme;
     const projectName = sanitizeLine(project.name);
     const projectRoot = sanitizeLine(project.root);
+    await this.#loadProjectMemory();
     this.#write(
       `${theme.paint("prompt", "Quoder")} ${theme.paint("dim", "·")} ${theme.paint("strong", projectName)} ${theme.paint("dim", projectRoot)}\n` +
         `${theme.paint("dim", "Model")} ${theme.paint("accent", `${model.providerID}/${model.id}`)}\n` +
@@ -258,6 +289,16 @@ export class Harness {
       `${theme.paint("dim", "Permission prompts on")} ${theme.paint("dim", "·")} `
       + `${theme.paint("dim", "approved commands run with your full user authority; model-run tools are unconfined")}\n`,
     );
+    if (this.#memory !== undefined) {
+      this.#write(
+        `${theme.paint("dim", "Project context memory is stored locally")} ${theme.paint("dim", "·")} `
+        + `${theme.paint("dim", `automatic previous-result summary ${this.#memory.automaticSummary ? "on" : "off"}`)} ${theme.paint("dim", "·")} `
+        + `${theme.paint("dim", "type /memory help for details")}\n`,
+      );
+    } else {
+      const reason = this.#memoryUnavailable ?? "io-error";
+      this.#write(`${theme.paint("warning", `${formatProjectMemoryFailure(reason)} Prompts continue without memory; use /memory clear to reset or retry.`)}\n`);
+    }
     this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
     let input = this.#options.input;
     if (this.#options.terminal) {
@@ -485,12 +526,208 @@ export class Harness {
       this.#write(`${HELP_TEXT}\n\n`);
       return true;
     }
+    if (input === "/memory" || input.startsWith("/memory ")) {
+      await this.#handleMemoryCommand(input);
+      return true;
+    }
     if (input.startsWith("/")) {
       this.#write("Unknown command. Type /help for the commands Quoder supports.\n\n");
       return true;
     }
     await this.#runPrompt(input);
     return true;
+  }
+
+  async #loadProjectMemory(): Promise<void> {
+    if (this.#memoryStore === undefined) {
+      this.#memoryUnavailable ??= "io-error";
+      return;
+    }
+    try {
+      const result = await this.#memoryStore.load();
+      if (result.status === "unavailable") {
+        this.#memory = undefined;
+        this.#memoryUnavailable = result.reason;
+      } else {
+        this.#memory = result.memory;
+        this.#memoryUnavailable = undefined;
+      }
+    } catch {
+      this.#memory = undefined;
+      this.#memoryUnavailable = "io-error";
+    }
+  }
+
+  #memoryMessage(message: string, warning = false): void {
+    const painted = warning ? this.#theme.paint("warning", message) : this.#theme.paint("success", message);
+    this.#write(`${painted}\n\n`);
+  }
+
+  async #saveProjectMemory(memory: ProjectMemory, success: string): Promise<void> {
+    if (this.#memoryStore === undefined) {
+      this.#memoryMessage(`${formatProjectMemoryFailure("io-error", "save")} No changes were saved.`, true);
+      return;
+    }
+    try {
+      const result = await this.#memoryStore.save(memory);
+      if (!result.ok) {
+        const advice = result.reason === "oversized" ? " Remove an entry or clear unused memory, then retry." : "";
+        this.#memoryMessage(`${formatProjectMemoryFailure(result.reason, "save")} No changes were saved.${advice}`, true);
+        return;
+      }
+      this.#memory = memory;
+      this.#memoryUnavailable = undefined;
+      this.#memoryMessage(success);
+    } catch {
+      this.#memoryMessage(`${formatProjectMemoryFailure("io-error", "save")} No changes were saved.`, true);
+    }
+  }
+
+  async #clearProjectMemory(): Promise<void> {
+    if (this.#memoryStore === undefined) {
+      this.#memoryMessage(`${formatProjectMemoryFailure("io-error", "clear")} No changes were saved.`, true);
+      return;
+    }
+    try {
+      const result = await this.#memoryStore.clear();
+      if (!result.ok) {
+        this.#memoryMessage(`${formatProjectMemoryFailure(result.reason, "clear")} No changes were saved.`, true);
+        return;
+      }
+      this.#memory = emptyProjectMemory();
+      this.#memoryUnavailable = undefined;
+      this.#memoryMessage("Project memory cleared. Automatic summaries will resume after the next answered prompt.");
+    } catch {
+      this.#memoryMessage(`${formatProjectMemoryFailure("io-error", "clear")} No changes were saved.`, true);
+    }
+  }
+
+  async #handleMemoryCommand(input: string): Promise<void> {
+    const command = input.slice("/memory".length).trim();
+    if (command === "" || command === "show") {
+      await this.#loadProjectMemory();
+      if (this.#memory === undefined) {
+        this.#memoryMessage(
+          `${formatProjectMemoryFailure(this.#memoryUnavailable ?? "io-error")} Use /memory clear to reset or retry.`,
+          true,
+        );
+        return;
+      }
+      this.#write(`${formatProjectMemory(this.#memory, this.#memoryStore?.filePath ?? "(unavailable)", this.#theme)}\n`);
+      return;
+    }
+    if (command === "help") {
+      this.#write(`${PROJECT_MEMORY_HELP_TEXT}\n\n`);
+      return;
+    }
+    if (command === "clear") {
+      await this.#clearProjectMemory();
+      return;
+    }
+    if (this.#memory === undefined) {
+      this.#memoryMessage(
+        `Project memory is unavailable. ${formatProjectMemoryFailure(this.#memoryUnavailable ?? "io-error")} Use /memory clear to reset or retry.`,
+        true,
+      );
+      return;
+    }
+
+    if (command === "objective" || command === "task") {
+      this.#memoryMessage("Memory values cannot be empty; use /memory clear objective or /memory clear task.", true);
+      return;
+    }
+    const setting = command.match(/^(objective|task)\s+([\s\S]+)$/u);
+    if (setting !== null) {
+      const field = setting[1] as "objective" | "task";
+      const value = setting[2]?.trim() ?? "";
+      if (value === "") {
+        this.#memoryMessage("Memory values cannot be empty; use /memory clear objective or /memory clear task.", true);
+        return;
+      }
+      if (Array.from(value).length > PROJECT_MEMORY_MAX_CODE_POINTS) {
+        this.#memoryMessage(`That value exceeds ${PROJECT_MEMORY_MAX_CODE_POINTS} Unicode characters. No changes were saved.`, true);
+        return;
+      }
+      await this.#saveProjectMemory({ ...this.#memory, [field]: value }, `${field === "objective" ? "Objective" : "Task"} saved.`);
+      return;
+    }
+
+    if (/^add\s+(decision|constraint|issue)$/u.test(command)) {
+      this.#memoryMessage("Memory entries cannot be empty. No changes were saved.", true);
+      return;
+    }
+    const add = command.match(/^add\s+(decision|constraint|issue)\s+([\s\S]+)$/u);
+    if (add !== null) {
+      const kind = add[1];
+      const value = add[2]?.trim() ?? "";
+      if (value === "") {
+        this.#memoryMessage("Memory entries cannot be empty. No changes were saved.", true);
+        return;
+      }
+      if (Array.from(value).length > PROJECT_MEMORY_MAX_CODE_POINTS) {
+        this.#memoryMessage(`That entry exceeds ${PROJECT_MEMORY_MAX_CODE_POINTS} Unicode characters. No changes were saved.`, true);
+        return;
+      }
+      const field = kind === "decision" ? "decisions" : kind === "constraint" ? "constraints" : "unresolvedIssues";
+      const current = this.#memory[field];
+      if (current.length >= PROJECT_MEMORY_MAX_LIST_ITEMS) {
+        this.#memoryMessage(`That list already has ${PROJECT_MEMORY_MAX_LIST_ITEMS} entries. Remove one before adding another.`, true);
+        return;
+      }
+      const next = [...current, value];
+      const label = kind === "decision" ? "Decision" : kind === "constraint" ? "Constraint" : "Issue";
+      await this.#saveProjectMemory({ ...this.#memory, [field]: next }, `${label} ${next.length} saved.`);
+      return;
+    }
+
+    const remove = command.match(/^remove\s+(decision|constraint|issue)\s+(\d+)$/u);
+    if (remove !== null) {
+      const kind = remove[1];
+      const index = Number(remove[2]) - 1;
+      const field = kind === "decision" ? "decisions" : kind === "constraint" ? "constraints" : "unresolvedIssues";
+      const current = this.#memory[field];
+      if (!Number.isSafeInteger(index) || index < 0 || index >= current.length) {
+        this.#memoryMessage("That memory item number does not exist. Use /memory show to see list numbers.", true);
+        return;
+      }
+      const next = current.filter((_entry, candidate) => candidate !== index);
+      const label = kind === "decision" ? "Decision" : kind === "constraint" ? "Constraint" : "Issue";
+      await this.#saveProjectMemory({ ...this.#memory, [field]: next }, `${label} ${index + 1} removed.`);
+      return;
+    }
+
+    const auto = command.match(/^auto\s+(on|off)$/u);
+    if (auto !== null) {
+      const enabled = auto[1] === "on";
+      await this.#saveProjectMemory(
+        { ...this.#memory, automaticSummary: enabled },
+        `Automatic previous-result summaries ${enabled ? "enabled" : "disabled"}.`,
+      );
+      return;
+    }
+
+    const clear = command.match(/^clear\s+(objective|task|decisions|constraints|issues|summary)$/u);
+    if (clear !== null) {
+      const field = clear[1];
+      const next = field === "objective" || field === "task"
+        ? { ...this.#memory, [field]: null }
+        : field === "decisions"
+          ? { ...this.#memory, decisions: [] }
+          : field === "constraints"
+            ? { ...this.#memory, constraints: [] }
+            : field === "issues"
+              ? { ...this.#memory, unresolvedIssues: [] }
+              : { ...this.#memory, previousExecution: null };
+      const label = field === "objective" ? "Objective"
+        : field === "task" ? "Task"
+          : field === "decisions" ? "Decisions"
+            : field === "constraints" ? "Constraints"
+              : field === "issues" ? "Issues" : "Previous summary";
+      await this.#saveProjectMemory(next, `${label} cleared.`);
+      return;
+    }
+
+    this.#memoryMessage("Unknown memory command. Type /memory help for the supported commands.", true);
   }
 
   async #runPrompt(prompt: string): Promise<void> {

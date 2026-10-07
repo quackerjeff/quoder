@@ -4,6 +4,7 @@ import type { GitComparison, GitDiffStats, GitFailureKind, GitPathChange } from 
 import type { TurnStats } from "./live-view.js";
 import type { PromptResult, RejectedPermission, TurnOutcome } from "./session-runner.js";
 import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
+import type { MemoryUnavailableReason, ProjectMemory } from "./project-memory.js";
 
 const seconds = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
 
@@ -238,10 +239,88 @@ export function formatResult(result: PromptResult, theme: Theme = PLAIN_THEME, s
   return `${lines.join("\n")}\n`;
 }
 
+const formatMemoryValue = (value: string): string =>
+  sanitizeForTerminal(value).split("\n").map((line) => `  ${line}`).join("\n");
+
+const memoryFieldValue = (value: string | null): string => {
+  if (value === null) return "(not set)";
+  const safe = sanitizeForTerminal(value);
+  return safe.includes("\n") ? `\n${formatMemoryValue(safe)}` : safe.replace(/\s+/gu, " ");
+};
+
+/** Displays developer-authored memory after escaping terminal control sequences. */
+export function formatProjectMemory(memory: ProjectMemory, filePath: string, theme: Theme = PLAIN_THEME): string {
+  const lines = [
+    theme.paint("strong", "Project memory"),
+    `Storage: ${sanitizeLine(filePath, 240)}`,
+    `Automatic previous-result summary: ${memory.automaticSummary ? "on" : "off"}`,
+    `Objective: ${memoryFieldValue(memory.objective)}`,
+    `Task: ${memoryFieldValue(memory.task)}`,
+  ];
+  const addList = (label: string, values: readonly string[]): void => {
+    lines.push(`${label}:`);
+    if (values.length === 0) lines.push("  (none)");
+    for (const [index, value] of values.entries()) {
+      const safe = formatMemoryValue(value).replace(/^  /u, "");
+      const [first = "", ...rest] = safe.split("\n");
+      lines.push(`  ${index + 1}. ${first}`, ...rest.map((line) => `     ${line}`));
+    }
+  };
+  addList("Decisions", memory.decisions);
+  addList("Constraints", memory.constraints);
+  addList("Unresolved issues", memory.unresolvedIssues);
+  if (memory.previousExecution === null) {
+    lines.push("Previous execution summary: (none)");
+  } else {
+    const request = formatMemoryValue(memory.previousExecution.requestExcerpt).replace(/^  /u, "");
+    const response = formatMemoryValue(memory.previousExecution.responseExcerpt).replace(/^  /u, "");
+    lines.push(
+      "Previous execution summary (bounded excerpts; not verified facts):",
+      `  Request${memory.previousExecution.requestTruncated ? " (truncated)" : ""}: ${request}`,
+      `  Response${memory.previousExecution.responseTruncated ? " (truncated)" : ""}: ${response}`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+const memoryFailureText: Record<MemoryUnavailableReason, string> = {
+  corrupt: "saved project memory is malformed",
+  "unsupported-version": "saved project memory uses an unsupported version",
+  "invalid-data": "project memory did not pass validation",
+  oversized: "project memory exceeds the storage limit",
+  "unsafe-path": "the project memory path is unsafe",
+  "io-error": "project memory could not be accessed",
+};
+
+export function formatProjectMemoryFailure(reason: MemoryUnavailableReason, operation = "load"): string {
+  return `Could not ${operation} project memory: ${memoryFailureText[reason]}.`;
+}
+
+export const PROJECT_MEMORY_HELP_TEXT = [
+  "Project memory is stored locally outside the project. Other processes running as your user may be able to read it.",
+  "Automatic previous-result summaries save bounded request/response excerpts verbatim; Quoder does not detect or redact secrets.",
+  "Use `/memory auto off` to stop replacing the previous-result summary, and `/memory clear summary` to remove the current one.",
+  "Objective/task fields allow 500 characters. Decisions, constraints, and issues allow 20 entries of 500 characters each.",
+  "The saved document is limited to 32 KiB; injected context is capped at 4,096 characters.",
+  "",
+  "  /memory show                         Show saved project memory",
+  "  /memory objective <text>            Set the objective",
+  "  /memory task <text>                 Set the current task",
+  "  /memory add decision <text>         Add a durable decision",
+  "  /memory add constraint <text>       Add a project constraint",
+  "  /memory add issue <text>            Add an unresolved issue",
+  "  /memory remove <kind> <number>      Remove a decision, constraint, or issue",
+  "  /memory auto on|off                 Enable or disable automatic summaries",
+  "  /memory clear <field|category>      Clear one field/category/summary",
+  "  /memory clear                       Clear all context memory",
+].join("\n");
+
 export const HELP_TEXT = [
   "Each prompt runs in a fresh OpenCode session that is deleted afterwards.",
   "",
   "  /help          Show this help",
+  "  /memory help   Inspect or manage persistent project context",
+  "  /memory        Inspect or manage persistent project context",
   "  /exit          Leave Quoder (Ctrl-D also works)",
   "  Shift+Return   Start a new line; Return sends the prompt",
   "",
