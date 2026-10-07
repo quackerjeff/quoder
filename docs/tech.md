@@ -71,6 +71,37 @@ Local server command:
 npx --no-install opencode serve --hostname 127.0.0.1 --port <port>
 ```
 
+### Model and Agent Discovery (Milestone 7 research, 2026-10-07)
+
+The pinned `@opencode-ai/sdk@1.18.33` V2 client exposes project-scoped
+catalogs: `client.v2.model.list({ location: { directory } })` returns
+`{ location, data: ModelV2Info[] }`, and
+`client.v2.agent.list({ location: { directory } })` returns
+`{ location, data: AgentV2Info[] }`. The generated declarations are in
+`node_modules/@opencode-ai/sdk/dist/v2/gen/sdk.gen.d.ts` and
+`types.gen.d.ts`; both methods accept an optional `signal` through their
+second request-options argument.
+
+`ModelV2Info` includes `id`, `providerID`, `name`, `enabled`, and status.
+`AgentV2Info` includes `id`, `mode`, and `hidden`; mode is `primary`,
+`subagent`, or `all`. These fields are sufficient to build selectable labels
+without showing agent system prompts, provider request details, or permission
+rules. Core V2 session creation accepts both `agent?: string` and
+`model?: ModelRef`, where `ModelRef` contains `providerID`, `id`, and optional
+`variant`. This is the same session-creation contract Quoder already uses;
+Milestone 7 does not require a new endpoint or dependency.
+
+**Milestone 7 implementation:** `OpenCodeAdapter.listModels(directory)` and
+`listAgents(directory)` call those V2 endpoints with the canonical project
+root and a per-call deadline. Models are reduced to provider ID, model ID, and
+display name after filtering disabled entries. Agents are reduced to IDs after
+filtering hidden and subagent-only entries. The REPL sanitizes catalog values
+before display, resolves exact or unique case-insensitive partial matches, and
+keeps the selected model/agent in process memory. Each prompt snapshots both
+values before it starts, passes them to the fresh session, and records them in
+execution history. `/model` and `/agent` catalog errors use fixed messages and
+do not alter the current selection. This selection state is not persisted.
+
 The Quoder launcher omits `--pure` and registers a `shell.env` plugin from a final `OPENCODE_CONFIG_CONTENT` merge. This does not isolate credentials for the Core V2 Bash tool in `opencode-ai@1.18.33`: pinned `packages/core/src/tool/bash.ts` marks plugin `shell.env` support as TODO and creates the child process directly. A bounded user-guided tool-shell probe confirmed that `OPENCODE_CONFIG_CONTENT` and `OPENCODE_SERVER_PASSWORD` were nonempty. Same-user processes can inspect an owned server's environment using `ps eww`, and local MCP child processes also inherit `process.env`. The Seatbelt trampoline is not honored on the Core V2 session path used by the harness. These isolation gaps are defense-in-depth follow-up, not a gate on the enabled permission prompts; the CLI discloses that model-run tools are unconfined. Since project plugins execute in the server process and can access its environment, Quoder rejects project plugin configuration and plugin directories while preserving plugin-free project settings. User-level plugins remain trusted.
 
 Group 3 verification: unit coverage confirms project settings without plugin sources are accepted, root/nested/ancestor plugin sources are rejected, and the `shell.env` hook function blanks the server credentials and inherited inline config when called. This does not establish invocation by Core V2 Bash; pinned 1.18.33 source explicitly records that hook integration as TODO, and runtime probing confirmed the two credential/config variables remain nonempty. Authenticated server startup and native save scope/revocation passed no-model runtime checks. Credential isolation remains unverified on the harness path and is not a release blocker under the 2026-10-06 requirement restatement.
@@ -111,7 +142,7 @@ Verification recorded for this milestone: 552 tests across 29 files pass, as do 
 
 `src/harness/repl.ts` begins one history record after the baseline Git snapshot and context assembly, before submitting a prompt. Initial Quoder/OpenCode startup occurs before the developer can submit a prompt, so startup failure creates no execution record. If a server must be started or replaced after the record begins and that startup fails, the run finalizes as `failed` with `failureStage: "server-start"`. A dropped admitted prompt retried in a fresh OpenCode session remains one Quoder record and increments `attempts`. Normal cancellation, permission rejection, question rejection, failure, and answered outcomes finalize the same record after the final Git comparison. A process interruption before finalization leaves its last valid `in-progress` record; list and detail label this “in progress / possibly interrupted” because another Quoder process may still own it.
 
-The version-1 record in `src/harness/execution-history.ts` contains a 32-character lowercase random ID, timestamps and duration, project name/canonical root, starting branch and HEAD, model provider/ID, nullable agent, exact developer prompt and injected context, compact permission decisions (action, resource count, selected reply and reply success), exact Bash command strings/statuses, tool names/statuses, observed file changes, final response, outcome, retry-attempt count, and optional server-start failure stage. It omits credentials, OpenCode session IDs, tool stdout/stderr, full tool inputs/outputs, and SDK/event payloads. Agent is null because the current harness does not select one. Git changes retain Milestone 4 endpoint-observation semantics and do not establish authorship.
+The version-1 record in `src/harness/execution-history.ts` contains a 32-character lowercase random ID, timestamps and duration, project name/canonical root, starting branch and HEAD, model provider/ID, nullable agent, exact developer prompt and injected context, compact permission decisions (action, resource count, selected reply and reply success), exact Bash command strings/statuses, tool names/statuses, observed file changes, final response, outcome, retry-attempt count, and optional server-start failure stage. It omits credentials, OpenCode session IDs, tool stdout/stderr, full tool inputs/outputs, and SDK/event payloads. Milestone 6 left agent nullable because selection was not yet supported; Milestone 7 records the selected agent for new runs. Git changes retain Milestone 4 endpoint-observation semantics and do not establish authorship.
 
 The store uses Node filesystem/path/crypto APIs; no persistence dependency was added. It stores each project's records outside the target repository under `$XDG_STATE_HOME/quoder/history/<sha256-project-root>` when `XDG_STATE_HOME` is absolute. Otherwise it uses `~/Library/Application Support/Quoder/history/<sha256-project-root>` on macOS and `~/.local/state/quoder/history/<sha256-project-root>` on other supported POSIX systems. The default maximum is 100 completed records per project, configurable from 1 through 1,000; the list shows ten newest metadata-only summaries. In-progress records do not count toward retention. Concurrent completions may temporarily exceed the selected cap; finalization prunes oldest completed records.
 

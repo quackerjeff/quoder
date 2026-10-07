@@ -4,7 +4,7 @@ import { createInterface, emitKeypressEvents, type Interface } from "node:readli
 import type { ModelRef, OpencodeClient } from "@opencode-ai/sdk/v2";
 
 import { startEventMonitor, type EventMonitor, type PermissionAsked } from "../event-monitor.js";
-import { OpenCodeAdapter } from "../opencode-adapter.js";
+import { OpenCodeAdapter, type OpenCodeAgentOption, type OpenCodeModelOption } from "../opencode-adapter.js";
 import {
   basicAuthorizationHeader,
   type AuthenticatedServerLaunch,
@@ -22,6 +22,8 @@ import {
   formatExecutionHistoryFailure,
   formatExecutionHistoryList,
   formatExecutionHistoryRecord,
+  formatModelChoices,
+  formatAgentChoices,
   HELP_TEXT,
   PROJECT_MEMORY_HELP_TEXT,
   formatGitSummary,
@@ -52,6 +54,7 @@ import {
   type ProjectMemoryStore,
 } from "./project-memory.js";
 import { SessionTracker, runPrompt, type StopRequest, type TurnOutcome } from "./session-runner.js";
+import { resolveAgentSelection, resolveModelSelection } from "./selection.js";
 import { narrowStreamEvent } from "./stream-events.js";
 import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
 
@@ -213,10 +216,13 @@ export class Harness {
   #diffKeyResolver: ((key: DiffKey) => void) | undefined;
   #memory: ProjectMemory | undefined;
   #memoryUnavailable: MemoryUnavailableReason | undefined;
+  #selectedModel: ModelRef;
+  #selectedAgent = "build";
 
   constructor(options: HarnessOptions, dependencies: HarnessDependencies) {
     this.#options = options;
     this.#dependencies = dependencies;
+    this.#selectedModel = options.model;
     try {
       this.#memoryStore = (dependencies.createProjectMemoryStore ?? createProjectMemoryStore)(options.project.root);
     } catch {
@@ -293,14 +299,15 @@ export class Harness {
   }
 
   async #main(): Promise<number> {
-    const { project, model } = this.#options;
+    const { project } = this.#options;
     const theme = this.#theme;
     const projectName = sanitizeLine(project.name);
     const projectRoot = sanitizeLine(project.root);
     await this.#loadProjectMemory();
     this.#write(
       `${theme.paint("prompt", "Quoder")} ${theme.paint("dim", "·")} ${theme.paint("strong", projectName)} ${theme.paint("dim", projectRoot)}\n` +
-        `${theme.paint("dim", "Model")} ${theme.paint("accent", `${model.providerID}/${model.id}`)}\n` +
+        `${theme.paint("dim", "Model")} ${theme.paint("accent", `${this.#selectedModel.providerID}/${this.#selectedModel.id}`)}\n` +
+        `${theme.paint("dim", "Agent")} ${theme.paint("accent", this.#selectedAgent)}\n` +
         `${theme.paint("dim", "Starting OpenCode server…")}\n`,
     );
     try {
@@ -579,6 +586,14 @@ export class Harness {
       this.#write(`${HELP_TEXT}\n\n`);
       return true;
     }
+    if (input === "/model" || input.startsWith("/model ")) {
+      await this.#handleModelCommand(input);
+      return true;
+    }
+    if (input === "/agent" || input.startsWith("/agent ")) {
+      await this.#handleAgentCommand(input);
+      return true;
+    }
     if (input === "/memory" || input.startsWith("/memory ")) {
       await this.#handleMemoryCommand(input);
       return true;
@@ -593,6 +608,69 @@ export class Harness {
     }
     await this.#runPrompt(input);
     return true;
+  }
+
+  #selectionMessage(message: string, warning = false): void {
+    const painted = warning ? this.#theme.paint("warning", message) : this.#theme.paint("success", message);
+    this.#write(`${painted}\n\n`);
+  }
+
+  async #handleModelCommand(input: string): Promise<void> {
+    const query = input.slice("/model".length).trim();
+    let models: readonly OpenCodeModelOption[];
+    try {
+      const server = await this.#ensureServer();
+      models = await server.adapter.listModels(this.#options.project.root);
+    } catch {
+      this.#selectionMessage("Could not load configured models; the current model selection is unchanged.", true);
+      return;
+    }
+    if (query === "") {
+      this.#write(`${formatModelChoices(models, this.#selectedModel, this.#theme)}\n`);
+      return;
+    }
+    const result = resolveModelSelection(query, models);
+    if (result.kind === "selected") {
+      this.#selectedModel = result.value;
+      this.#selectionMessage(`Model selected for future prompts: ${sanitizeLine(`${result.value.providerID}/${result.value.id}`, 180)}.`);
+      return;
+    }
+    if (result.kind === "ambiguous") {
+      const matches = result.matches.map((match) => sanitizeLine(`${match.providerID}/${match.id}`, 180));
+      this.#selectionMessage(`Model query is ambiguous. Use one of these full IDs; selection is unchanged:\n  ${matches.join("\n  ")}`, true);
+    } else {
+      this.#selectionMessage(`No enabled model matches "${sanitizeLine(query, 80)}"; the selection is unchanged.`, true);
+    }
+    this.#write(`${formatModelChoices(models, this.#selectedModel, this.#theme)}\n`);
+  }
+
+  async #handleAgentCommand(input: string): Promise<void> {
+    const query = input.slice("/agent".length).trim();
+    let agents: readonly OpenCodeAgentOption[];
+    try {
+      const server = await this.#ensureServer();
+      agents = await server.adapter.listAgents(this.#options.project.root);
+    } catch {
+      this.#selectionMessage("Could not load configured agents; the current agent selection is unchanged.", true);
+      return;
+    }
+    if (query === "") {
+      this.#write(`${formatAgentChoices(agents, this.#selectedAgent, this.#theme)}\n`);
+      return;
+    }
+    const result = resolveAgentSelection(query, agents);
+    if (result.kind === "selected") {
+      this.#selectedAgent = result.value;
+      this.#selectionMessage(`Agent selected for future prompts: ${sanitizeLine(result.value, 120)}.`);
+      return;
+    }
+    if (result.kind === "ambiguous") {
+      const matches = result.matches.map((agent) => sanitizeLine(agent, 120));
+      this.#selectionMessage(`Agent query is ambiguous. Use one of these full IDs; selection is unchanged:\n  ${matches.join("\n  ")}`, true);
+    } else {
+      this.#selectionMessage(`No selectable agent matches "${sanitizeLine(query, 80)}"; the selection is unchanged.`, true);
+    }
+    this.#write(`${formatAgentChoices(agents, this.#selectedAgent, this.#theme)}\n`);
   }
 
   async #loadProjectMemory(): Promise<void> {
@@ -870,12 +948,14 @@ export class Harness {
   async #runPrompt(prompt: string): Promise<void> {
     const controller = new AbortController();
     this.#running = controller;
+    const model = this.#selectedModel;
+    const agent = this.#selectedAgent;
     const theme = this.#theme;
     const beforeGit = await this.#captureGitState();
     const memory = this.#memory ?? emptyProjectMemory();
     const harnessContext = buildHarnessContext(prompt, memory, beforeGit);
     const startedAt = Date.now();
-    const historyStart = await this.#beginHistory(prompt, harnessContext.context, beforeGit, startedAt);
+    const historyStart = await this.#beginHistory(prompt, harnessContext.context, beforeGit, startedAt, model, agent);
     if (historyStart !== undefined) {
       this.#activeHistory = {
         id: historyStart.id,
@@ -892,7 +972,7 @@ export class Harness {
       theme,
       write: (text) => this.#write(text),
       root: this.#options.project.root,
-      modelLabel: this.#options.model.id,
+      modelLabel: model.id,
       statusLine: this.#options.terminal,
       ...(this.#options.columns === undefined ? {} : { columns: this.#options.columns }),
       ...(this.#options.renderMarkdown === undefined ? {} : { render: this.#options.renderMarkdown }),
@@ -928,7 +1008,8 @@ export class Harness {
         adapter: server.adapter,
         tracker: this.#tracker,
         directory: this.#options.project.root,
-        model: this.#options.model,
+        model,
+        agent,
         prompt: harnessContext.combinedPrompt,
         cancel: controller.signal,
         ...(this.#dependencies.noResponseTimeoutMs === undefined ? {} : { noResponseTimeoutMs: this.#dependencies.noResponseTimeoutMs }),
@@ -989,6 +1070,8 @@ export class Harness {
     injectedContext: string,
     before: GitSnapshotResult,
     startedAt: number,
+    model: ModelRef,
+    agent: string,
   ): Promise<ExecutionHistoryRecord | undefined> {
     const store = this.#historyStore;
     if (store === undefined) {
@@ -1000,8 +1083,8 @@ export class Harness {
         startedAt: new Date(startedAt).toISOString(),
         branch: before.kind === "available" ? before.branch ?? null : null,
         startingHead: before.kind === "available" ? before.head ?? null : null,
-        model: { providerID: this.#options.model.providerID, id: this.#options.model.id },
-        agent: null,
+        model: { providerID: model.providerID, id: model.id },
+        agent,
         prompt,
         injectedContext,
       });

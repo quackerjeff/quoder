@@ -38,6 +38,8 @@ interface FakeMethods {
   globalEvents: ReturnType<typeof vi.fn>;
   deleteSession: ReturnType<typeof vi.fn>;
   rejectQuestion: ReturnType<typeof vi.fn>;
+  listModels: ReturnType<typeof vi.fn>;
+  listAgents: ReturnType<typeof vi.fn>;
 }
 
 const fakeClient = (): { client: OpencodeClient; methods: FakeMethods } => {
@@ -54,10 +56,18 @@ const fakeClient = (): { client: OpencodeClient; methods: FakeMethods } => {
     globalEvents: vi.fn(),
     deleteSession: vi.fn(),
     rejectQuestion: vi.fn(),
+    listModels: vi.fn(),
+    listAgents: vi.fn(),
   };
 
   const client = {
     v2: {
+      model: {
+        list: methods.listModels as Method<OpencodeClient["v2"]["model"]["list"]>,
+      },
+      agent: {
+        list: methods.listAgents as Method<OpencodeClient["v2"]["agent"]["list"]>,
+      },
       session: {
         create: methods.create as Method<OpencodeClient["v2"]["session"]["create"]>,
         prompt: methods.prompt as Method<OpencodeClient["v2"]["session"]["prompt"]>,
@@ -95,6 +105,100 @@ afterEach(() => {
 });
 
 describe("verified OpenCode 1.18.33 request payloads", () => {
+  it("lists enabled project models using the Core V2 model catalog", async () => {
+    const { client, methods } = fakeClient();
+    methods.listModels.mockResolvedValue(result({
+      location: { directory: "/tmp/project" },
+      data: [
+        { id: "glm", providerID: "ollama", name: "GLM", enabled: true },
+        { id: "disabled", providerID: "ollama", name: "Disabled", enabled: false },
+      ],
+    }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await expect(adapter.listModels("/tmp/project")).resolves.toEqual([
+      { id: "glm", providerID: "ollama", name: "GLM" },
+    ]);
+    expect(methods.listModels).toHaveBeenCalledWith(
+      { location: { directory: "/tmp/project" } },
+      { signal: expect.any(AbortSignal) },
+    );
+  });
+
+  it("lists only visible primary or general-purpose project agents", async () => {
+    const { client, methods } = fakeClient();
+    methods.listAgents.mockResolvedValue(result({
+      location: { directory: "/tmp/project" },
+      data: [
+        { id: "build", mode: "primary", hidden: false },
+        { id: "reviewer", mode: "all", hidden: false },
+        { id: "hidden", mode: "primary", hidden: true },
+        { id: "subagent", mode: "subagent", hidden: false },
+      ],
+    }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await expect(adapter.listAgents("/tmp/project")).resolves.toEqual([
+      { id: "build" },
+      { id: "reviewer" },
+    ]);
+    expect(methods.listAgents).toHaveBeenCalledWith(
+      { location: { directory: "/tmp/project" } },
+      { signal: expect.any(AbortSignal) },
+    );
+  });
+
+  it("replaces raw catalog failures with sanitized adapter diagnostics", async () => {
+    const { client, methods } = fakeClient();
+    methods.listModels.mockRejectedValue(new Error("provider secret must not escape"));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await expect(adapter.listModels("/tmp/project")).rejects.toMatchObject({
+      diagnostic: {
+        operation: "list models",
+        message: "OpenCode model catalog request failed",
+      },
+    });
+    await expect(adapter.listModels("/tmp/project")).rejects.not.toThrow("provider secret");
+  });
+
+  it.each([
+    ["models", "listModels", { id: "glm", providerID: "ollama", name: 42, enabled: true }],
+    ["agents", "listAgents", { id: 42, mode: "primary", hidden: false }],
+  ] as const)("rejects malformed %s catalog entries with a fixed diagnostic", async (catalog, method, entry) => {
+    const { client, methods } = fakeClient();
+    const request = catalog === "models" ? methods.listModels : methods.listAgents;
+    request.mockResolvedValue(result({ location: { directory: "/tmp/project" }, data: [entry] }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    const failure = await adapter[method]("/tmp/project").catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      diagnostic: {
+        message: catalog === "models"
+          ? "OpenCode model catalog request failed"
+          : "OpenCode agent catalog request failed",
+      },
+    });
+  });
+
+  it("rejects a model catalog above the entry limit", async () => {
+    const { client, methods } = fakeClient();
+    methods.listModels.mockResolvedValue(result({
+      location: { directory: "/tmp/project" },
+      data: Array.from({ length: 501 }, (_, index) => ({
+        id: `model-${index}`,
+        providerID: "ollama",
+        name: `Model ${index}`,
+        enabled: true,
+      })),
+    }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await expect(adapter.listModels("/tmp/project")).rejects.toMatchObject({
+      diagnostic: { message: "OpenCode model catalog request failed" },
+    });
+  });
+
   it("creates a Core V2 session with a non-empty payload and location", async () => {
     const { client, methods } = fakeClient();
     methods.create.mockResolvedValue(result({ data: { id: "session-1" } }));

@@ -37,7 +37,7 @@ const fakeAdapter = (turn: FakeTurn) => {
   let polls = 0;
   let interrupted = false;
   const adapter = {
-    createSession: vi.fn(async (options: { directory: string; model: unknown }) => {
+    createSession: vi.fn(async (options: { directory: string; model: unknown; agent: string }) => {
       calls.push(`create:${options.directory}`);
       if (turn.createFails) throw new Error("create session: unavailable");
       return { id: `ses_${++sessions}` };
@@ -112,7 +112,7 @@ describe("one prompt in one fresh OpenCode session", () => {
     const result = await run(adapter, tracker);
 
     expect(result).toMatchObject({ sessionID: "ses_1", outcome: { kind: "answered", text: "Done." }, sessionDeleted: true });
-    expect(raw.createSession).toHaveBeenCalledWith({ directory: "/work/QuackTrack", model: MODEL });
+    expect(raw.createSession).toHaveBeenCalledWith({ directory: "/work/QuackTrack", model: MODEL, agent: "build" });
     expect(calls).toEqual(["create:/work/QuackTrack", "prompt:ses_1", "delete:ses_1"]);
     expect(tracker.owns("ses_1")).toBe(false);
   });
@@ -125,6 +125,14 @@ describe("one prompt in one fresh OpenCode session", () => {
 
     expect([first.sessionID, second.sessionID]).toEqual(["ses_1", "ses_2"]);
     expect(calls.filter((call) => call.startsWith("delete:"))).toEqual(["delete:ses_1", "delete:ses_2"]);
+  });
+
+  it("binds a selected agent to every fresh session attempt", async () => {
+    const { adapter, raw } = fakeAdapter({ messages: [user("input-1"), assistant("Done.")] });
+
+    await run(adapter, new SessionTracker(), new AbortController().signal, { agent: "reviewer" });
+
+    expect(raw.createSession).toHaveBeenCalledWith({ directory: "/work/QuackTrack", model: MODEL, agent: "reviewer" });
   });
 
   it("reports a rejected permission as the reason the turn ended", async () => {
@@ -403,7 +411,7 @@ describe("cancelling around a retry (review cycle 5)", () => {
     const cancel = new AbortController();
     const { adapter, calls, raw } = dropFirst();
     const create = raw.createSession.getMockImplementation();
-    raw.createSession.mockImplementation(async (options: { directory: string; model: unknown }) => {
+    raw.createSession.mockImplementation(async (options: { directory: string; model: unknown; agent: string }) => {
       const session = await create!(options);
       if (session.id === "ses_2") cancel.abort();
       return session;

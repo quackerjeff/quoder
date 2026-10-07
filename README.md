@@ -1,15 +1,15 @@
 # Quoder
 
 Quoder provides a persistent developer-facing shell while each prompt runs in a
-fresh, disposable OpenCode session. Milestones 1–6 provide the harness,
+fresh, disposable OpenCode session. Milestones 1–7 provide the harness,
 streaming and live activity, interactive permission prompts, read-only Git
-awareness, persistent project context, and execution history. The Milestone 0
-feasibility probe remains as regression evidence.
+awareness, persistent project context, execution history, and model/agent
+selection. The Milestone 0 feasibility probe remains as regression evidence.
 
 Quoder is a single-developer local tool. It reviews what the model is about to
 do; it does not contain it. See "Known limitations".
 
-## Using Quoder (Milestones 1–6)
+## Using Quoder (Milestones 1–7)
 
 Install the pinned dependencies, build, and put `quoder` on your `PATH`:
 
@@ -55,9 +55,9 @@ How it behaves:
   outside a repository, resolved to its real path. The prompt shows the
   project's name.
 - **One server, a fresh session per prompt.** Quoder starts one authenticated,
-  project-local OpenCode server and keeps it for the whole harness session. Each
-  prompt runs in a fresh session bound to the model. Afterwards the session is
-  deleted and its deletion verified.
+  project-local OpenCode server and keeps it for the whole harness session.
+  Each prompt runs in a fresh session bound to the selected model and agent.
+  Afterwards the session is deleted and its deletion verified.
 - **Git awareness.** After each prompt, Quoder summarizes repository status
   observed before and after execution. Changes already present before the
   prompt are labeled pre-existing; the summary does not claim who made a
@@ -88,7 +88,13 @@ How it behaves:
   - Return sends all the lines as one prompt.
   - A multi-line paste stays one prompt until you press Return.
 - **Model.** The default is `ollama/glm-4.7-flash:latest`. Override it with
-  `quoder --model provider/model`.
+  `quoder --model provider/model`. During a run, `/model` lists enabled models
+  and `/model <query>` selects one by exact `provider/model-id` or a unique
+  case-insensitive match. `/agent` lists visible primary/general-purpose
+  agents and `/agent <query>` selects one by exact or unique partial ID. A
+  missing or ambiguous match leaves the selection unchanged. Choices apply to
+  subsequent fresh sessions in the current Quoder process; they are not saved
+  across restarts. Listing a model does not prove that its provider is reachable.
 - **Execution history.** Quoder stores one record for each submitted run,
   outside the project in per-project local state. `/history` lists the ten
   most recent IDs, timestamps, and statuses; `/history <id>` shows a record,
@@ -107,7 +113,8 @@ How it behaves:
   complete OpenCode event payloads. Recorded Git paths describe observed
   before/after state and do not prove authorship.
 - **Commands and keys.**
-  - `/help`; `/memory help`; `/history help`; `/exit` or Ctrl-D to leave.
+  - `/help`; `/model`; `/agent`; `/memory help`; `/history help`; `/exit` or
+    Ctrl-D to leave.
   - Ctrl-C cancels a running prompt (interrupt, settle, delete), prints
     "Execution cancelled … Harness session remains active.", and returns to
     the prompt.

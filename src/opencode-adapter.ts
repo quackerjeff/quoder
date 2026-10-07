@@ -1,6 +1,8 @@
 import {
   createOpencodeClient,
   type ModelRef,
+  type ModelV2Info,
+  type AgentV2Info,
   type OpencodeClient,
   type V2Event,
   type PermissionV2Reply,
@@ -53,6 +55,19 @@ export interface CreateSessionOptions {
   readonly agent?: string;
   readonly model?: ModelRef;
 }
+
+export type OpenCodeModelOption = Pick<ModelV2Info, "id" | "name" | "providerID">;
+export type OpenCodeAgentOption = Pick<AgentV2Info, "id">;
+
+const MAX_CATALOG_ENTRIES = 500;
+const MAX_MODEL_FIELD_LENGTH = 256;
+const MAX_AGENT_ID_LENGTH = 128;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isBoundedString = (value: unknown, maximum: number): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= maximum;
 
 export interface CreatePermissionOptions {
   readonly sessionID: string;
@@ -158,6 +173,52 @@ export class OpenCodeAdapter {
       ),
     );
     return this.#requiredData<{ data: SessionV2Info }>(result).data;
+  }
+
+  /** Lists enabled model choices for the specified project directory. */
+  async listModels(directory: string): Promise<readonly OpenCodeModelOption[]> {
+    try {
+      const result = await this.#request("list models", (signal) =>
+        this.#client.v2.model.list({ location: { directory } }, { signal }),
+      );
+      const models: unknown = this.#requiredData<{ data: unknown }>(result).data;
+      if (!Array.isArray(models) || models.length > MAX_CATALOG_ENTRIES) throw new TypeError("Invalid model catalog");
+      const options: OpenCodeModelOption[] = [];
+      for (const model of models) {
+        if (!isRecord(model) || !isBoundedString(model.id, MAX_MODEL_FIELD_LENGTH) ||
+          !isBoundedString(model.providerID, MAX_MODEL_FIELD_LENGTH) ||
+          !isBoundedString(model.name, MAX_MODEL_FIELD_LENGTH) || typeof model.enabled !== "boolean") {
+          throw new TypeError("Invalid model catalog entry");
+        }
+        if (model.enabled) options.push({ id: model.id, name: model.name, providerID: model.providerID });
+      }
+      return options;
+    } catch (cause) {
+      throw this.#catalogError("list models", "OpenCode model catalog request failed", cause);
+    }
+  }
+
+  /** Lists visible primary or general-purpose agents for the specified project. */
+  async listAgents(directory: string): Promise<readonly OpenCodeAgentOption[]> {
+    try {
+      const result = await this.#request("list agents", (signal) =>
+        this.#client.v2.agent.list({ location: { directory } }, { signal }),
+      );
+      const agents: unknown = this.#requiredData<{ data: unknown }>(result).data;
+      if (!Array.isArray(agents) || agents.length > MAX_CATALOG_ENTRIES) throw new TypeError("Invalid agent catalog");
+      const options: OpenCodeAgentOption[] = [];
+      for (const agent of agents) {
+        if (!isRecord(agent) || !isBoundedString(agent.id, MAX_AGENT_ID_LENGTH) ||
+          typeof agent.hidden !== "boolean" ||
+          (agent.mode !== "primary" && agent.mode !== "subagent" && agent.mode !== "all")) {
+          throw new TypeError("Invalid agent catalog entry");
+        }
+        if (!agent.hidden && (agent.mode === "primary" || agent.mode === "all")) options.push({ id: agent.id });
+      }
+      return options;
+    } catch (cause) {
+      throw this.#catalogError("list agents", "OpenCode agent catalog request failed", cause);
+    }
   }
 
   async prompt(sessionID: string, text: string): Promise<SessionInputAdmitted> {
@@ -380,6 +441,18 @@ export class OpenCodeAdapter {
       });
     }
     return result.data;
+  }
+
+  #catalogError(operation: string, message: string, cause: unknown): OpenCodeAdapterError {
+    const original = cause instanceof OpenCodeAdapterError ? cause.diagnostic : undefined;
+    return new OpenCodeAdapterError(
+      {
+        operation,
+        ...(original?.status === undefined ? {} : { status: original.status }),
+        ...(original?.timedOut === undefined ? {} : { timedOut: original.timedOut }),
+        message,
+      },
+    );
   }
 
   #toError(

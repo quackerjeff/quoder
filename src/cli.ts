@@ -18,6 +18,7 @@ const USAGE = [
   "",
   "Starts the Quoder harness in the current project. Each prompt runs in a fresh",
   "OpenCode session that is deleted afterwards.",
+  "Use /model and /agent inside the harness to list or select configured choices.",
   "",
   `  --model provider/model   OpenCode model to bind (default: ${DEFAULT_MODEL.providerID}/${DEFAULT_MODEL.id})`,
   "  --no-color               Disable colour (NO_COLOR is also honoured)",

@@ -6,6 +6,7 @@ import type { PromptResult, RejectedPermission, TurnOutcome } from "./session-ru
 import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
 import type { MemoryUnavailableReason, ProjectMemory } from "./project-memory.js";
 import type { ExecutionHistoryRecord, ExecutionHistorySummary, HistoryUnavailableReason } from "./execution-history.js";
+import type { OpenCodeAgentOption, OpenCodeModelOption } from "../opencode-adapter.js";
 
 const seconds = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
 
@@ -428,9 +429,54 @@ export const HELP_TEXT = [
   "  /memory        Inspect or manage persistent project context",
   "  /history help  Inspect or manage execution history",
   "  /history       List recent executions",
+  "  /model        List configured models; /model <query> selects one",
+  "  /agent        List available agents; /agent <query> selects one",
   "  /exit          Leave Quoder (Ctrl-D also works)",
   "  Shift+Return   Start a new line; Return sends the prompt",
   "",
   "Ctrl-C cancels a running prompt or discards a multi-line prompt; at an empty prompt it leaves Quoder.",
   "Colour follows your terminal; set NO_COLOR or pass --no-color to turn it off.",
 ].join("\n");
+
+const modelReference = ({ providerID, id }: Pick<OpenCodeModelOption, "providerID" | "id">): string =>
+  sanitizeLine(`${providerID}/${id}`, 180);
+
+/** Formats the current selection and the project-scoped models that may be selected next. */
+export function formatModelChoices(
+  models: readonly OpenCodeModelOption[],
+  current: { readonly providerID: string; readonly id: string },
+  theme: Theme = PLAIN_THEME,
+): string {
+  const currentReference = modelReference(current);
+  const sorted = [...models].sort((left, right) => modelReference(left).localeCompare(modelReference(right)));
+  const currentListed = sorted.some((model) => modelReference(model) === currentReference);
+  const lines = [
+    theme.paint("strong", "Configured models"),
+    `Current model: ${currentReference}${currentListed ? "" : " (not listed by OpenCode)"}`,
+  ];
+  if (sorted.length === 0) lines.push("  (no enabled models available)");
+  else for (const model of sorted) {
+    const reference = modelReference(model);
+    const selected = reference === currentReference ? " (selected)" : "";
+    lines.push(`  ${reference}${selected} — ${sanitizeLine(model.name, 120)}`);
+  }
+  lines.push("Use /model <provider/model-id> or a unique name fragment to select.");
+  return `${lines.join("\n")}\n`;
+}
+
+/** Formats the current selection and the visible primary/general-purpose agents. */
+export function formatAgentChoices(
+  agents: readonly OpenCodeAgentOption[],
+  current: string,
+  theme: Theme = PLAIN_THEME,
+): string {
+  const sorted = [...agents].sort((left, right) => left.id.localeCompare(right.id));
+  const lines = [theme.paint("strong", "Available agents"), `Current agent: ${sanitizeLine(current, 120)}`];
+  if (sorted.length === 0) lines.push("  (no selectable agents available)");
+  else for (const agent of sorted) {
+    const id = sanitizeLine(agent.id, 120);
+    lines.push(`  ${id}${agent.id === current ? " (selected)" : ""}`);
+  }
+  lines.push("Use /agent <id> or a unique ID fragment to select.");
+  return `${lines.join("\n")}\n`;
+}

@@ -54,6 +54,8 @@ interface FakeOptions {
   readonly permissionDecisionsEnabled?: boolean;
   readonly permissionRequestCount?: number;
   readonly permissionOperation?: "read" | "edit";
+  readonly modelCatalogFails?: boolean;
+  readonly agentCatalogFails?: boolean;
   /** Session deletion waits until this gate opens. */
   readonly deleteGate?: ReturnType<typeof gate>;
 }
@@ -153,11 +155,12 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
   const client = {
     v2: {
       session: {
-        create: vi.fn(async (body: { location: { directory: string } }) => {
+        create: vi.fn(async (body: { location: { directory: string }; agent?: string; model?: { providerID: string; id: string } }) => {
           await alive();
           const id = `ses_${++sessions}`;
           if (id === "ses_1" && options.createGate) await options.createGate.opened;
           calls.push(`create:${id}:${body.location.directory}`);
+          calls.push(`binding:${id}:${body.model?.providerID}/${body.model?.id}:${body.agent}`);
           return result({ data: { id } });
         }),
         prompt: vi.fn(async (parameters: { sessionID: string; prompt: { text: string } }) => {
@@ -240,6 +243,32 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
           }),
         },
       },
+      model: {
+        list: vi.fn(async ({ location }: { location: { directory: string } }) => {
+          if (options.modelCatalogFails) throw new Error("sensitive model catalog diagnostic");
+          return result({
+            location,
+            data: [
+              { id: MODEL.id, providerID: MODEL.providerID, name: "GLM 4.7 Flash", enabled: true },
+              { id: "qwen3-coder:30b", providerID: "ollama", name: "Qwen 3 Coder", enabled: true },
+              { id: "qwen2-coder:14b", providerID: "cloud", name: "Qwen 2 Coder", enabled: true },
+            ],
+          });
+        }),
+      },
+      agent: {
+        list: vi.fn(async ({ location }: { location: { directory: string } }) => {
+          if (options.agentCatalogFails) throw new Error("sensitive agent catalog diagnostic");
+          return result({
+            location,
+            data: [
+              { id: "build", mode: "primary", hidden: false },
+              { id: "reviewer", mode: "all", hidden: false },
+              { id: "architect", mode: "primary", hidden: false },
+            ],
+          });
+        }),
+      },
     },
     session: {
       delete: vi.fn(async (parameters: { sessionID: string }) => {
@@ -283,7 +312,7 @@ function fakeExecutionHistoryStore(options: Pick<HarnessRunOptions, "historyBegi
     branch: "main",
     startingHead: "0123456789abcdef0123456789abcdef01234567",
     model: MODEL,
-    agent: null,
+    agent: "build",
     prompt: "",
     injectedContext: "",
     permissionDecisions: [],
@@ -462,6 +491,47 @@ const sessionsDeleted = (trace: readonly HarnessTraceEvent[]) =>
   trace.flatMap((event) => (event.event === "session.deleted" && event.verified ? [event.sessionID] : []));
 
 describe("quoder harness (Milestone 1)", () => {
+  it("selects a model and agent for later sessions and records the effective pair", async () => {
+    const run = startHarness();
+    run.input.end("/model\n/model qwen3\n/model qwen\n/agent\n/agent reviewer\n/model missing\n/agent hidden\nselection smoke check\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Current model: ollama/glm-4.7-flash:latest");
+    expect(run.output()).toContain("ollama/glm-4.7-flash:latest (selected)");
+    expect(run.output()).toContain("Model selected for future prompts: ollama/qwen3-coder:30b.");
+    expect(run.output()).toContain("Model query is ambiguous. Use one of these full IDs; selection is unchanged:");
+    expect(run.output()).toContain("cloud/qwen2-coder:14b");
+    expect(run.output()).toContain("Current agent: build");
+    expect(run.output()).toContain("Agent selected for future prompts: reviewer.");
+    expect(run.output()).toContain("No enabled model matches \"missing\"; the selection is unchanged.");
+    expect(run.output()).toContain("No selectable agent matches \"hidden\"; the selection is unchanged.");
+    expect(run.calls).toContain("binding:ses_1:ollama/qwen3-coder:30b:reviewer");
+    expect(run.history.begun[0]).toMatchObject({
+      model: { providerID: "ollama", id: "qwen3-coder:30b" },
+      agent: "reviewer",
+    });
+    expect(run.history.completed).toHaveLength(1);
+    expect(run.history.completed[0]).toMatchObject({ status: "answered", attempts: 1 });
+  });
+
+  it("keeps selections intact and hides catalog errors when model or agent lookup fails", async () => {
+    const run = startHarness({ modelCatalogFails: true, agentCatalogFails: true });
+    run.input.end("/model qwen\n/agent reviewer\nlookup failure recovery\n/exit\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Could not load configured models; the current model selection is unchanged.");
+    expect(run.output()).toContain("Could not load configured agents; the current agent selection is unchanged.");
+    expect(run.output()).not.toContain("sensitive model catalog diagnostic");
+    expect(run.output()).not.toContain("sensitive agent catalog diagnostic");
+    expect(run.calls).toContain("binding:ses_1:ollama/glm-4.7-flash:latest:build");
+    expect(run.history.begun[0]).toMatchObject({
+      model: { providerID: "ollama", id: "glm-4.7-flash:latest" },
+      agent: "build",
+    });
+  });
+
   it("serves history help, empty list, and retention locally in piped mode", async () => {
     const run = startHarness();
     run.input.end("/history\n/history help\n/history retention\n/exit\n");
@@ -749,7 +819,7 @@ describe("quoder harness (Milestone 1)", () => {
 
   it("handles /help, unknown commands, blank lines, and /exit without creating sessions", async () => {
     const run = startHarness();
-    run.input.write("/help\n\n/model qwen\n/exit\nnever run\n");
+    run.input.write("/help\n\n/unknown\n/exit\nnever run\n");
 
     await expect(run.finished).resolves.toBe(0);
 

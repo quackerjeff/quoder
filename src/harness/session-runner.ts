@@ -177,6 +177,8 @@ export interface RunPromptOptions {
   readonly tracker: SessionTracker;
   readonly directory: string;
   readonly model: ModelRef;
+  /** OpenCode agent bound to each fresh attempt; defaults to the build agent. */
+  readonly agent?: string;
   readonly prompt: string;
   /** Aborting cancels the turn: the session is interrupted, settled, and deleted. */
   readonly cancel: AbortSignal;
@@ -236,7 +238,11 @@ async function runAttempt(options: RunPromptOptions): Promise<Attempt> {
   let endedIdle = false;
   let dropped = false;
   try {
-    const session = await options.adapter.createSession({ directory: options.directory, model: options.model });
+    const session = await options.adapter.createSession({
+      directory: options.directory,
+      model: options.model,
+      agent: options.agent ?? "build",
+    });
     sessionID = session.id;
     options.tracker.register(sessionID);
     options.onSessionCreated?.(sessionID);
