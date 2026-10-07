@@ -63,7 +63,7 @@ Spec: `.cmd/specs/2026-10-07-milestone-5-persistent-context/spec.md`
   - **Accept**: QA confirms the milestone exit criteria with focused automated coverage and the approved no-model or bounded runtime scenarios; all critical/warning findings are resolved.
   - **Verify**: Run the repository's required validation from `steering/quality-engineering.md`; record exact commands and coverage in `qa.md`.
   - **Constraints**: Do not send a real model prompt or run live verification without explicit authorization. Keep all runtime data in disposable projects and use harmless content.
-  - **Progress**: `npm test` passed (552 tests / 29 files); `npm run typecheck`, `npm run build`, and `git diff --check` passed. Coverage includes memory controls, storage separation and recovery, answered-only updates, retry/fresh sessions, context bound, hostile paths, and response-excerpt exclusion. No live model prompt or user configuration inspection was performed. QA verdict PASS with conditional release confidence; see `qa.md` for unverified runtime/platform coverage.
+  - **Progress**: `npm test` passed (552 tests / 29 files); `npm run typecheck`, `npm run build`, and `git diff --check` passed. Coverage includes memory controls, storage separation and recovery, answered-only updates, retry/fresh sessions, context bound, hostile paths, and response-excerpt exclusion. The developer confirmed the disposable-project real-terminal check and Linux filesystem validation both passed; no live model prompt was submitted. QA verdict PASS with READY release confidence; exact manual command output and Linux distribution/version were not provided. See `qa.md` for both cycles.
 
 ## Group 9: Documentation and completion
 

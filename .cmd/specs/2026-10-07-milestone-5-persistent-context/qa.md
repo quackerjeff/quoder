@@ -34,3 +34,30 @@ None.
 ### Verdict: PASS
 
 No critical defects were found, and the specified acceptance behaviors were exercised by automated tests. The warning describes remaining environment-specific validation, not a failure of the tested acceptance criteria.
+
+## Cycle 2 — 2026-10-07
+Validating: Follow-up for Group 8 tasks
+
+### Coverage
+
+- **Manual:** The developer confirmed that both follow-up checks passed: a real-terminal run using the disposable-project `/memory` workflow, and Linux filesystem validation. No ordinary model prompt was required for the terminal check.
+- **Evidence detail:** The developer reported both checks passed, but did not provide terminal output, exact Linux commands, distribution, or version. This report records the confirmation without inferring those details.
+- **Not covered:** Provider/model behavior remains unverified; no live model prompt was submitted.
+
+### Critical
+
+None.
+
+### Warning
+
+None. The Cycle 1 environment-coverage warning is resolved by the developer-confirmed terminal and Linux validation.
+
+### Suggestion
+
+None.
+
+### Release Confidence
+
+**READY** — Automated repository checks and the two requested follow-up validations passed. Provider/model behavior was intentionally outside this QA scope.
+
+### Verdict: PASS
