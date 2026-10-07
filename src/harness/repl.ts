@@ -25,6 +25,7 @@ import {
 } from "./format.js";
 import { captureGitDiff, hasInspectableGitDiff, type GitDiffResult } from "./git-diff.js";
 import { captureGitSnapshot, compareGitSnapshots, type GitComparison, type GitSnapshotResult } from "./git-state.js";
+import { buildHarnessContext, createPreviousExecutionSummary } from "./context-builder.js";
 import { CONTINUE_MARK, DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys } from "./line-keys.js";
 import { LiveView } from "./live-view.js";
 import type { Project } from "./project.js";
@@ -764,12 +765,15 @@ export class Harness {
         await this.#presentGitDiff(comparison);
         return;
       }
+      const memory = this.#memory ?? emptyProjectMemory();
+      const harnessContext = buildHarnessContext(prompt, memory, beforeGit);
+      view.note(`${theme.paint("dim", `Harness context: ${harnessContext.contextCharacters} chars · Prompt: ${harnessContext.promptCharacters} chars`)}\n`);
       const result = await runPrompt({
         adapter: server.adapter,
         tracker: this.#tracker,
         directory: this.#options.project.root,
         model: this.#options.model,
-        prompt,
+        prompt: harnessContext.combinedPrompt,
         cancel: controller.signal,
         ...(this.#dependencies.noResponseTimeoutMs === undefined ? {} : { noResponseTimeoutMs: this.#dependencies.noResponseTimeoutMs }),
         onRetry: () => {
@@ -789,6 +793,19 @@ export class Harness {
       const afterGit = await this.#captureGitState();
       const comparison = await this.#compareGitState(beforeGit, afterGit);
       this.#write(`${formatGitSummary(comparison, theme)}\n`);
+      if (result.outcome.kind === "answered" && this.#memory?.automaticSummary === true && this.#memoryStore !== undefined) {
+        const updated = {
+          ...this.#memory,
+          previousExecution: createPreviousExecutionSummary(prompt, result.outcome.text),
+        };
+        try {
+          const saved = await this.#memoryStore.save(updated);
+          if (saved.ok) this.#memory = updated;
+          else this.#memoryMessage(`${formatProjectMemoryFailure(saved.reason, "save")} Automatic summary was not updated.`, true);
+        } catch {
+          this.#memoryMessage(`${formatProjectMemoryFailure("io-error", "save")} Automatic summary was not updated.`, true);
+        }
+      }
       for (const notice of this.#notices.splice(0)) {
         const alreadyShown = result.outcome.kind === "failed" && result.outcome.reason.startsWith(notice);
         if (!alreadyShown) this.#write(`${theme.paint("warning", `Note: ${notice} A new OpenCode server will start with your next prompt.`)}\n\n`);

@@ -298,7 +298,9 @@ export function formatProjectMemoryFailure(reason: MemoryUnavailableReason, oper
 
 export const PROJECT_MEMORY_HELP_TEXT = [
   "Project memory is stored locally outside the project. Other processes running as your user may be able to read it.",
-  "Automatic previous-result summaries save bounded request/response excerpts verbatim; Quoder does not detect or redact secrets.",
+  "Automatic summaries save bounded request/response excerpts verbatim; Quoder does not detect or redact secrets.",
+  "Only the previous request excerpt is included in future prompts; the response excerpt stays local for `/memory show`.",
+  "Saved fields and repository paths in context are shown as escaped, single-line data.",
   "Use `/memory auto off` to stop replacing the previous-result summary, and `/memory clear summary` to remove the current one.",
   "Objective/task fields allow 500 characters. Decisions, constraints, and issues allow 20 entries of 500 characters each.",
   "The saved document is limited to 32 KiB; injected context is capped at 4,096 characters.",

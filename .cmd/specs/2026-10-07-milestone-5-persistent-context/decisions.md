@@ -45,3 +45,19 @@
 **Failure behavior**: Load errors leave memory unavailable but do not prevent server startup or developer prompts. Only whole-memory clear is allowed while corrupt/unsupported state is unavailable. All edits report success only after store persistence succeeds; failures keep the displayed in-memory state unchanged. No memory command writes prompt text or saved values to traces.
 
 **Verification**: `./node_modules/.bin/vitest run tests/integration/harness.test.ts tests/unit/project-memory.test.ts` passes 86 tests. `npm run typecheck`, `npm run build`, and `git diff --check` pass.
+
+## 2026-10-07 — Bounded context and prompt lifecycle
+
+**Implementation**: Added `src/harness/context-builder.ts`. It assembles a 4,096-code-point background block from developer-authored objective/task and lists, the immediately preceding developer request excerpt, and a fresh Git branch/path snapshot. Persisted values and Git paths are JSON-encoded as single-line data; tag delimiters and control characters cannot create new context records. Git input is bounded to 12 paths with 120 code points per path; no diff or line statistics are duplicated. The current developer request follows in a separate labeled section and is preserved verbatim. Quoder reports exact Unicode code-point counts for the context block and current request before `runPrompt` creates a session. Because the schema has no cross-category list timestamps, manual list entries are budgeted in recency-ranked rounds across decisions, constraints, and issues so one category cannot monopolize the space.
+
+**Lifecycle**: The single assembled prompt is captured once and passed unchanged through OpenCode's dropped-prompt retry, which still creates and deletes fresh sessions. After the final Git snapshot attempt, only an `answered` outcome replaces the bounded request/response excerpts. Rejected, failed, cancelled, and unanswered outcomes leave prior memory unchanged. A summary persistence failure is shown as a warning and does not change the completed prompt outcome.
+
+**Verification**: `./node_modules/.bin/vitest run tests/unit/context-builder.test.ts tests/unit/project-memory.test.ts tests/integration/harness.test.ts` passes 101 tests. Coverage includes empty/populated context, current Git changes, escaped single-line repository path encoding, model-response exclusion, Unicode bounds, cross-category recency budgeting, excerpt clipping, automatic summary update policy including opt-out and all non-answered outcomes, storage failure, retry prompt equivalence, and fresh-session behavior. `npm run typecheck`, `npm run build`, and `git diff --check` pass.
+
+## 2026-10-07 — Keep model-authored excerpts out of later prompts
+
+**Context**: Group 7 security review identified that delimiter escaping and an untrusted-data label do not prevent a malicious or compromised model response excerpt from influencing a later model session.
+
+**Decision**: Continue storing the bounded final-response excerpt locally so the developer can inspect it with `/memory show`, but do not inject that model-authored text into future prompts. Prompt continuity uses the developer-authored previous-request excerpt and the fresh Git snapshot. Encode memory and repository path values as single-line JSON data before insertion. Help and spec text disclose these boundaries.
+
+**Rationale**: Avoid carrying automatically persisted model-authored instructions into later tool-capable sessions while retaining the local summary inspection and developer request continuity. Context labels remain defense in depth; they are not treated as a security boundary.

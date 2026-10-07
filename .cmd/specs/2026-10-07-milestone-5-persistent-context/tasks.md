@@ -35,31 +35,35 @@ Spec: `.cmd/specs/2026-10-07-milestone-5-persistent-context/spec.md`
 
 ## Group 5: Context builder and prompt lifecycle integration
 
-- [ ] Build bounded labeled context from current memory and live Git state and submit it with each fresh prompt | `src/harness/`, `src/harness/repl.ts`, `src/harness/session-runner.ts`, `tests/`
+- [x] Build bounded labeled context from current memory and live Git state and submit it with each fresh prompt | `src/harness/context-builder.ts`, `src/harness/repl.ts`, `tests/unit/context-builder.test.ts`, `tests/integration/harness.test.ts`
   - **Accept**: Each new OpenCode session receives current prompt plus correctly labeled, bounded continuity memory and current Git context; a follow-up can unambiguously refer to immediately preceding work; exact context/prompt character counts are displayed before execution; retry uses equivalent context; session creation/deletion semantics remain unchanged.
   - **Verify**: Focused tests cover empty and populated memory, prior summary/update policy, changed Git state, context truncation, prompt labeling, dropped-prompt retry, and fresh-session lifecycle.
   - **Constraints**: Do not reuse OpenCode sessions or feed the complete developer conversation. Treat persisted memory as untrusted data, keep it separate from current user instructions, and omit duplicated Git details.
+  - **Progress**: Added a 4,096-code-point labeled context builder with escaped memory delimiters, single-line JSON encoding for persisted values and Git paths, objective/task and previous-request priority, recency-ranked rounds across manual memory categories, bounded live Git branch/path data, omission notices, and code-point clipping. Every fresh session receives that context plus a separately labeled, verbatim current request. Quoder displays exact context/request code-point counts before session creation. A successful retry reuses the identical assembled prompt. Only answered turns replace the bounded request/response excerpts, after final Git capture; only the previous developer-request excerpt enters a future prompt, while the assistant-response excerpt remains local for `/memory show`. Rejected, failed, cancelled, question-rejected, and server-start-failed turns preserve the previous summary, and storage errors warn without changing the turn result. Focused verification: 101 unit/integration tests pass; `npm run typecheck`, `npm run build`, and `git diff --check` pass.
 
 ## Group 6: General review
 
-- [ ] Review Milestone 5 implementation | `.cmd/specs/2026-10-07-milestone-5-persistent-context/review.md`
+- [x] Review Milestone 5 implementation | `.cmd/specs/2026-10-07-milestone-5-persistent-context/review.md`
   - **Accept**: Reviewer report is persisted verbatim with PASS, zero critical findings, and zero warnings.
   - **Verify**: `rg -i 'verdict.*pass' .cmd/specs/2026-10-07-milestone-5-persistent-context/review.md`
   - **Constraints**: Run after Groups 3–5; maximum three cycles. Do not proceed to security review until general review passes.
+  - **Progress**: Cycle 1 found two warnings: memory category ordering could omit recent items in later categories, and summary-preservation coverage did not include every non-answered outcome. Cycle 2 passed with no critical findings or warnings after recency-ranked interleaving, documented policy, and coverage for question rejection, cancellation, and server startup failure. Cycle 3 re-reviewed the security-driven prompt-context change and passed with no critical findings or warnings. Passing reports are in `review.md`.
 
 ## Group 7: Security review
 
-- [ ] Review persistence, prompt-context trust boundaries, and sensitive-data handling | `.cmd/specs/2026-10-07-milestone-5-persistent-context/security-review.md`
+- [x] Review persistence, prompt-context trust boundaries, and sensitive-data handling | `.cmd/specs/2026-10-07-milestone-5-persistent-context/security-review.md`
   - **Accept**: Security report is persisted verbatim with PASS, zero critical findings, and zero warnings.
   - **Verify**: `rg -i 'verdict.*pass' .cmd/specs/2026-10-07-milestone-5-persistent-context/security-review.md`
   - **Constraints**: Run only after Group 6 passes; inspect path/key construction, permissions, symlink behavior, atomic writes, corruption and concurrency handling, prompt injection through memory, and leakage to traces/output. Maximum three cycles.
+  - **Progress**: Cycle 1 found that an automatically stored model response could carry instructions into a future prompt. The response excerpt is now retained locally for `/memory show` but omitted from model prompts. Cycle 2 found that newline/control-bearing Git paths could add apparent context lines; Git paths and persisted values are now bounded, single-line JSON strings. Cycle 3 passed with no critical findings or warnings after reviewing both remediations, storage protections, trace behavior, and terminal sanitization. The verbatim report is in `security-review.md`.
 
 ## Group 8: QA validation
 
-- [ ] Validate persistent-context acceptance and regressions | `.cmd/specs/2026-10-07-milestone-5-persistent-context/qa.md`
+- [x] Validate persistent-context acceptance and regressions | `.cmd/specs/2026-10-07-milestone-5-persistent-context/qa.md`
   - **Accept**: QA confirms the milestone exit criteria with focused automated coverage and the approved no-model or bounded runtime scenarios; all critical/warning findings are resolved.
   - **Verify**: Run the repository's required validation from `steering/quality-engineering.md`; record exact commands and coverage in `qa.md`.
   - **Constraints**: Do not send a real model prompt or run live verification without explicit authorization. Keep all runtime data in disposable projects and use harmless content.
+  - **Progress**: `npm test` passed (552 tests / 29 files); `npm run typecheck`, `npm run build`, and `git diff --check` passed. Coverage includes memory controls, storage separation and recovery, answered-only updates, retry/fresh sessions, context bound, hostile paths, and response-excerpt exclusion. No live model prompt or user configuration inspection was performed. QA verdict PASS with conditional release confidence; see `qa.md` for unverified runtime/platform coverage.
 
 ## Group 9: Documentation and completion
 
