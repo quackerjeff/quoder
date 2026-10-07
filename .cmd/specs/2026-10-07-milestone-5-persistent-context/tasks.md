@@ -67,7 +67,8 @@ Spec: `.cmd/specs/2026-10-07-milestone-5-persistent-context/spec.md`
 
 ## Group 9: Documentation and completion
 
-- [ ] Document Milestone 5 behavior and close the active spec | `docs/requirements.md`, `docs/tech.md`, `.cmd/specs/2026-10-07-milestone-5-persistent-context/`
+- [x] Document Milestone 5 behavior and close the active spec | `docs/requirements.md`, `docs/tech.md`, `.cmd/specs/2026-10-07-milestone-5-persistent-context/`
   - **Accept**: Requirements and technical docs match shipped behavior, including data location, privacy, memory controls, bounds, and recovery. Review/security/QA reports are present and pass; all tasks are complete; `.cmd/specs/currentspec.md` is cleared.
   - **Verify**: `git diff --check`; inspect the final docs against implementation and the Group 2 interaction design.
   - **Constraints**: Documentation is the final group and follows passed review, security review, and required QA. Do not claim isolation from same-user processes.
+  - **Progress**: Updated requirements and technical documentation to describe the shipped `/memory` controls, project-scoped storage, exact bounds, privacy limits, recovery behavior, context construction, and fresh-session lifecycle. Confirmed general review, security review, and QA reports all end in PASS; QA release confidence is READY after the developer-confirmed terminal and Linux filesystem checks. `git diff --check` passes. Cleared `.cmd/specs/currentspec.md` after completing the documentation review.

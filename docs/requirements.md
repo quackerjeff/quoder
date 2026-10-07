@@ -969,16 +969,48 @@ Restore conversational continuity without restoring OpenCode conversational hist
 
 ## Features
 
-Implement persistent harness state containing:
+Persist bounded, versioned harness memory per canonical project, outside the
+project repository. Memory contains developer-authored objective, task,
+decisions, constraints, and unresolved issues, plus an optional automatically
+refreshed excerpt of the previous answered turn. Keep OpenCode sessions fresh;
+do not persist or replay conversational history.
 
-- Current objective
-- Current task
-- Decisions
-- Constraints
-- Previous execution summary
-- Unresolved issues
+Provide local `/memory` commands to inspect and edit these fields, toggle
+automatic summaries, and clear selected fields or all memory. Durable objective,
+task, decision, constraint, and issue entries are explicitly developer-authored;
+Quoder does not infer them from model output. Automatic summaries are on by
+default and retain bounded excerpts from the previous developer request and
+final response only after an answered prompt. The response excerpt is available
+for local inspection but is not included in later model prompts. Failed,
+rejected, cancelled, unanswered, or server-start-failed turns preserve the last
+successful summary. Developers can disable automatic summaries or clear the
+stored data.
 
-Implement a context builder.
+Build a labeled context block from memory and the current Git snapshot for each
+fresh session, followed by the current developer request verbatim. The context
+block is limited to 4,096 Unicode code points; memory fields and paths are
+bounded and encoded as single-line data. Show context and request code-point
+counts before execution, and reuse the same assembled prompt on retry. Do not
+duplicate Git diffs or line statistics in memory.
+
+Store one SHA-256-keyed JSON document per canonical project under the absolute
+`$XDG_STATE_HOME/quoder/context` directory, or the platform fallback:
+`~/Library/Application Support/Quoder/context` on macOS and
+`~/.local/state/quoder/context` on other supported POSIX systems. Use private
+directory/file permissions (0700/0600 where supported), bounded schema
+validation, and same-directory atomic replacement. Objective/task fields allow
+500 Unicode code points each; decisions, constraints, and issues allow up to 20
+entries of 500 code points each; request/response excerpts allow 512/1,536 code
+points; and the serialized document is capped at 32 KiB. This is local data
+hygiene, not isolation from other processes running as the same user. Automatic
+excerpts are retained verbatim within their limits and are not reliably
+secret-redacted; the REPL discloses this and provides opt-out and clear controls.
+
+When stored memory is malformed or uses an unsupported version, continue
+without it, report the problem, and require an explicit clear/reset before
+writing again. Storage failures warn without failing prompt execution. Concurrent
+Quoder processes use atomic last-writer-wins updates without cross-process
+locking.
 
 ```mermaid
 flowchart TD
@@ -996,13 +1028,15 @@ flowchart TD
 
 ## Exit Criteria
 
-The developer can refer naturally to previous work:
+The developer can refer naturally to immediately preceding work:
 
 ```text
 QuackTrack > Now add tests for what we just implemented.
 ```
 
-A fresh OpenCode session receives sufficient context to correctly understand what "what we just implemented" means.
+A fresh OpenCode session receives the preceding developer request excerpt and
+current Git state, while each session remains independent and the prior model
+response stays out of future prompts.
 
 ---
 
