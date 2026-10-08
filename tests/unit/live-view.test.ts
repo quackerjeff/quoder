@@ -74,16 +74,16 @@ describe("live view", () => {
     const { live, output } = view();
     live.handle({ kind: "tool-called", sessionID: S, callID: "c1", tool: "edit", input: { path: "a.ts" } });
     live.handle({ kind: "tool-failed", sessionID: S, callID: "c1", message: "oldString not found" });
-    live.handle({ kind: "retried", sessionID: S, attempt: 2, message: "HTTP 502" });
-    live.handle({ kind: "step-failed", sessionID: S, message: "boom" });
+    live.handle({ kind: "retried", sessionID: S, attempt: 2, message: "OpenCode is retrying the request" });
+    live.handle({ kind: "step-failed", sessionID: S, message: "OpenCode reported a failed model step" });
     live.cancelling();
-    live.handle({ kind: "step-failed", sessionID: S, message: "Provider turn interrupted" });
+    live.handle({ kind: "step-failed", sessionID: S, message: "OpenCode reported a failed model step" });
     live.finish(cancelled);
     expect(output()).toBe(
       [
         "✗ ✎ Edit   a.ts  oldString not found",
-        "! Retrying (attempt 2): HTTP 502",
-        "! Step failed: boom",
+        "! Retrying (attempt 2): OpenCode is retrying the request",
+        "! Step failed: OpenCode reported a failed model step",
         "Cancelling OpenCode execution…",
         "",
       ].join("\n"),

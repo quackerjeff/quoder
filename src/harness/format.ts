@@ -4,6 +4,7 @@ import type { GitComparison, GitDiffStats, GitFailureKind, GitPathChange } from 
 import type { TurnStats } from "./live-view.js";
 import type { PromptResult, RejectedPermission, TurnOutcome } from "./session-runner.js";
 import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
+import { formatOperationalFailure } from "./operational-log.js";
 import type { MemoryUnavailableReason, ProjectMemory } from "./project-memory.js";
 import type { ExecutionHistoryRecord, ExecutionHistorySummary, HistoryUnavailableReason } from "./execution-history.js";
 import type { OpenCodeAgentOption, OpenCodeModelOption } from "../opencode-adapter.js";
@@ -57,7 +58,7 @@ const describeOutcome = (outcome: TurnOutcome, theme: Theme): string | undefined
       ].join("\n");
     }
     case "failed":
-      return theme.paint("error", `The prompt did not complete: ${sanitizeLine(outcome.reason)}`);
+      return theme.paint("error", formatOperationalFailure(outcome.category ?? "OpenCode"));
   }
 };
 
@@ -313,6 +314,11 @@ const historyFailureText: Record<HistoryUnavailableReason, string> = {
 
 export function formatExecutionHistoryFailure(reason: HistoryUnavailableReason): string {
   return `Execution history is unavailable: ${historyFailureText[reason]}.`;
+}
+
+export function formatLocalStateRecovery(area: "Project memory" | "Execution history" | "OpenCode session ownership", detail: string): string {
+  return `Local state: ${area} is unavailable. ${detail} Its source was preserved unchanged. `
+    + "Stop Quoder before inspecting or moving it, make a copy before manual edits, and consult docs/tech.md for the state location and schema.";
 }
 
 const historyStatus = (status: ExecutionHistorySummary["status"]): string =>

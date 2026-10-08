@@ -6,10 +6,16 @@ import { createOpencodeClient, type ModelRef } from "@opencode-ai/sdk/v2";
 
 import { Harness, type HarnessTraceEvent } from "./harness/repl.js";
 import { resolveProject } from "./harness/project.js";
-import { launchSandboxedOpenCodeServer } from "./opencode-server.js";
+import {
+  launchSandboxedOpenCodeServer,
+  validateOpenCodeLaunchInputs,
+  type OpenCodeLaunchInputIssue,
+} from "./opencode-server.js";
 import { IsolatedMarkdownRenderer } from "./ui/isolated-render.js";
 import { colorEnabled, createTheme } from "./ui/style.js";
 import { packagePath } from "./package-root.js";
+import { openOperationalLog } from "./harness/operational-log.js";
+import { sanitizeLine } from "./harness/terminal-text.js";
 
 export const DEFAULT_MODEL: ModelRef = { providerID: "ollama", id: "glm-4.7-flash:latest" };
 
@@ -63,6 +69,13 @@ const traceWriter = (path: string | undefined): ((event: HarnessTraceEvent) => v
     ? undefined
     : (event) => appendFileSync(path, `${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`, "utf8");
 
+export function startupConfigurationDiagnostic(issue: OpenCodeLaunchInputIssue): string {
+  if (issue === "inline-config-invalid") {
+    return "Configuration: OpenCode launch configuration is invalid. Correct OPENCODE_CONFIG_CONTENT JSON and its plugin list; no values are shown.";
+  }
+  return "Configuration: Quoder's pinned OpenCode executable is unavailable. Run `npm install` in Quoder to restore dependencies.";
+}
+
 async function main(): Promise<number> {
   const parsed = parseArguments(process.argv.slice(2));
   if (parsed.kind === "help") {
@@ -75,7 +88,15 @@ async function main(): Promise<number> {
     return 0;
   }
   if (parsed.kind === "error") {
-    process.stderr.write(`${parsed.message}\n\n${USAGE}\n`);
+    process.stderr.write(`Configuration: ${sanitizeLine(parsed.message, 240)}\n\n${USAGE}\n`);
+    return 2;
+  }
+  const launchInputIssue = validateOpenCodeLaunchInputs();
+  if (launchInputIssue === "inline-config-invalid") {
+    process.stderr.write(`${startupConfigurationDiagnostic(launchInputIssue)}\n`);
+    return 2;
+  } else if (launchInputIssue === "executable-unavailable") {
+    process.stderr.write(`${startupConfigurationDiagnostic(launchInputIssue)}\n`);
     return 2;
   }
   const project = await resolveProject(process.cwd());
@@ -84,6 +105,21 @@ async function main(): Promise<number> {
   const markdown = new IsolatedMarkdownRenderer();
   markdown.start();
   const trace = traceWriter(process.env.QUODER_TRACE_FILE);
+  const configuredLogPath = process.env.QUODER_LOG_FILE;
+  const logResult = configuredLogPath === undefined || configuredLogPath === ""
+    ? undefined
+    : openOperationalLog(configuredLogPath, project.root);
+  if (configuredLogPath !== undefined && configuredLogPath !== "") {
+    try {
+      if (logResult?.ok === true) {
+        process.stderr.write(`Operational JSONL log enabled: ${sanitizeLine(logResult.logger.path, 240)}\n`);
+      } else {
+        process.stderr.write("Configuration: operational logging is unavailable; Quoder will continue without a log. Set QUODER_LOG_FILE to an absolute JSONL path in an existing writable directory outside the target project.\n");
+      }
+    } catch {
+      // A diagnostic about diagnostic logging must not affect startup.
+    }
+  }
   const harness = new Harness(
     {
       project,
@@ -102,6 +138,7 @@ async function main(): Promise<number> {
       createClient: (baseUrl, authorization) => createOpencodeClient({ baseUrl, headers: { Authorization: authorization } }),
       permissionDecisionsEnabled: true,
       ...(trace === undefined ? {} : { trace }),
+      ...(logResult?.ok === true ? { operationalLog: (event) => logResult.logger.write(event) } : {}),
     },
   );
   // A closed output pipe (for example `quoder | head`) ends Quoder through its orderly shutdown
@@ -114,7 +151,11 @@ async function main(): Promise<number> {
   // Conventional 128 + signal exit codes, so supervisors can tell a signalled exit apart.
   process.on("SIGTERM", () => harness.terminate(143));
   process.on("SIGHUP", () => harness.terminate(129));
-  return harness.run();
+  try {
+    return await harness.run();
+  } finally {
+    if (logResult?.ok === true) logResult.logger.close();
+  }
 }
 
 /** True when run as a program, including through the `npm link` symlink; false when imported. */

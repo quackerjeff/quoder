@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_MODEL, parseArguments } from "../../src/cli.js";
+import { DEFAULT_MODEL, parseArguments, startupConfigurationDiagnostic } from "../../src/cli.js";
 
 describe("quoder command-line arguments", () => {
   it("defaults to the verified glm model", () => {
@@ -41,5 +41,13 @@ describe("quoder command-line arguments", () => {
     expect(parseArguments(["-h"])).toEqual({ kind: "help" });
     expect(parseArguments(["--version"])).toEqual({ kind: "version" });
     expect(parseArguments(["--yolo"])).toEqual({ kind: "error", message: "Unknown argument: --yolo" });
+  });
+
+  it("reports launch-critical configuration failures with fixed sanitized diagnostics", () => {
+    expect(startupConfigurationDiagnostic("inline-config-invalid")).toBe(
+      "Configuration: OpenCode launch configuration is invalid. Correct OPENCODE_CONFIG_CONTENT JSON and its plugin list; no values are shown.",
+    );
+    expect(startupConfigurationDiagnostic("executable-unavailable")).toContain("Run `npm install` in Quoder");
+    expect(startupConfigurationDiagnostic("inline-config-invalid")).not.toContain("secret");
   });
 });

@@ -49,17 +49,19 @@ describe("narrowing OpenCode display events", () => {
       callID: "c1",
       message: "no match",
     });
-    expect(narrow("step.failed", { ...base, error: { type: "unknown", message: "Provider turn interrupted" } })).toEqual({
+    expect(narrow("step.failed", { ...base, error: { type: "unknown", message: "PROVIDER_PAYLOAD_SECRET" } })).toEqual({
       kind: "step-failed",
       sessionID: "ses_1",
-      message: "Provider turn interrupted",
+      message: "OpenCode reported a failed model step",
     });
-    expect(narrow("retried", { timestamp: 1, sessionID: "ses_1", attempt: 2, error: { message: "HTTP 502", isRetryable: true } })).toEqual({
+    expect(narrow("retried", { timestamp: 1, sessionID: "ses_1", attempt: 2, error: { message: "PROVIDER_PAYLOAD_SECRET", isRetryable: true } })).toEqual({
       kind: "retried",
       sessionID: "ses_1",
       attempt: 2,
-      message: "HTTP 502",
+      message: "OpenCode is retrying the request",
     });
+    expect(JSON.stringify(narrow("step.failed", { ...base, error: { message: "PROVIDER_PAYLOAD_SECRET" } }))).not.toContain("PROVIDER_PAYLOAD_SECRET");
+    expect(JSON.stringify(narrow("retried", { ...base, error: { message: "PROVIDER_PAYLOAD_SECRET" } }))).not.toContain("PROVIDER_PAYLOAD_SECRET");
   });
 
   it("ignores events that are not display events", () => {

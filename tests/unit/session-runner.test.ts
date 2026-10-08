@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { SessionTracker, runPrompt, summarizeQuestions } from "../../src/harness/session-runner.js";
+import { formatResult } from "../../src/harness/format.js";
 import type { OpenCodeAdapter } from "../../src/opencode-adapter.js";
+import type { OwnedSessionLedger } from "../../src/harness/owned-session-ledger.js";
 
 const MODEL = { providerID: "ollama", id: "glm-4.7-flash:latest" };
 
@@ -37,7 +39,7 @@ const fakeAdapter = (turn: FakeTurn) => {
   let polls = 0;
   let interrupted = false;
   const adapter = {
-    createSession: vi.fn(async (options: { directory: string; model: unknown; agent: string }) => {
+    createSession: vi.fn(async (options: { directory: string; id?: string; model: unknown; agent: string }) => {
       calls.push(`create:${options.directory}`);
       if (turn.createFails) throw new Error("create session: unavailable");
       return { id: `ses_${++sessions}` };
@@ -105,6 +107,136 @@ describe("session tree ownership", () => {
 });
 
 describe("one prompt in one fresh OpenCode session", () => {
+  it("reports a failed ownership-ledger prepare as sanitized local state without creating a session", async () => {
+    const { adapter, raw } = fakeAdapter({ messages: [] });
+    const secret = "private ledger contents";
+    const ledger: OwnedSessionLedger = {
+      list: vi.fn(async () => ({ status: "available" as const, records: [] })),
+      prepare: vi.fn(async () => { throw new Error(secret); }),
+      markCreated: vi.fn(async () => undefined),
+      markAmbiguous: vi.fn(async () => undefined),
+      remove: vi.fn(async () => undefined),
+    };
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, { ownedSessionLedger: ledger });
+    const output = formatResult(result);
+
+    expect(result.outcome).toMatchObject({ kind: "failed", category: "Local state" });
+    expect(output).toContain("Local state:");
+    expect(output).not.toContain(secret);
+    expect(raw.createSession).not.toHaveBeenCalled();
+    expect(ledger.markAmbiguous).not.toHaveBeenCalled();
+    expect(ledger.remove).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed ownership-ledger markCreated as local state and preserves uncertain ownership", async () => {
+    const { adapter, calls, raw } = fakeAdapter({ messages: [], deleteFails: true });
+    raw.createSession.mockImplementation(async (options) => ({ id: options.id! }));
+    const secret = "private ledger contents";
+    const ledger: OwnedSessionLedger = {
+      list: vi.fn(async () => ({ status: "available" as const, records: [] })),
+      prepare: vi.fn(async () => undefined),
+      markCreated: vi.fn(async () => { throw new Error(secret); }),
+      markAmbiguous: vi.fn(async () => undefined),
+      remove: vi.fn(async () => undefined),
+    };
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, { ownedSessionLedger: ledger });
+    const output = formatResult(result);
+
+    expect(result.outcome).toMatchObject({ kind: "failed", category: "Local state" });
+    expect(output).toContain("Local state:");
+    expect(output).not.toContain(secret);
+    expect(result.sessionDeleted).toBe(false);
+    expect(calls.some((call) => call.startsWith("interrupt:"))).toBe(true);
+    expect(calls.some((call) => call.startsWith("delete:"))).toBe(true);
+    expect(ledger.remove).not.toHaveBeenCalled();
+  });
+
+  it("persists the exact random intent before create and retires it only after verified deletion", async () => {
+    const { adapter, calls, raw } = fakeAdapter({ messages: [user("input-1"), assistant("Done.")] });
+    const order: string[] = [];
+    raw.createSession.mockImplementation(async (options) => {
+      order.push(`create:${options.id}`);
+      return { id: options.id! };
+    });
+    const ledger: OwnedSessionLedger = {
+      list: vi.fn(async () => ({ status: "available" as const, records: [] })),
+      prepare: vi.fn(async (id) => { order.push(`intent:${id}`); }),
+      markCreated: vi.fn(async (id) => { order.push(`created:${id}`); }),
+      markAmbiguous: vi.fn(async (id) => { order.push(`ambiguous:${id}`); }),
+      remove: vi.fn(async (id) => { order.push(`remove:${id}`); }),
+    };
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, { ownedSessionLedger: ledger });
+
+    expect(result.sessionDeleted).toBe(true);
+    expect(order).toHaveLength(4);
+    const id = order[0]?.slice("intent:".length);
+    expect(id).toMatch(/^ses_[a-f0-9]{24}$/u);
+    expect(order).toEqual([`intent:${id}`, `create:${id}`, `created:${id}`, `remove:${id}`]);
+  });
+
+  it("quarantines a conflicting or ambiguous create result and never deletes its candidate ID", async () => {
+    const { adapter, calls, raw } = fakeAdapter({ messages: [] });
+    raw.createSession.mockRejectedValueOnce(new Error("session ID conflict"));
+    const states: string[] = [];
+    const ledger: OwnedSessionLedger = {
+      list: vi.fn(async () => ({ status: "available" as const, records: [] })),
+      prepare: vi.fn(async (id) => { states.push(`intent:${id}`); }),
+      markCreated: vi.fn(async (id) => { states.push(`created:${id}`); }),
+      markAmbiguous: vi.fn(async (id) => { states.push(`ambiguous:${id}`); }),
+      remove: vi.fn(async (id) => { states.push(`remove:${id}`); }),
+    };
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, { ownedSessionLedger: ledger });
+
+    expect(result.outcome.kind).toBe("failed");
+    expect(states[0]).toMatch(/^intent:ses_[a-f0-9]{24}$/u);
+    expect(states[1]).toBe(states[0]?.replace("intent:", "ambiguous:"));
+    expect(states).toHaveLength(2);
+    expect(calls.some((call) => call.startsWith("delete:"))).toBe(false);
+  });
+
+  it("reports a failed ambiguous-state ledger write as local state and leaves the intent unconfirmed", async () => {
+    const { adapter, calls, raw } = fakeAdapter({ messages: [] });
+    raw.createSession.mockRejectedValue(new Error("session create outcome is ambiguous"));
+    let persistedState: "intent" | "ambiguous" = "intent";
+    const ledger: OwnedSessionLedger = {
+      list: vi.fn(async () => ({ status: "available" as const, records: [] })),
+      prepare: vi.fn(async () => { persistedState = "intent"; }),
+      markCreated: vi.fn(async () => undefined),
+      markAmbiguous: vi.fn(async () => { throw new Error("ledger write failed"); }),
+      remove: vi.fn(async () => undefined),
+    };
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, { ownedSessionLedger: ledger });
+
+    expect(result.outcome).toMatchObject({ kind: "failed", category: "Local state" });
+    expect(ledger.markAmbiguous).toHaveBeenCalledTimes(1);
+    expect(persistedState).toBe("intent");
+    expect(calls.some((call) => call.startsWith("delete:"))).toBe(false);
+    expect(ledger.remove).not.toHaveBeenCalled();
+  });
+
+  it("keeps a ledger intent when session deletion cannot be verified", async () => {
+    const { adapter, raw } = fakeAdapter({ messages: [user("input-1"), assistant("Done.")], deleteFails: true });
+    raw.createSession.mockImplementation(async (options) => ({ id: options.id! }));
+    const removed: string[] = [];
+    const ledger: OwnedSessionLedger = {
+      list: vi.fn(async () => ({ status: "available" as const, records: [] })),
+      prepare: vi.fn(async () => undefined),
+      markCreated: vi.fn(async () => undefined),
+      markAmbiguous: vi.fn(async () => undefined),
+      remove: vi.fn(async (id) => { removed.push(id); }),
+    };
+
+    const result = await run(adapter, new SessionTracker(), new AbortController().signal, { ownedSessionLedger: ledger });
+
+    expect(result.sessionDeleted).toBe(false);
+    expect(removed).toEqual([]);
+  });
+
   it("answers, then deletes the session it created, binding the model and project directory", async () => {
     const { adapter, calls, raw } = fakeAdapter({ messages: [user("input-1"), assistant("Done.")], runningPolls: 2 });
     const tracker = new SessionTracker();
@@ -178,7 +310,7 @@ describe("one prompt in one fresh OpenCode session", () => {
       messages: [user("input-1"), assistant("partial", { finish: "error", error: { type: "unknown", message: "HTTP transport failed" } })],
     });
 
-    await expect(run(adapter)).resolves.toMatchObject({ outcome: { kind: "failed", reason: "HTTP transport failed" } });
+    await expect(run(adapter)).resolves.toMatchObject({ outcome: { kind: "failed", category: "OpenCode", reason: "OpenCode reported a session failure" } });
   });
 
   it("reports an empty response as a failure, not an answer", async () => {
@@ -208,7 +340,7 @@ describe("one prompt in one fresh OpenCode session", () => {
 
     const result = await run(adapter);
 
-    expect(result.outcome).toEqual({ kind: "failed", reason: "submit prompt: rejected" });
+    expect(result.outcome).toEqual({ kind: "failed", reason: "submit prompt: rejected", category: "OpenCode" });
     expect(calls).toEqual(["create:/work/QuackTrack", "prompt:ses_1", "interrupt:ses_1", "idle:ses_1", "delete:ses_1"]);
   });
 
@@ -218,7 +350,7 @@ describe("one prompt in one fresh OpenCode session", () => {
 
     const result = await run(adapter);
 
-    expect(result.outcome).toEqual({ kind: "failed", reason: "list active sessions: timed out after 30000ms" });
+    expect(result.outcome).toEqual({ kind: "failed", reason: "list active sessions: timed out after 30000ms", category: "OpenCode" });
     expect(calls.slice(-3)).toEqual(["interrupt:ses_1", "idle:ses_1", "delete:ses_1"]);
   });
 
@@ -302,7 +434,7 @@ describe("one prompt in one fresh OpenCode session", () => {
       onRetry: () => retries++,
     });
 
-    expect(result.outcome).toEqual({ kind: "failed", reason: "OpenCode did not start a response" });
+    expect(result.outcome).toEqual({ kind: "failed", reason: "OpenCode did not start a response", category: "OpenCode" });
     expect(retries).toBe(1);
     expect(calls).toEqual([
       "create:/work/QuackTrack", "prompt:ses_1", "interrupt:ses_1", "idle:ses_1", "delete:ses_1",

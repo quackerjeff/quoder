@@ -1,6 +1,9 @@
+import { randomBytes } from "node:crypto";
 import type { ModelRef, SessionMessagesResponse } from "@opencode-ai/sdk/v2";
 
 import type { PermissionAsked, QuestionAsked } from "../event-monitor.js";
+import type { OperationalFailureCategory } from "./operational-log.js";
+import type { OwnedSessionLedger } from "./owned-session-ledger.js";
 import {
   finalAssistantResponseText,
   hasAssistantResponseAfter,
@@ -29,12 +32,27 @@ export type TurnOutcome =
   | { readonly kind: "permission-rejected"; readonly action: string | undefined; readonly resourceCount: number }
   | { readonly kind: "question-rejected"; readonly questions: readonly QuestionSummary[] }
   | { readonly kind: "cancelled" }
-  | { readonly kind: "failed"; readonly reason: string };
+  | { readonly kind: "failed"; readonly reason: string; readonly category?: OperationalFailureCategory };
 
 export interface RejectedPermission {
   readonly action: string | undefined;
   readonly resourceCount: number;
 }
+
+const PROVIDER_FAILURE_NAMES = new Set([
+  "ProviderAuthError",
+  "MessageOutputLengthError",
+  "StructuredOutputError",
+  "ContextOverflowError",
+  "ContentFilterError",
+  "APIError",
+]);
+
+const isReportedInferenceFailure = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null) return false;
+  const name = Reflect.get(error, "name") ?? Reflect.get(error, "_tag");
+  return typeof name === "string" && PROVIDER_FAILURE_NAMES.has(name);
+};
 
 /**
  * Aborting a turn's cancel signal with a `StopRequest` reason stops it for a harness reason (for
@@ -51,7 +69,7 @@ const stopMessage = (reason: unknown): string | undefined => {
 
 const abortedOutcome = (signal: AbortSignal): TurnOutcome => {
   const message = stopMessage(signal.reason);
-  return message === undefined ? { kind: "cancelled" } : { kind: "failed", reason: message };
+  return message === undefined ? { kind: "cancelled" } : { kind: "failed", reason: message, category: "OpenCode" };
 };
 
 export interface PromptResult {
@@ -175,6 +193,8 @@ const pause = (ms: number, signal: AbortSignal): Promise<void> =>
 export interface RunPromptOptions {
   readonly adapter: OpenCodeAdapter;
   readonly tracker: SessionTracker;
+  /** Durable intent is published before issuing the server create request. */
+  readonly ownedSessionLedger?: OwnedSessionLedger;
   readonly directory: string;
   readonly model: ModelRef;
   /** OpenCode agent bound to each fresh attempt; defaults to the build agent. */
@@ -234,16 +254,42 @@ export async function runPrompt(options: RunPromptOptions): Promise<PromptResult
 
 async function runAttempt(options: RunPromptOptions): Promise<Attempt> {
   let sessionID: string | undefined;
+  let intendedSessionID: string | undefined;
+  let createIssued = false;
   let outcome: TurnOutcome;
   let endedIdle = false;
   let dropped = false;
+  let localStateFailure = false;
   try {
+    if (options.ownedSessionLedger !== undefined) {
+      intendedSessionID = `ses_${randomBytes(12).toString("hex")}`;
+      try {
+        await options.ownedSessionLedger.prepare(intendedSessionID);
+      } catch {
+        localStateFailure = true;
+        throw new Error("Quoder could not prepare session ownership state");
+      }
+    }
+    createIssued = true;
     const session = await options.adapter.createSession({
       directory: options.directory,
+      ...(intendedSessionID === undefined ? {} : { id: intendedSessionID }),
       model: options.model,
       agent: options.agent ?? "build",
     });
     sessionID = session.id;
+    if (intendedSessionID !== undefined && sessionID !== intendedSessionID) {
+      sessionID = undefined;
+      throw new Error("OpenCode returned a different session ID than Quoder requested");
+    }
+    if (intendedSessionID !== undefined) {
+      try {
+        await options.ownedSessionLedger?.markCreated(intendedSessionID);
+      } catch {
+        localStateFailure = true;
+        throw new Error("Quoder could not update session ownership state");
+      }
+    }
     options.tracker.register(sessionID);
     options.onSessionCreated?.(sessionID);
     if (options.cancel.aborted) {
@@ -255,7 +301,18 @@ async function runAttempt(options: RunPromptOptions): Promise<Attempt> {
       dropped = turn.dropped;
     }
   } catch (error) {
-    outcome = options.cancel.aborted ? abortedOutcome(options.cancel) : { kind: "failed", reason: failureReason(error) };
+    if (intendedSessionID !== undefined && createIssued && sessionID === undefined) {
+      try {
+        await options.ownedSessionLedger?.markAmbiguous(intendedSessionID);
+      } catch {
+        localStateFailure = true;
+      }
+    }
+    outcome = options.cancel.aborted
+      ? abortedOutcome(options.cancel)
+      : localStateFailure
+        ? { kind: "failed", reason: failureReason(error), category: "Local state" }
+        : { kind: "failed", reason: failureReason(error), category: "OpenCode" };
   }
   let sessionDeleted = sessionID === undefined;
   let rejectedPermissions: RejectedPermission[] = [];
@@ -270,6 +327,7 @@ async function runAttempt(options: RunPromptOptions): Promise<Attempt> {
     try {
       await options.adapter.deleteSession(sessionID);
       sessionDeleted = true;
+      if (intendedSessionID === sessionID) await options.ownedSessionLedger?.remove(sessionID).catch(() => undefined);
     } catch {
       sessionDeleted = false;
     }
@@ -298,7 +356,7 @@ async function runTurn(
       }
       idleWithoutResponseSince ??= now();
       if (now() - idleWithoutResponseSince >= noResponseTimeoutMs) {
-        return { outcome: { kind: "failed", reason: NOT_STARTED }, endedIdle: false, dropped: true };
+        return { outcome: { kind: "failed", reason: NOT_STARTED, category: "OpenCode" }, endedIdle: false, dropped: true };
       }
     } else {
       idleWithoutResponseSince = undefined;
@@ -325,9 +383,16 @@ function classifyEndedTurn(
     return { kind: "question-rejected", questions: questions.flatMap((question) => summarizeQuestions(question.questions)) };
   }
   const last = lastAssistantInTurn(messages, inputID);
-  const errorMessage = last?.error === undefined ? undefined : Reflect.get(last.error, "message");
-  if (typeof errorMessage === "string" && errorMessage.length > 0) return { kind: "failed", reason: errorMessage };
-  return { kind: "failed", reason: text === "" ? "The model returned an empty response" : "The turn ended without a final response" };
+  if (last?.error !== undefined) {
+    return isReportedInferenceFailure(last.error)
+      ? { kind: "failed", reason: "OpenCode reported an inference failure", category: "Provider/inference" }
+      : { kind: "failed", reason: "OpenCode reported a session failure", category: "OpenCode" };
+  }
+  return {
+    kind: "failed",
+    reason: text === "" ? "The model returned an empty response" : "The turn ended without a final response",
+    category: "OpenCode",
+  };
 }
 
 /** Interrupt and wait (bounded by the adapter timeout) for the session to idle before deleting it. */

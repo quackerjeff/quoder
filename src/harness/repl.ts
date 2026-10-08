@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { resolve } from "node:path";
 import { createInterface, emitKeypressEvents, type Interface } from "node:readline";
 
 import type { ModelRef, OpencodeClient } from "@opencode-ai/sdk/v2";
@@ -20,6 +22,7 @@ import {
   formatProjectMemoryFailure,
   EXECUTION_HISTORY_HELP_TEXT,
   formatExecutionHistoryFailure,
+  formatLocalStateRecovery,
   formatExecutionHistoryList,
   formatExecutionHistoryRecord,
   formatModelChoices,
@@ -43,6 +46,11 @@ import {
 } from "./execution-history.js";
 import { CONTINUE_MARK, DISABLE_KEYBOARD_PROTOCOL, ENABLE_KEYBOARD_PROTOCOL, LineEndingKeys } from "./line-keys.js";
 import { LiveView } from "./live-view.js";
+import {
+  createOwnedSessionLedger,
+  type OwnedSessionLedger,
+  type OwnedSessionRecord,
+} from "./owned-session-ledger.js";
 import type { Project } from "./project.js";
 import {
   createProjectMemoryStore,
@@ -57,6 +65,7 @@ import { SessionTracker, runPrompt, type StopRequest, type TurnOutcome } from ".
 import { resolveAgentSelection, resolveModelSelection } from "./selection.js";
 import { narrowStreamEvent } from "./stream-events.js";
 import { sanitizeForTerminal, sanitizeLine } from "./terminal-text.js";
+import { formatOperationalFailure, type OperationalFailureCategory, type OperationalLogEvent } from "./operational-log.js";
 
 export const HARNESS_OPERATION_TIMEOUT_MS = 30_000;
 /** The monitor's subscription lives as long as its server; this only bounds a forgotten one. */
@@ -128,10 +137,14 @@ export interface HarnessDependencies {
   readonly compareGitSnapshots?: typeof compareGitSnapshots;
   readonly captureGitDiff?: typeof captureGitDiff;
   readonly trace?: (event: HarnessTraceEvent) => void;
+  /** Metadata-only logger; it never receives prompts, responses, tool output, or raw errors. */
+  readonly operationalLog?: (event: OperationalLogEvent) => void;
   /** Injectable project-memory store factory for harness tests and embedders. */
   readonly createProjectMemoryStore?: (projectRoot: string) => ProjectMemoryStore;
   /** Injectable history store for tests and embedders; production uses Quoder's local store. */
   readonly createExecutionHistoryStore?: (project: Project) => ExecutionHistoryStore;
+  /** Injectable Quoder-owned OpenCode session intent ledger. */
+  readonly createOwnedSessionLedger?: (project: Project) => OwnedSessionLedger | undefined;
 }
 
 export interface HarnessOptions {
@@ -158,6 +171,7 @@ interface ServerSession {
   readonly monitor: EventMonitor;
   /** Set when the monitor is lost or a rejection fails; the server is replaced before the next prompt. */
   unhealthy: boolean;
+  reconciled: boolean;
 }
 
 /**
@@ -172,6 +186,7 @@ export class Harness {
   readonly #dependencies: HarnessDependencies;
   readonly #memoryStore: ProjectMemoryStore | undefined;
   readonly #historyStore: ExecutionHistoryStore | undefined;
+  readonly #ownedSessionLedger: OwnedSessionLedger | undefined;
   readonly #tracker = new SessionTracker();
   readonly #permissionQueue: PermissionAsked[] = [];
   #permissionReplyInFlight: string | undefined;
@@ -203,6 +218,7 @@ export class Harness {
   } | undefined;
   #wakeLoop: (() => void) | undefined;
   #readline: Interface | undefined;
+  #cleanupDecisionResolve: ((confirmed: boolean) => void) | undefined;
   #server: ServerSession | undefined;
   #startingServer: Promise<ServerSession> | undefined;
   #running: AbortController | undefined;
@@ -234,6 +250,9 @@ export class Harness {
     } catch {
       this.#historyStore = undefined;
     }
+    this.#ownedSessionLedger = dependencies.createOwnedSessionLedger === undefined
+      ? createOwnedSessionLedger(options.project.root)
+      : dependencies.createOwnedSessionLedger(options.project);
   }
 
   /** Runs until the developer exits; resolves with the process exit code. */
@@ -244,6 +263,11 @@ export class Harness {
 
   /** Ctrl-C: cancel the running prompt, or leave Quoder when idle or still starting. */
   interrupt(): void {
+    if (this.#cleanupDecisionResolve !== undefined) {
+      this.#write("\nCleanup declined; the listed OpenCode session remains and no cleanup was attempted.\n");
+      this.#resolveCleanupDecision(false);
+      return;
+    }
     if (this.#running !== undefined) {
       if (this.#running.signal.aborted) {
         this.#notice("Still cleaning up the cancelled prompt…\n");
@@ -291,6 +315,7 @@ export class Harness {
   }
 
   #requestExit(exitCode: number): void {
+    this.#resolveCleanupDecision(false);
     this.#exitCode ??= exitCode;
     this.#lines.length = 0;
     this.#launchAbort?.abort();
@@ -310,11 +335,12 @@ export class Harness {
         `${theme.paint("dim", "Agent")} ${theme.paint("accent", this.#selectedAgent)}\n` +
         `${theme.paint("dim", "Starting OpenCode server…")}\n`,
     );
+    let initialServer: ServerSession;
     try {
-      await this.#ensureServer();
+      initialServer = await this.#ensureServer();
     } catch {
       if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
-      this.#write(`${theme.paint("error", "Could not start the OpenCode server.")} Run \`npm run verify:environment\` in Quoder to diagnose.\n`);
+      this.#reportFailure("OpenCode", "Could not start the OpenCode server.");
       return this.#shutdownOnce(1);
     }
     if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
@@ -335,7 +361,8 @@ export class Harness {
       );
     } else {
       const reason = this.#memoryUnavailable ?? "io-error";
-      this.#write(`${theme.paint("warning", `${formatProjectMemoryFailure(reason)} Prompts continue without memory; use /memory clear to reset or retry.`)}\n`);
+      const guidance = formatLocalStateRecovery("Project memory", formatProjectMemoryFailure(reason));
+      this.#write(`${theme.paint("warning", `${guidance} Prompts continue without memory.`)}\n`);
     }
     this.#write(`${theme.paint("dim", "Execution history is stored locally and may contain verbatim prompts, context, commands, and responses. Quoder does not redact secrets; other processes running as your user may be able to read it. Type /history help for retention and deletion controls.")}\n`);
     this.#write(`${theme.paint("success", "Ready.")} ${theme.paint("dim", "Type /help for help.")}\n\n`);
@@ -345,8 +372,14 @@ export class Harness {
       // itself; Quoder does, and restores it on shutdown.
       const keys = new LineEndingKeys({
         // While a prompt runs, typing is not echoed over the status line; Return explains why.
-        isBusy: () => this.#running !== undefined,
-        onReturnWhileBusy: () => this.#notice("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n"),
+        // A stale-session decision may be requested while a new prompt is obtaining a
+        // replacement server. Route Return to the confirmation instead of the busy notice.
+        isBusy: () => this.#running !== undefined && this.#cleanupDecisionResolve === undefined,
+        onReturnWhileBusy: () => {
+          if (this.#cleanupDecisionResolve === undefined) {
+            this.#notice("Quoder is still running the previous prompt; press Ctrl-C to cancel it.\n");
+          }
+        },
         onBusyDecisionKey: (key) => this.#onPermissionKey(key),
         isDiffInteraction: () => this.#diffInteraction !== undefined,
         onDiffInteractionKey: (key) => this.#onDiffInteractionKey(key),
@@ -380,6 +413,7 @@ export class Harness {
     readline.on("SIGTSTP", () => undefined);
     readline.on("close", () => {
       this.#inputClosed = true;
+      this.#resolveCleanupDecision(false);
       this.#diffKeyResolver?.("exit");
       if (this.#running !== undefined && !this.#running.signal.aborted) {
         this.#permissionQueue.length = 0;
@@ -387,7 +421,16 @@ export class Harness {
       }
       this.#wakeLoop?.();
     });
-    readline.prompt();
+    try {
+      await this.#reconcileOwnedSessions(initialServer);
+      initialServer.reconciled = true;
+    } catch {
+      this.#write(`${formatLocalStateRecovery("OpenCode session ownership", "The ownership ledger is corrupt, unsafe, or unavailable.")}\n`);
+      this.#log({ event: "failure.reported", category: "Local state" });
+      return this.#shutdownOnce(1);
+    }
+    if (this.#exitCode !== undefined) return this.#shutdownOnce(this.#exitCode);
+    if (!this.#inputClosed) readline.prompt();
     for (;;) {
       const line = await this.#nextLine();
       if (line === undefined || !(await this.#handle(line)) || this.#exitCode !== undefined) break;
@@ -397,6 +440,11 @@ export class Harness {
   }
 
   #receive(line: string): void {
+    if (this.#cleanupDecisionResolve !== undefined) {
+      const choice = line.trim().toLowerCase();
+      this.#resolveCleanupDecision(choice === "y" || choice === "yes");
+      return;
+    }
     const continues = this.#options.terminal && this.#lineContinues;
     this.#lineContinues = false;
     if (this.#exitCode !== undefined) return;
@@ -622,7 +670,8 @@ export class Harness {
       const server = await this.#ensureServer();
       models = await server.adapter.listModels(this.#options.project.root);
     } catch {
-      this.#selectionMessage("Could not load configured models; the current model selection is unchanged.", true);
+      this.#log({ event: "failure.reported", category: "OpenCode" });
+      this.#selectionMessage(`${formatOperationalFailure("OpenCode")} Could not load configured models; the current model selection is unchanged.`, true);
       return;
     }
     if (query === "") {
@@ -651,7 +700,8 @@ export class Harness {
       const server = await this.#ensureServer();
       agents = await server.adapter.listAgents(this.#options.project.root);
     } catch {
-      this.#selectionMessage("Could not load configured agents; the current agent selection is unchanged.", true);
+      this.#log({ event: "failure.reported", category: "OpenCode" });
+      this.#selectionMessage(`${formatOperationalFailure("OpenCode")} Could not load configured agents; the current agent selection is unchanged.`, true);
       return;
     }
     if (query === "") {
@@ -683,6 +733,7 @@ export class Harness {
       if (result.status === "unavailable") {
         this.#memory = undefined;
         this.#memoryUnavailable = result.reason;
+        this.#log({ event: "failure.reported", category: "Local state" });
       } else {
         this.#memory = result.memory;
         this.#memoryUnavailable = undefined;
@@ -690,6 +741,7 @@ export class Harness {
     } catch {
       this.#memory = undefined;
       this.#memoryUnavailable = "io-error";
+      this.#log({ event: "failure.reported", category: "Local state" });
     }
   }
 
@@ -704,7 +756,9 @@ export class Harness {
   }
 
   #historyUnavailable(reason?: import("./execution-history.js").HistoryUnavailableReason): void {
-    this.#historyMessage(reason === undefined ? "Execution history is unavailable." : formatExecutionHistoryFailure(reason), true);
+    this.#log({ event: "failure.reported", category: "Local state" });
+    const detail = reason === undefined ? "Execution history is unavailable." : formatExecutionHistoryFailure(reason);
+    this.#historyMessage(formatLocalStateRecovery("Execution history", detail), true);
   }
 
   async #handleHistoryCommand(input: string): Promise<void> {
@@ -786,8 +840,11 @@ export class Harness {
     try {
       const result = await this.#memoryStore.save(memory);
       if (!result.ok) {
-        const advice = result.reason === "oversized" ? " Remove an entry or clear unused memory, then retry." : "";
-        this.#memoryMessage(`${formatProjectMemoryFailure(result.reason, "save")} No changes were saved.${advice}`, true);
+        const detail = formatProjectMemoryFailure(result.reason, "save");
+        const message = ["corrupt", "unsupported-version", "invalid-data", "oversized", "unsafe-path"].includes(result.reason)
+          ? formatLocalStateRecovery("Project memory", detail)
+          : `${detail} No changes were saved.`;
+        this.#memoryMessage(message, true);
         return;
       }
       this.#memory = memory;
@@ -799,6 +856,13 @@ export class Harness {
   }
 
   async #clearProjectMemory(): Promise<void> {
+    if (this.#memory === undefined) {
+      this.#memoryMessage(formatLocalStateRecovery(
+        "Project memory",
+        formatProjectMemoryFailure(this.#memoryUnavailable ?? "io-error"),
+      ), true);
+      return;
+    }
     if (this.#memoryStore === undefined) {
       this.#memoryMessage(`${formatProjectMemoryFailure("io-error", "clear")} No changes were saved.`, true);
       return;
@@ -806,7 +870,11 @@ export class Harness {
     try {
       const result = await this.#memoryStore.clear();
       if (!result.ok) {
-        this.#memoryMessage(`${formatProjectMemoryFailure(result.reason, "clear")} No changes were saved.`, true);
+        const detail = formatProjectMemoryFailure(result.reason, "clear");
+        const message = ["corrupt", "unsupported-version", "invalid-data", "oversized", "unsafe-path"].includes(result.reason)
+          ? formatLocalStateRecovery("Project memory", detail)
+          : `${detail} No changes were saved.`;
+        this.#memoryMessage(message, true);
         return;
       }
       this.#memory = emptyProjectMemory();
@@ -822,10 +890,10 @@ export class Harness {
     if (command === "" || command === "show") {
       await this.#loadProjectMemory();
       if (this.#memory === undefined) {
-        this.#memoryMessage(
-          `${formatProjectMemoryFailure(this.#memoryUnavailable ?? "io-error")} Use /memory clear to reset or retry.`,
-          true,
-        );
+        this.#memoryMessage(formatLocalStateRecovery(
+          "Project memory",
+          formatProjectMemoryFailure(this.#memoryUnavailable ?? "io-error"),
+        ), true);
         return;
       }
       this.#write(`${formatProjectMemory(this.#memory, this.#memoryStore?.filePath ?? "(unavailable)", this.#theme)}\n`);
@@ -840,10 +908,10 @@ export class Harness {
       return;
     }
     if (this.#memory === undefined) {
-      this.#memoryMessage(
-        `Project memory is unavailable. ${formatProjectMemoryFailure(this.#memoryUnavailable ?? "io-error")} Use /memory clear to reset or retry.`,
-        true,
-      );
+      this.#memoryMessage(formatLocalStateRecovery(
+        "Project memory",
+        formatProjectMemoryFailure(this.#memoryUnavailable ?? "io-error"),
+      ), true);
       return;
     }
 
@@ -994,7 +1062,7 @@ export class Harness {
         server = await this.#ensureServer();
       } catch {
         view.finish();
-        this.#write(`${theme.paint("error", "Could not start the OpenCode server; the prompt was not run.")}\n\n`);
+        this.#reportFailure("OpenCode", "Could not start the OpenCode server; the prompt was not run.");
         const afterGit = await this.#captureGitState();
         const comparison = await this.#compareGitState(beforeGit, afterGit);
         this.#write(formatGitSummary(comparison, theme));
@@ -1007,6 +1075,7 @@ export class Harness {
       const result = await runPrompt({
         adapter: server.adapter,
         tracker: this.#tracker,
+        ...(this.#ownedSessionLedger === undefined ? {} : { ownedSessionLedger: this.#ownedSessionLedger }),
         directory: this.#options.project.root,
         model,
         agent,
@@ -1026,6 +1095,9 @@ export class Harness {
       });
       if (result.sessionID !== undefined && !result.sessionDeleted) this.#undeletedSessions.push(result.sessionID);
       this.#trace({ event: "prompt.completed", outcome: result.outcome.kind, elapsedMs: result.elapsedMs });
+      if (result.outcome.kind === "failed") {
+        this.#log({ event: "failure.reported", category: result.outcome.category ?? "OpenCode" });
+      }
       const stats = view.finish(result);
       this.#write(`\n${formatResult(result, theme, stats)}\n`);
       const afterGit = await this.#captureGitState();
@@ -1051,8 +1123,7 @@ export class Harness {
         }
       }
       for (const notice of this.#notices.splice(0)) {
-        const alreadyShown = result.outcome.kind === "failed" && result.outcome.reason.startsWith(notice);
-        if (!alreadyShown) this.#write(`${theme.paint("warning", `Note: ${notice} A new OpenCode server will start with your next prompt.`)}\n\n`);
+        this.#write(`${theme.paint("warning", `Note: ${notice} A new OpenCode server will start with your next prompt.`)}\n\n`);
       }
       this.#view = undefined;
       this.#running = undefined;
@@ -1142,6 +1213,7 @@ export class Harness {
   }
 
   #historyWarning(operation: "begin" | "complete", reason: string): void {
+    this.#log({ event: "failure.reported", category: "Local state" });
     this.#write(`${this.#theme.paint("warning", `Execution history ${operation} failed (${reason}); the prompt outcome is unchanged.`)}\n`);
   }
 
@@ -1246,6 +1318,108 @@ export class Harness {
     this.#running.abort(reason);
   }
 
+  async #reconcileOwnedSessions(server: ServerSession): Promise<void> {
+    if (this.#ownedSessionLedger === undefined) return;
+    const listed = await this.#ownedSessionLedger.list();
+    if (listed.status !== "available") {
+      throw new Error("OpenCode session ownership ledger is unavailable");
+    }
+
+    const candidates: OwnedSessionRecord[] = [];
+    let leftUntouched = 0;
+    for (const record of listed.records) {
+      if (record.state !== "created") {
+        leftUntouched++;
+        continue;
+      }
+      let session;
+      try {
+        session = await server.adapter.getSession(record.id);
+      } catch {
+        this.#reportFailure("OpenCode", "Could not inspect a Quoder-owned session; no cleanup was attempted.");
+        throw new Error("OpenCode session reconciliation failed");
+      }
+      if (session === undefined) {
+        // Exact Core V2 404 is the only evidence that an abandoned intent can be retired.
+        await this.#ownedSessionLedger.remove(record.id);
+        continue;
+      }
+      const remoteRoot = typeof session.location?.directory === "string"
+        ? await realpath(session.location.directory).catch(() => resolve(session.location.directory))
+        : undefined;
+      if (session.id !== record.id || remoteRoot !== resolve(this.#options.project.root) ||
+        record.projectRoot !== resolve(this.#options.project.root)) {
+        leftUntouched++;
+        continue;
+      }
+      candidates.push(record);
+    }
+
+    if (leftUntouched > 0) {
+      this.#write(`Left ${leftUntouched} report-only or mismatched Quoder session record(s) untouched.\n`);
+    }
+    if (candidates.length === 0) return;
+
+    this.#write(
+      `Found ${candidates.length} Quoder-owned OpenCode session(s) from an earlier run:\n`
+      + `${candidates.map(({ id }) => `  ${id}`).join("\n")}\n`
+      + "Activity on these sessions is unknown; cleanup may interrupt work if an older OpenCode server is still using one.\n",
+    );
+    if (!this.#options.terminal) {
+      this.#write("Cleanup was skipped because confirmation requires a terminal. Run Quoder for this project in a TTY to review each session.\n");
+      return;
+    }
+
+    for (const candidate of candidates) {
+      const confirmed = await this.#confirmOwnedSessionCleanup(candidate.id);
+      if (!confirmed) {
+        this.#write(`Kept ${candidate.id}; no cleanup was attempted.\n`);
+        continue;
+      }
+      try {
+        const current = await server.adapter.getSession(candidate.id);
+        if (current === undefined) {
+          await this.#ownedSessionLedger.remove(candidate.id);
+          this.#write(`Session ${candidate.id} is already absent; its ledger entry was retired.\n`);
+          continue;
+        }
+        const currentRoot = typeof current.location?.directory === "string"
+          ? await realpath(current.location.directory).catch(() => resolve(current.location.directory))
+          : undefined;
+        if (current.id !== candidate.id || currentRoot !== resolve(this.#options.project.root)) {
+          this.#write(`Kept ${candidate.id}; its current ID or project location no longer matches the ledger.\n`);
+          continue;
+        }
+        await server.adapter.deleteSession(candidate.id);
+        this.#trace({ event: "session.deleted", sessionID: candidate.id, verified: true });
+        await this.#ownedSessionLedger.remove(candidate.id);
+        for (let index = this.#undeletedSessions.indexOf(candidate.id); index >= 0; index = this.#undeletedSessions.indexOf(candidate.id)) {
+          this.#undeletedSessions.splice(index, 1);
+        }
+        this.#write(`Deleted ${candidate.id}; OpenCode confirmed it is absent.\n`);
+      } catch {
+        this.#write(`Could not confirm cleanup of ${candidate.id}; its ownership record was preserved for review.\n`);
+      }
+    }
+  }
+
+  #confirmOwnedSessionCleanup(sessionID: string): Promise<boolean> {
+    if (!this.#options.terminal || this.#readline === undefined || this.#inputClosed || this.#exitCode !== undefined) {
+      return Promise.resolve(false);
+    }
+    this.#write(`Delete only ${sessionID}? [y/N] `);
+    return new Promise((resolveDecision) => {
+      this.#cleanupDecisionResolve = resolveDecision;
+    });
+  }
+
+  #resolveCleanupDecision(confirmed: boolean): void {
+    const resolveDecision = this.#cleanupDecisionResolve;
+    if (resolveDecision === undefined) return;
+    this.#cleanupDecisionResolve = undefined;
+    resolveDecision(confirmed);
+  }
+
   async #ensureServer(): Promise<ServerSession> {
     const current = this.#server;
     if (current !== undefined && !current.unhealthy) return current;
@@ -1253,7 +1427,12 @@ export class Harness {
     this.#startingServer ??= this.#launchServer().finally(() => {
       this.#startingServer = undefined;
     });
-    return this.#startingServer;
+    const started = await this.#startingServer;
+    if (this.#readline !== undefined && !started.reconciled) {
+      await this.#reconcileOwnedSessions(started);
+      started.reconciled = true;
+    }
+    return started;
   }
 
   async #launchServer(): Promise<ServerSession> {
@@ -1317,7 +1496,7 @@ export class Harness {
         await monitor.stop();
         throw new Error("OpenCode did not confirm the event subscription");
       }
-      server = { launch, adapter, monitor, unhealthy: false };
+      server = { launch, adapter, monitor, unhealthy: false, reconciled: false };
       if (this.#exitCode !== undefined) {
         await monitor.stop();
         throw new Error("Quoder is shutting down");
@@ -1326,7 +1505,6 @@ export class Harness {
       this.#trace({ event: "server.started" });
       const launched = server;
       void launch.exited?.then(() => this.#onServerExit(launched));
-      await this.#retryUndeletedSessions(launched);
       return launched;
     } catch (error) {
       await this.#closeLaunch(launch);
@@ -1346,7 +1524,7 @@ export class Harness {
       this.#notices.push(problem);
       this.#stopRunning(`${problem} The prompt was stopped.`);
     } else {
-      this.#notifyIdle(`\n${problem} A new OpenCode server will start with your next prompt.\n`);
+      this.#notifyIdle(`\n${formatOperationalFailure("OpenCode")} ${problem} A new OpenCode server will start with your next prompt.\n`);
     }
   }
 
@@ -1359,9 +1537,11 @@ export class Harness {
     // A server already marked unhealthy (usually its event stream dropped first) was reported then.
     if (server.unhealthy) return;
     if (this.#running !== undefined) {
-      this.#stopRunning("The OpenCode server stopped unexpectedly, so the prompt was stopped.");
+      const notice = "The OpenCode server stopped unexpectedly, so the prompt was stopped.";
+      this.#notices.push(notice);
+      this.#stopRunning(notice);
     } else {
-      this.#notifyIdle("\nThe OpenCode server stopped unexpectedly; a new one will start with your next prompt.\n");
+      this.#notifyIdle(`\n${formatOperationalFailure("OpenCode")} The OpenCode server stopped unexpectedly; a new one will start with your next prompt.\n`);
     }
   }
 
@@ -1383,23 +1563,6 @@ export class Harness {
     }
   }
 
-  /** Sessions whose deletion could not be verified (for example after a server loss) are retried. */
-  async #retryUndeletedSessions(server: ServerSession): Promise<void> {
-    const pending = this.#undeletedSessions.splice(0);
-    if (pending.length === 0) return;
-    let deleted = 0;
-    for (const sessionID of pending) {
-      try {
-        await server.adapter.deleteSession(sessionID);
-        deleted++;
-        this.#trace({ event: "session.deleted", sessionID, verified: true });
-      } catch {
-        this.#undeletedSessions.push(sessionID);
-      }
-    }
-    if (deleted > 0) this.#notice(`Deleted ${deleted} earlier OpenCode session(s) that could not be verified before.\n`);
-  }
-
   #shutdownOnce(exitCode: number): Promise<number> {
     this.#shutdown ??= this.#performShutdown(exitCode);
     return this.#shutdown;
@@ -1413,7 +1576,6 @@ export class Harness {
     await this.#startingServer?.catch(() => undefined);
     const server = this.#server;
     this.#server = undefined;
-    if (server !== undefined && !server.unhealthy) await this.#retryUndeletedSessions(server);
     if (this.#undeletedSessions.length > 0) {
       this.#write(`Warning: ${this.#undeletedSessions.length} OpenCode session(s) could not be verified as deleted.\n`);
     }
@@ -1450,5 +1612,44 @@ export class Harness {
     } catch {
       // Tracing is diagnostic only and must never affect the session lifecycle.
     }
+    let safeEvent: OperationalLogEvent | undefined;
+    switch (event.event) {
+      case "server.started":
+      case "server.stopped":
+      case "server.lost":
+      case "monitor.lost":
+      case "prompt.started":
+      case "prompt.retried":
+        safeEvent = { event: event.event };
+        break;
+      case "prompt.completed":
+        safeEvent = { event: event.event, outcome: event.outcome, elapsedMs: event.elapsedMs };
+        break;
+      case "session.created":
+        safeEvent = { event: event.event };
+        break;
+      case "session.deleted":
+        safeEvent = { event: event.event, verified: event.verified };
+        break;
+      case "stream.first-text":
+      case "permission.replied":
+      case "activity.tool":
+        break;
+    }
+    if (safeEvent !== undefined) this.#log(safeEvent);
+  }
+
+  #log(event: OperationalLogEvent): void {
+    try {
+      this.#dependencies.operationalLog?.(event);
+    } catch {
+      // Diagnostics cannot change prompt, cleanup, or recovery outcomes.
+    }
+  }
+
+  #reportFailure(category: OperationalFailureCategory, suffix = ""): void {
+    this.#log({ event: "failure.reported", category });
+    const explanation = formatOperationalFailure(category);
+    this.#write(`${this.#theme.paint("error", `${explanation}${suffix === "" ? "" : ` ${suffix}`}`)}\n`);
   }
 }

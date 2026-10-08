@@ -105,6 +105,50 @@ afterEach(() => {
 });
 
 describe("verified OpenCode 1.18.33 request payloads", () => {
+  it("prechecks and creates only the exact caller-supplied ledger ID", async () => {
+    const { client, methods } = fakeClient();
+    const id = `ses_${"a".repeat(24)}`;
+    methods.get.mockResolvedValueOnce(failedResult({ _tag: "SessionNotFoundError" }, 404));
+    methods.create.mockResolvedValue(result({ data: { id, location: { directory: "/tmp/project" } } }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await expect(adapter.createSession({ id, directory: "/tmp/project" })).resolves.toMatchObject({ id });
+
+    expect(methods.get).toHaveBeenCalledWith({ sessionID: id }, { signal: expect.any(AbortSignal) });
+    expect(methods.create).toHaveBeenCalledWith(
+      { id, agent: "build", location: { directory: "/tmp/project" } },
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(methods.get.mock.invocationCallOrder[0]).toBeLessThan(methods.create.mock.invocationCallOrder[0]!);
+  });
+
+  it("rejects an ID conflict before create and refuses a mismatched create response", async () => {
+    const id = `ses_${"b".repeat(24)}`;
+    const { client, methods } = fakeClient();
+    methods.get.mockResolvedValueOnce(result({ data: { id, location: { directory: "/tmp/project" } } }));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+    await expect(adapter.createSession({ id, directory: "/tmp/project" })).rejects.toMatchObject({
+      diagnostic: { operation: "create session", status: 409 },
+    });
+    expect(methods.create).not.toHaveBeenCalled();
+
+    methods.get.mockResolvedValueOnce(failedResult({ _tag: "SessionNotFoundError" }, 404));
+    methods.create.mockResolvedValueOnce(result({ data: { id: `ses_${"c".repeat(24)}` } }));
+    await expect(adapter.createSession({ id, directory: "/tmp/project" })).rejects.toMatchObject({
+      diagnostic: { operation: "create session", message: "server returned a different session ID" },
+    });
+  });
+
+  it("treats only the tagged Core V2 404 as an absent exact session", async () => {
+    const { client, methods } = fakeClient();
+    methods.get.mockResolvedValue(failedResult({ _tag: "UnknownError" }, 404));
+    const adapter = new OpenCodeAdapter({ client, timeoutMs: 100 });
+
+    await expect(adapter.getSession(`ses_${"d".repeat(24)}`)).rejects.toMatchObject({
+      diagnostic: { operation: "get session", status: 404, errorTag: "UnknownError" },
+    });
+  });
+
   it("lists enabled project models using the Core V2 model catalog", async () => {
     const { client, methods } = fakeClient();
     methods.listModels.mockResolvedValue(result({

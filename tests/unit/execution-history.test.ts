@@ -250,17 +250,35 @@ describe("execution history persistence", () => {
     await expect(store.list()).resolves.toMatchObject({ status: "available", records: [{ id: ids.c }, { id: ids.b }] });
   });
 
-  it("rejects invalid retention and allows explicit settings recovery", async () => {
+  it("rejects invalid retention and preserves corrupt settings for manual recovery", async () => {
     const root = await temporaryDirectory();
     const projectRoot = join(root, "project");
     await mkdir(projectRoot);
     const store = await makeStore(projectRoot, join(root, "state"), () => ids.a);
     expect(await store.setRetention(0)).toEqual({ ok: false, reason: "invalid-data" });
     await store.retention();
-    await writeFile(join(store.directory, "settings.json"), "{broken", { mode: 0o600 });
+    const settingsPath = join(store.directory, "settings.json");
+    const original = "{broken";
+    await writeFile(settingsPath, original, { mode: 0o600 });
     await expect(store.retention()).resolves.toEqual({ status: "unavailable", reason: "corrupt" });
-    await expect(store.setRetention(8)).resolves.toEqual({ ok: true });
-    await expect(store.retention()).resolves.toEqual({ status: "available", maxCompletedRecords: 8 });
+    await expect(store.setRetention(8)).resolves.toEqual({ ok: false, reason: "corrupt" });
+    expect(await readFile(settingsPath, "utf8")).toBe(original);
+    await expect(store.retention()).resolves.toEqual({ status: "unavailable", reason: "corrupt" });
+  });
+
+  it("preflights history clear and preserves malformed record sources", async () => {
+    const root = await temporaryDirectory();
+    const projectRoot = join(root, "project");
+    await mkdir(projectRoot);
+    const store = await makeStore(projectRoot, join(root, "state"), () => ids.a);
+    await store.begin(startInput());
+    const recordPath = join(store.directory, `${ids.a}--in-progress.json`);
+    const original = "{malformed-record";
+    await writeFile(recordPath, original, { mode: 0o600 });
+
+    await expect(store.delete(ids.a)).resolves.toEqual({ status: "unavailable", reason: "corrupt" });
+    await expect(store.clearAll()).resolves.toEqual({ status: "unavailable", reason: "corrupt" });
+    expect(await readFile(recordPath, "utf8")).toBe(original);
   });
 
   it("deletes exact IDs, preserves tombstones against concurrent finalization, and clears project history", async () => {

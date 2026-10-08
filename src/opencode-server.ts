@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 
 import { opencodeExecutablePath } from "./package-root.js";
 import { assertNoProjectOpenCodePlugins } from "./opencode-project-policy.js";
@@ -56,6 +57,26 @@ function configContentWithShellEnvironmentPlugin(env: NodeJS.ProcessEnv): string
     // shell.env hooks; this registration is not a credential-isolation boundary for that tool.
     plugin: [...configuredPlugins, shellEnvironmentPluginURL],
   });
+}
+
+export type OpenCodeLaunchInputIssue = "executable-unavailable" | "inline-config-invalid";
+
+/** Validates only inputs Quoder requires to construct and launch its pinned OpenCode child. */
+export function validateOpenCodeLaunchInputs(
+  env: NodeJS.ProcessEnv = process.env,
+  executable = opencodeExecutablePath(),
+): OpenCodeLaunchInputIssue | undefined {
+  try {
+    accessSync(executable, constants.X_OK);
+  } catch {
+    return "executable-unavailable";
+  }
+  try {
+    configContentWithShellEnvironmentPlugin(env);
+  } catch {
+    return "inline-config-invalid";
+  }
+  return undefined;
 }
 
 const waitForOwnedChildExit = async (

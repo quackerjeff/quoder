@@ -1238,6 +1238,22 @@ Add:
 
 The harness can be used as the normal interface for local OpenCode development without requiring frequent manual recovery.
 
+## Implementation status (2026-10-07)
+
+Milestone 9 implementation and validation are complete. Quoder validates its own
+startup settings and launch-critical OpenCode inputs, reports sanitized
+operational failure categories, preserves corrupt state with manual recovery
+guidance, and can write opt-in metadata-only JSONL logs outside the target
+project. A durable ownership ledger supports conservative stale-session
+reporting and cleanup only after explicit confirmation.
+
+Cleanup is limited to durable `created` ledger records whose exact session ID
+and project location still match. Intent-only and ambiguous records remain
+report-only; old or unregistered sessions are left untouched. The accepted
+create-before-confirmation-write crash window requires manual recovery. QA's
+automated checks passed; a real interactive TTY and OS process-crash smoke run
+was not performed. See the Milestone 9 QA report for evidence and limitations.
+
 ---
 
 # 11. Future Possibilities

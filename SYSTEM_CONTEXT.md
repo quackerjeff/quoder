@@ -88,6 +88,7 @@ Rules:
 
 Persistent state owned here:
 - Per-project context memory and execution history, stored in Quoder's local user state directory outside target repositories; each feature uses a separate state subtree and its own schema/retention rules.
+- A private per-project OpenCode session ownership ledger, stored outside target repositories. It records Quoder-generated session IDs and lifecycle state so stale sessions can be reconciled conservatively.
 
 Important invariants:
 - Each submitted prompt uses a new OpenCode session.
@@ -114,9 +115,13 @@ Known failure modes or sensitive areas:
 - Session cleanup failures could retain unwanted model context or orphan resources.
 - Permission forwarding errors could weaken user control or block valid work.
 - A process interruption can leave a valid execution-history record in progress; Quoder labels it as possibly interrupted rather than guessing. Atomic state writes protect saved context and history records from partial publication, but same-user processes are not isolated from their contents.
+- Stale-session cleanup is limited to ledger entries durably confirmed after an exact matching create response and verified against exact session ID and canonical project location. Each cleanup requires explicit confirmation. Intent-only and ambiguous entries are report-only; a crash after server-side create but before durable confirmation requires manual recovery. Older/unregistered sessions are left untouched, and activity may be unknown.
+- Corrupt project memory, execution history, or ownership-ledger sources are preserved unchanged. Quoder provides manual recovery guidance; it does not automatically reset or repair the source.
+- Startup validation covers Quoder-owned settings and launch-critical inputs, including the command-line model shape, pinned OpenCode executable, and inline launch configuration. It does not validate arbitrary OpenCode user or project settings.
+- Optional structured operational JSONL logging is disabled by default. When explicitly configured with `QUODER_LOG_FILE`, it is metadata-only and must resolve outside the target project. Prompts, tool output, provider payloads, credentials, and raw error details are excluded.
 
 Observability references:
-- Structured local logging is planned for a later milestone; no current observability artifacts exist.
+- Optional metadata-only JSONL operational logging is documented in `docs/tech.md` and `docs/runbook.md`.
 
 ## Adjacent Repositories
 

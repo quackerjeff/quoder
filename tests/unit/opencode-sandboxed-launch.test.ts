@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   launchSandboxedOpenCodeServer,
   type SandboxedServerDependencies,
+  validateOpenCodeLaunchInputs,
 } from "../../src/opencode-server.js";
 import { SHELL_NOT_SANDBOXED_MESSAGE } from "../../src/opencode-sandbox-assertion.js";
 import type { ToolSandbox } from "../../src/opencode-tool-sandbox.js";
@@ -26,6 +27,26 @@ const deps = (overrides: Partial<SandboxedServerDependencies> = {}): SandboxedSe
 }) as SandboxedServerDependencies;
 
 const options = { username: "quoder", password: "secret", cwd: "/tmp/project" };
+
+describe("OpenCode startup input validation", () => {
+  it("accepts a usable pinned executable and the launch overlay shape Quoder consumes", () => {
+    expect(validateOpenCodeLaunchInputs({ OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: ["trusted"] }) }, process.execPath))
+      .toBeUndefined();
+  });
+
+  it.each([
+    ["malformed JSON", "{secret-inline-value"],
+    ["invalid plugin list", JSON.stringify({ plugin: ["ok", 42] })],
+  ])("reports %s without returning inline configuration", (_label, value) => {
+    const result = validateOpenCodeLaunchInputs({ OPENCODE_CONFIG_CONTENT: value }, process.execPath);
+    expect(result).toBe("inline-config-invalid");
+    expect(String(result)).not.toContain("secret-inline-value");
+  });
+
+  it("detects a missing launch executable without exposing its path", () => {
+    expect(validateOpenCodeLaunchInputs({}, "/private/path/to/missing-opencode")).toBe("executable-unavailable");
+  });
+});
 
 describe("launchSandboxedOpenCodeServer", () => {
   it("passes the prepared sandbox to the launcher", async () => {

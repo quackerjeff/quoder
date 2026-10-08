@@ -52,6 +52,7 @@ export interface WaitUntilIdleOptions {
 
 export interface CreateSessionOptions {
   readonly directory: string;
+  readonly id?: string;
   readonly agent?: string;
   readonly model?: ModelRef;
 }
@@ -162,9 +163,18 @@ export class OpenCodeAdapter {
   }
 
   async createSession(options: CreateSessionOptions): Promise<SessionV2Info> {
+    if (options.id !== undefined) {
+      if (!/^ses_[a-f0-9]{24}$/u.test(options.id)) {
+        throw new OpenCodeAdapterError({ operation: "create session", message: "caller-supplied session ID is invalid" });
+      }
+      if (await this.getSession(options.id) !== undefined) {
+        throw new OpenCodeAdapterError({ operation: "create session", status: 409, message: "caller-supplied session ID already exists" });
+      }
+    }
     const result = await this.#request("create session", (signal) =>
       this.#client.v2.session.create(
         {
+          ...(options.id === undefined ? {} : { id: options.id }),
           agent: options.agent ?? "build",
           location: { directory: options.directory },
           ...(options.model === undefined ? {} : { model: options.model }),
@@ -172,6 +182,23 @@ export class OpenCodeAdapter {
         { signal },
       ),
     );
+    const session = this.#requiredData<{ data: SessionV2Info }>(result).data;
+    if (options.id !== undefined && session.id !== options.id) {
+      throw new OpenCodeAdapterError({ operation: "create session", message: "server returned a different session ID" });
+    }
+    return session;
+  }
+
+  /** Returns only a precisely verified not-found result as absent; all other failures stay errors. */
+  async getSession(sessionID: string): Promise<SessionV2Info | undefined> {
+    const result = await this.#requestAllowingError("get session", (signal) =>
+      this.#client.v2.session.get({ sessionID }, { signal }),
+    );
+    const tag = errorTag(result.error);
+    if (result.response.status === 404 && tag === "SessionNotFoundError") return undefined;
+    if (!result.response.ok || result.error !== undefined) {
+      throw this.#toError("get session", result.error, result.response.status);
+    }
     return this.#requiredData<{ data: SessionV2Info }>(result).data;
   }
 

@@ -173,6 +173,10 @@ Source: `Session3.create` and `V2SessionCreateData` in the local generated 1.18.
 
 Sources: `Session3.create` and `V2SessionCreateData`/`V2SessionCreateResponses` in the local generated 1.18.33 declarations.
 
+**Caller-supplied Core V2 session IDs (Milestone 9 research, 2026-10-07).** The pinned V2 declaration accepts `id?: string` on `Session3.create`; `SessionV2Info` returns an `id`, and `Session3.list` supports project/directory filtering. V2 create has no `title` or arbitrary `metadata` field, and `SessionV2Info` has no ownership metadata. The legacy `SessionCreateData` `title`/`metadata` fields are not part of this Core V2 contract.
+
+A bounded no-model runtime probe against the project-local `opencode-ai@1.18.33` confirmed that a caller ID shaped as `ses_` plus 24 lowercase hexadecimal characters was returned unchanged, accessible through V2 `get` and project-filtered `list`, and remained accessible through both after the server was stopped and restarted against the same temporary state directory. The temporary session was deleted through the already verified legacy delete bridge and V2 `get` then returned HTTP 404. See the active Milestone 9 spec for exact setup and limitations. This establishes behavior for the pinned local version only; it does not establish uniqueness/collision semantics, cross-version behavior, or a server-authenticated ownership marker. A caller-supplied ID is a correlation value, not by itself proof of ownership.
+
 ### Prompt Submission
 
 ```ts
@@ -944,3 +948,52 @@ are recorded in the 2026-10-06 decision below.
 - **`/config` reports the V1 resolved document.** It reported Quoder's trampoline even when the
   Core V2 tool path ignored it, while `/global/config` never reports `shell` at all. A runtime
   assertion that reads `/config` therefore cannot prove the V2 tool path is sandboxed.
+
+## Operational recovery and diagnostics (Milestone 9, 2026-10-07)
+
+### Startup validation and failure categories
+
+Before accepting work, the CLI validates its `--model` provider/model shape and calls
+`validateOpenCodeLaunchInputs()`. That launch check verifies the project-pinned OpenCode
+executable is available and executable, and that `OPENCODE_CONFIG_CONTENT` can be parsed as a
+JSON object with a string-only plugin list. It does not validate arbitrary OpenCode user or
+project configuration. Diagnostics use fixed sanitized categories: `OpenCode`,
+`Provider/inference`, `Configuration`, and `Local state`; raw dependency errors and secret values
+are not shown. See `src/cli.ts`, `src/opencode-server.ts`, and `src/harness/operational-log.ts`.
+
+### Optional operational JSONL
+
+Operational logging is enabled only when `QUODER_LOG_FILE` is set to an absolute path. The target
+must resolve outside the active project and have an existing writable parent directory. The file
+is opened for append with mode `0600`; a rejected/unavailable log destination produces a safe
+configuration diagnostic and Quoder continues without logging. Logging failure does not change
+execution or cleanup behavior.
+
+Each line has an ISO timestamp and an allowlisted metadata event. Events include server lifecycle,
+prompt lifecycle/outcome and elapsed milliseconds, session create/delete verification, and the
+sanitized failure category. Prompts, tool output, provider payloads, credentials, raw errors, and
+child stderr are not fields in the log schema. Do not confuse the older `QUODER_TRACE_FILE` test
+trace hook with this operational log.
+
+### Quoder-owned OpenCode session ledger
+
+`createOwnedSessionLedger()` stores per-session JSON records outside the project. Its directory is
+`<state-history-base>/<sha256(resolved-project-root)>/owned-sessions`, where the history base uses
+an absolute `XDG_STATE_HOME` when set, otherwise macOS Application Support or the standard
+`.local/state` location. The ledger is private and validates record shape, identifier, file type,
+link count, size, and canonical project root.
+
+Records include schema version, exact `ses_<24 lowercase hex>` ID, project root, timestamp, and one
+of `intent`, `created`, or `ambiguous` states. Only a durably persisted `created` record created
+after an exact matching server response can be considered for stale cleanup. Quoder verifies the
+session ID and project location again and requires explicit confirmation for each cleanup. Intent
+and ambiguous records are report-only. A crash after server-side creation but before durable
+confirmation remains a manual-recovery case; old or unregistered sessions are not discoverable as
+Quoder-owned candidates. Because a newly started server cannot prove an older server is inactive,
+the UI warns that activity may be unknown and cleanup could interrupt work.
+
+The M9 security review passed with no warnings. It retained a low-confidence suggestion to check
+ownership of an existing operational-log file explicitly for elevated or unusual shared-directory
+deployments. Current checks enforce regular-file/single-link properties and restrictive mode, but
+do not independently verify existing file ownership. QA did not perform a real TTY or OS process
+crash smoke run; see `docs/runbook.md` and the M9 QA report for operational limits.

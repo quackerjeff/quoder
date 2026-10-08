@@ -121,7 +121,7 @@ describe("project memory persistence", () => {
     expect(storeA.filePath).not.toBe(storeB.filePath);
   });
 
-  it("rejects malformed and unsupported documents without overwriting them, then permits explicit reset", async () => {
+  it("rejects malformed and unsupported documents without overwriting or clearing them", async () => {
     const root = await temporaryDirectory();
     const project = join(root, "project");
     const store = storeFor(project, join(root, "state"));
@@ -134,13 +134,16 @@ describe("project memory persistence", () => {
     await expect(store.save({ ...emptyProjectMemory(), objective: "Should not replace corruption" }))
       .resolves.toEqual({ ok: false, reason: "corrupt" });
     expect(await readFile(store.filePath, "utf8")).toBe(original);
-    await expect(store.clear()).resolves.toEqual({ ok: true });
-    await expect(store.load()).resolves.toEqual({ status: "loaded", memory: emptyProjectMemory() });
+    await expect(store.clear()).resolves.toEqual({ ok: false, reason: "corrupt" });
+    expect(await readFile(store.filePath, "utf8")).toBe(original);
 
-    await writeFile(store.filePath, JSON.stringify({ ...emptyProjectMemory(), version: 2 }), { mode: 0o600 });
+    const unsupported = JSON.stringify({ ...emptyProjectMemory(), version: 2 });
+    await writeFile(store.filePath, unsupported, { mode: 0o600 });
     await expect(store.load()).resolves.toEqual({ status: "unavailable", reason: "unsupported-version" });
     await expect(store.save(emptyProjectMemory())).resolves.toEqual({ ok: false, reason: "unsupported-version" });
+    await expect(store.clear()).resolves.toEqual({ ok: false, reason: "unsupported-version" });
     expect(JSON.parse(await readFile(store.filePath, "utf8")).version).toBe(2);
+    expect(await readFile(store.filePath, "utf8")).toBe(unsupported);
   });
 
   it("rejects invalid UTF-8 and oversized disk documents", async () => {

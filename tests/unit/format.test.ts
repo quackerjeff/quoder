@@ -85,7 +85,7 @@ describe("prompt result formatting", () => {
   it("reports cancellation (FR-12), failures, and an unverified deletion", () => {
     expect(formatResult(result({ kind: "cancelled" }))).toBe("– Execution cancelled after 2.3s. Harness session remains active.\n");
     expect(formatResult(result({ kind: "failed", reason: "Provider turn\ninterrupted\u0007" }))).toBe(
-      "The prompt did not complete: Provider turn interrupted\n\n✗ Failed after 2.3s\n",
+      "OpenCode: the server or session request failed. Restart Quoder; if this continues, run `npm run verify:environment` from Quoder.\n\n✗ Failed after 2.3s\n",
     );
     expect(formatResult(result({ kind: "cancelled" }, { sessionDeleted: false }))).toContain(
       "Warning: the OpenCode session could not be verified as deleted.",
@@ -94,7 +94,18 @@ describe("prompt result formatting", () => {
 
   it("colours with theme roles and keeps model text free of escape sequences", () => {
     const text = formatResult(result({ kind: "failed", reason: "bad\u001b]0;x\u0007" }), createTheme(true));
-    expect(text).toBe("\u001b[31mThe prompt did not complete: bad\u001b[39m\n\n\u001b[31m✗ Failed after 2.3s\u001b[39m\n");
+    expect(text).toBe("\u001b[31mOpenCode: the server or session request failed. Restart Quoder; if this continues, run `npm run verify:environment` from Quoder.\u001b[39m\n\n\u001b[31m✗ Failed after 2.3s\u001b[39m\n");
+    expect(text).not.toContain("bad");
+  });
+
+  it("uses the provider/inference category only when OpenCode supplies that evidence", () => {
+    const text = formatResult(result({
+      kind: "failed",
+      reason: "secret provider response",
+      category: "Provider/inference",
+    }));
+    expect(text).toContain("Provider/inference: OpenCode reported that the model request could not complete.");
+    expect(text).not.toContain("secret provider response");
   });
 });
 

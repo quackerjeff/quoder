@@ -4,6 +4,7 @@ import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import { describe, expect, it, vi } from "vitest";
 
 import type { EventMonitorOptions } from "../../src/event-monitor.js";
+import type { OwnedSessionLedger, OwnedSessionRecord } from "../../src/harness/owned-session-ledger.js";
 import type { GitSnapshot, GitSnapshotResult } from "../../src/harness/git-state.js";
 import type { GitDiffDocument } from "../../src/harness/git-diff.js";
 import type { BeginExecutionHistoryInput, CompleteExecutionHistoryInput, ExecutionHistoryRecord, ExecutionHistoryStore } from "../../src/harness/execution-history.js";
@@ -58,6 +59,12 @@ interface FakeOptions {
   readonly agentCatalogFails?: boolean;
   /** Session deletion waits until this gate opens. */
   readonly deleteGate?: ReturnType<typeof gate>;
+  readonly deleteFails?: boolean;
+  readonly createOutcomeAmbiguous?: boolean;
+  readonly markAmbiguousFails?: boolean;
+  readonly ownedSessionRecords?: readonly OwnedSessionRecord[];
+  readonly ownedSessionLedgerCorrupt?: boolean;
+  readonly unregisteredSessions?: readonly { readonly id: string; readonly projectRoot: string }[];
 }
 
 /**
@@ -87,6 +94,10 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
   const prompts = new Map<string, string>();
   const interrupted = new Set<string>();
   const deleted = new Set<string>();
+  const sessionInfo = new Map<string, { readonly id: string; readonly location: { readonly directory: string } }>();
+  for (const session of options.unregisteredSessions ?? []) {
+    sessionInfo.set(session.id, { id: session.id, location: { directory: session.projectRoot } });
+  }
   const permissionReplies = new Map<string, string>();
   const alive = async () => {
     if (state.dead) throw new TypeError("fetch failed");
@@ -150,14 +161,20 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
     if (prompt.startsWith("boom")) {
       return [userMessage, done("", { finish: "error", error: { type: "unknown", message: "HTTP transport failed" } })];
     }
+    if (prompt.startsWith("providerfailure")) {
+      return [userMessage, done("", { finish: "error", error: { name: "ProviderAuthError", data: { message: "PROVIDER_PAYLOAD_SECRET" } } })];
+    }
     return [userMessage, done(`Answer: ${prompt}`)];
   };
   const client = {
     v2: {
       session: {
-        create: vi.fn(async (body: { location: { directory: string }; agent?: string; model?: { providerID: string; id: string } }) => {
+        create: vi.fn(async (body: { id?: string; location: { directory: string }; agent?: string; model?: { providerID: string; id: string } }) => {
           await alive();
-          const id = `ses_${++sessions}`;
+          const id = body.id ?? `ses_${++sessions}`;
+          if (sessionInfo.has(id)) return failedResult({ _tag: "SessionConflictError", message: "conflict" }, 409);
+          sessionInfo.set(id, { id, location: { directory: body.location.directory } });
+          if (options.createOutcomeAmbiguous) return failedResult({ _tag: "SessionCreateError", message: "ambiguous result" }, 503);
           if (id === "ses_1" && options.createGate) await options.createGate.opened;
           calls.push(`create:${id}:${body.location.directory}`);
           calls.push(`binding:${id}:${body.model?.providerID}/${body.model?.id}:${body.agent}`);
@@ -219,9 +236,9 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
         }),
         get: vi.fn(async (parameters: { sessionID: string }) => {
           await alive();
-          return deleted.has(parameters.sessionID)
+          return deleted.has(parameters.sessionID) || !sessionInfo.has(parameters.sessionID)
             ? failedResult({ _tag: "SessionNotFoundError", message: "not found" }, 404)
-            : result({ data: { id: parameters.sessionID } });
+            : result({ data: sessionInfo.get(parameters.sessionID) });
         }),
         permission: {
           reply: vi.fn(async (parameters: { sessionID: string; requestID: string; reply: string }) => {
@@ -275,7 +292,9 @@ const fakeOpenCode = (options: FakeOptions = {}) => {
         await alive();
         if (options.deleteGate) await options.deleteGate.opened;
         calls.push(`delete:${parameters.sessionID}`);
+        if (options.deleteFails) return result(false);
         deleted.add(parameters.sessionID);
+        sessionInfo.delete(parameters.sessionID);
         return result(true);
       }),
     },
@@ -299,6 +318,7 @@ interface HarnessRunOptions extends FakeOptions {
   readonly historyBeginFails?: boolean;
   readonly historyCompleteFails?: boolean;
   readonly historyListFails?: boolean;
+  readonly operationalLogFails?: boolean;
 }
 
 function fakeExecutionHistoryStore(options: Pick<HarnessRunOptions, "historyBeginFails" | "historyCompleteFails" | "historyListFails"> = {}) {
@@ -395,10 +415,42 @@ function fakeProjectMemoryStore(options: Pick<HarnessRunOptions, "initialMemory"
   return { store, saved, get currentLoadResult() { return loadResult; } };
 }
 
+const fakeOwnedSessionLedger = (options: Pick<HarnessRunOptions, "ownedSessionRecords" | "ownedSessionLedgerCorrupt" | "markAmbiguousFails">) => {
+  const records = new Map((options.ownedSessionRecords ?? []).map((record) => [record.id, { ...record }]));
+  const calls: string[] = [];
+  const ledger: OwnedSessionLedger = {
+    list: vi.fn(async () => options.ownedSessionLedgerCorrupt
+      ? { status: "unavailable" as const, reason: "corrupt" as const }
+      : { status: "available" as const, records: [...records.values()] }),
+    prepare: vi.fn(async (id) => {
+      calls.push(`prepare:${id}`);
+      if (records.has(id)) throw new Error("session ID conflict");
+      records.set(id, { version: 1, id, projectRoot: PROJECT.root, createdAt: new Date(0).toISOString(), state: "intent" });
+    }),
+    markCreated: vi.fn(async (id) => {
+      calls.push(`created:${id}`);
+      const current = records.get(id);
+      if (current !== undefined) records.set(id, { ...current, state: "created" });
+    }),
+    markAmbiguous: vi.fn(async (id) => {
+      calls.push(`ambiguous:${id}`);
+      if (options.markAmbiguousFails) throw new Error("ledger transition could not be persisted");
+      const current = records.get(id);
+      if (current !== undefined) records.set(id, { ...current, state: "ambiguous" });
+    }),
+    remove: vi.fn(async (id) => {
+      calls.push(`remove:${id}`);
+      records.delete(id);
+    }),
+  };
+  return { ledger, calls, records };
+};
+
 const startHarness = (options: HarnessRunOptions = {}) => {
   const fake = fakeOpenCode(options);
   const memory = fakeProjectMemoryStore(options);
   const history = fakeExecutionHistoryStore(options);
+  const ownedSessions = fakeOwnedSessionLedger(options);
   const input = new PassThrough();
   const output = new PassThrough();
   let text = "";
@@ -406,6 +458,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
     text += chunk.toString("utf8");
   });
   const trace: HarnessTraceEvent[] = [];
+  const operationalEvents: unknown[] = [];
   const exits: Array<() => void> = [];
   const launchOptions: AuthenticatedServerOptions[] = [];
   let gitSnapshotIndex = 0;
@@ -455,6 +508,9 @@ const startHarness = (options: HarnessRunOptions = {}) => {
       createClient: vi.fn(() => fake.client),
       createProjectMemoryStore: vi.fn(() => memory.store),
       createExecutionHistoryStore: vi.fn(() => history.store),
+      createOwnedSessionLedger: () => options.ownedSessionRecords !== undefined || options.ownedSessionLedgerCorrupt === true || options.markAmbiguousFails === true
+        ? ownedSessions.ledger
+        : undefined,
       startMonitor: vi.fn(async (monitorOptions: EventMonitorOptions) => {
         fake.state.monitor = monitorOptions;
         return {
@@ -466,6 +522,10 @@ const startHarness = (options: HarnessRunOptions = {}) => {
         };
       }),
       trace: (event) => trace.push(event),
+      operationalLog: (event) => {
+        operationalEvents.push(event);
+        if (options.operationalLogFails) throw new Error("LOG_FAILURE_SECRET");
+      },
       captureGitSnapshot: vi.fn(async (root: string) => {
         fake.calls.push(`git:capture:${gitSnapshotIndex}`);
         gitCaptures.push(root);
@@ -482,7 +542,7 @@ const startHarness = (options: HarnessRunOptions = {}) => {
     },
   );
   const finished = harness.run();
-  return { harness, finished, input, output: () => text, trace, calls: fake.calls, fake, exits, counts, launchOptions, gitCaptures, memory, history };
+  return { harness, finished, input, output: () => text, trace, operationalEvents, calls: fake.calls, fake, exits, counts, launchOptions, gitCaptures, memory, history, ownedSessions };
 };
 
 const sessionsCreated = (trace: readonly HarnessTraceEvent[]) =>
@@ -880,17 +940,19 @@ describe("quoder harness (Milestone 1)", () => {
     expect(sessionsCreated(run.trace)).toEqual([]);
   });
 
-  it("requires explicit whole-memory reset before changing corrupt saved state", async () => {
+  it("provides manual recovery guidance and never clears corrupt saved state", async () => {
     const run = startHarness({ initialMemory: { status: "unavailable", reason: "corrupt" } });
     run.input.end("/memory show\n/memory objective Should not save\n/memory clear\n/memory show\n/exit\n");
 
     await expect(run.finished).resolves.toBe(0);
 
-    expect(run.output()).toContain("saved project memory is malformed");
-    expect(run.output()).toContain("use /memory clear to reset or retry");
+    expect(run.output()).toContain("Local state: Project memory is unavailable.");
+    expect(run.output()).toContain("Its source was preserved unchanged.");
+    expect(run.output()).toContain("Stop Quoder before inspecting or moving it");
+    expect(run.output()).not.toContain("use /memory clear to reset");
     expect(run.memory.store.save).not.toHaveBeenCalled();
-    expect(run.memory.store.clear).toHaveBeenCalledTimes(1);
-    expect(run.memory.currentLoadResult).toMatchObject({ status: "loaded", memory: emptyProjectMemory() });
+    expect(run.memory.store.clear).not.toHaveBeenCalled();
+    expect(run.memory.currentLoadResult).toEqual({ status: "unavailable", reason: "corrupt" });
     expect(sessionsCreated(run.trace)).toEqual([]);
   });
 
@@ -1101,9 +1163,32 @@ describe("quoder harness (Milestone 1)", () => {
 
     await expect(run.finished).resolves.toBe(0);
 
-    expect(run.output()).toContain("The prompt did not complete: HTTP transport failed");
+    expect(run.output()).toContain("OpenCode: the server or session request failed.");
+    expect(run.output()).not.toContain("HTTP transport failed");
     expect(run.output()).toContain("Answer: after the error");
     expect(sessionsDeleted(run.trace)).toEqual(["ses_1", "ses_2"]);
+  });
+
+  it("classifies explicit provider inference failures without exposing payloads and logs metadata only", async () => {
+    const run = startHarness();
+    run.input.end("providerfailure\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Provider/inference: OpenCode reported that the model request could not complete.");
+    expect(run.output()).not.toContain("PROVIDER_PAYLOAD_SECRET");
+    expect(JSON.stringify(run.operationalEvents)).toContain('"category":"Provider/inference"');
+    expect(JSON.stringify(run.operationalEvents)).not.toContain("PROVIDER_PAYLOAD_SECRET");
+  });
+
+  it("continues prompt execution and session cleanup when the operational logger throws", async () => {
+    const run = startHarness({ operationalLogFails: true });
+    run.input.end("answer despite logging failure\n");
+
+    await expect(run.finished).resolves.toBe(0);
+
+    expect(run.output()).toContain("Answer: answer despite logging failure");
+    expect(sessionsDeleted(run.trace)).toEqual(["ses_1"]);
   });
 
   it("Ctrl-C cancels the running prompt, deletes its session, and keeps the harness running", async () => {
@@ -1204,21 +1289,62 @@ describe("quoder harness (Milestone 1)", () => {
     expect(run.output()).toContain("Answer: after");
   });
 
-  it("stops a prompt when the server dies mid-turn, warns, and deletes the session on the next server", async () => {
-    const run = startHarness();
+  it("stops a prompt when the server dies mid-turn and leaves stale cleanup for terminal confirmation", async () => {
+    const run = startHarness({ ownedSessionRecords: [] });
     run.input.write("slow task\n");
-    await vi.waitFor(() => expect(run.calls).toContain("prompt:ses_1"));
+    await vi.waitFor(() => expect(run.calls.some((call) => call.startsWith("prompt:"))).toBe(true));
+    const runningSession = run.calls.find((call) => call.startsWith("prompt:"))?.slice("prompt:".length);
 
     run.fake.state.dead = true;
     run.exits[0]?.();
     await vi.waitFor(() => expect(run.output()).toContain("Warning: the OpenCode session could not be verified as deleted."));
+    run.fake.state.dead = false;
     run.input.end("after\n");
 
     await expect(run.finished).resolves.toBe(0);
     expect(run.output()).toContain("The OpenCode server stopped unexpectedly, so the prompt was stopped.");
-    expect(run.output()).toContain("Deleted 1 earlier OpenCode session(s)");
-    expect(sessionsDeleted(run.trace)).toEqual(["ses_1", "ses_2"]);
+    expect(run.output()).toContain("Cleanup was skipped because confirmation requires a terminal.");
+    expect(run.calls).not.toContain(`delete:${runningSession}`);
+    expect(run.output()).toContain(`  ${runningSession}`);
     expect(run.counts.launched).toBe(2);
+  });
+
+  it("routes Return to stale cleanup confirmation after replacing a server during a prompt", async () => {
+    const ownedID = `ses_${"f".repeat(24)}`;
+    const run = startHarness({
+      terminal: true,
+      ownedSessionRecords: [{
+        version: 1,
+        id: ownedID,
+        projectRoot: PROJECT.root,
+        createdAt: new Date(0).toISOString(),
+        state: "created",
+      }],
+      unregisteredSessions: [{ id: ownedID, projectRoot: PROJECT.root }],
+    });
+    await vi.waitFor(() => expect(run.output()).toContain(`Delete only ${ownedID}? [y/N]`));
+    run.input.write("n\r");
+    await vi.waitFor(() => expect(run.output()).toContain(`Kept ${ownedID}; no cleanup was attempted.`));
+
+    run.input.write("slow task\r");
+    await vi.waitFor(() => expect(run.calls.some((call) => call.startsWith("prompt:"))).toBe(true));
+    run.fake.state.dead = true;
+    run.exits[0]?.();
+    await vi.waitFor(() => expect(run.output()).toContain("The OpenCode server stopped unexpectedly"));
+    run.fake.state.dead = false;
+    run.input.write("after\r");
+    await vi.waitFor(() => expect(run.output().split(`Delete only ${ownedID}? [y/N]`).length - 1).toBe(2));
+
+    run.input.write("y\r");
+    await vi.waitFor(() => expect(run.calls).toContain(`delete:${ownedID}`));
+    await vi.waitFor(() => expect(run.output()).toContain(`Deleted ${ownedID}; OpenCode confirmed it is absent.`));
+    await vi.waitFor(() => expect(run.output().split("Delete only ses_").length - 1).toBe(3));
+    // The interrupted prompt's own session is also present in the ledger, and gets its
+    // own explicit decision. Keep it here so the test only approves the older candidate.
+    run.input.write("n\r");
+    await vi.waitFor(() => expect(run.output()).toContain("Answer: after"));
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
   });
 
   it("stops a prompt when the event monitor is lost and replaces the server before the next prompt", async () => {
@@ -1274,6 +1400,164 @@ describe("quoder harness (Milestone 1)", () => {
     await expect(run.finished).resolves.toBe(1);
     expect(run.output()).toContain("Could not start the OpenCode server.");
     expect(sessionsCreated(run.trace)).toEqual([]);
+  });
+});
+
+describe("Milestone 9 owned-session recovery", () => {
+  const owned = (id: string, state: OwnedSessionRecord["state"] = "created"): OwnedSessionRecord => ({
+    version: 1,
+    id,
+    projectRoot: PROJECT.root,
+    createdAt: new Date(0).toISOString(),
+    state,
+  });
+
+  it("reports an exact ledger session in piped mode and leaves it plus unregistered sessions untouched", async () => {
+    const ownedID = `ses_${"a".repeat(24)}`;
+    const unrelatedID = `ses_${"b".repeat(24)}`;
+    const run = startHarness({
+      ownedSessionRecords: [owned(ownedID)],
+      unregisteredSessions: [{ id: ownedID, projectRoot: PROJECT.root }, { id: unrelatedID, projectRoot: PROJECT.root }],
+    });
+    run.input.end();
+
+    const finishCode = await run.finished;
+    expect(finishCode, run.output()).toBe(0);
+
+    expect(run.output()).toContain(`  ${ownedID}`);
+    expect(run.output()).toContain("Activity on these sessions is unknown");
+    expect(run.output()).toContain("Cleanup was skipped because confirmation requires a terminal.");
+    expect(run.calls.some((call) => call.startsWith("delete:"))).toBe(false);
+    expect(run.ownedSessions.records.has(ownedID)).toBe(true);
+    expect(run.ownedSessions.records.has(unrelatedID)).toBe(false);
+  });
+
+  it("keeps an intent-only same-ID session report-only even in TTY mode", async () => {
+    const ownedID = `ses_${"c".repeat(24)}`;
+    const unrelatedID = `ses_${"d".repeat(24)}`;
+    const run = startHarness({
+      terminal: true,
+      ownedSessionRecords: [owned(ownedID, "intent")],
+      unregisteredSessions: [{ id: ownedID, projectRoot: PROJECT.root }, { id: unrelatedID, projectRoot: PROJECT.root }],
+    });
+    await vi.waitFor(() => expect(run.output()).toContain("report-only or mismatched Quoder session record(s) untouched"));
+    expect(run.output()).not.toContain(`Delete only ${ownedID}? [y/N]`);
+    expect(run.calls).not.toContain(`delete:${ownedID}`);
+    expect(run.calls).not.toContain(`delete:${unrelatedID}`);
+    expect(run.ownedSessions.records.has(ownedID)).toBe(true);
+    run.input.end();
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("does not offer deletion after an ambiguous create and failed quarantine write across server restart", async () => {
+    const run = startHarness({ createOutcomeAmbiguous: true, markAmbiguousFails: true });
+    run.input.write("first attempt\n");
+    await vi.waitFor(() => expect(run.output()).toContain("Local state:"));
+    await vi.waitFor(() => expect(run.ownedSessions.calls.some((call) => call.startsWith("ambiguous:"))).toBe(true));
+    const [intent] = [...run.ownedSessions.records.values()];
+    expect(intent?.state).toBe("intent");
+
+    run.exits[0]?.();
+    await vi.waitFor(() => expect(run.output()).toContain("The OpenCode server stopped unexpectedly"));
+    run.input.end("second attempt\n");
+
+    await expect(run.finished).resolves.toBe(0);
+    expect(run.output()).toContain("report-only or mismatched Quoder session record(s) untouched");
+    expect(run.output()).not.toContain(`Delete only ${intent?.id}? [y/N]`);
+    expect(run.calls).not.toContain(`delete:${intent?.id}`);
+    expect(run.ownedSessions.records.get(intent!.id)?.state).toBe("intent");
+  });
+
+  it("still requires explicit confirmation for a durably created stale session", async () => {
+    const ownedID = `ses_${"c".repeat(24)}`;
+    const run = startHarness({
+      terminal: true,
+      ownedSessionRecords: [owned(ownedID, "created")],
+      unregisteredSessions: [{ id: ownedID, projectRoot: PROJECT.root }],
+    });
+    await vi.waitFor(() => expect(run.output()).toContain(`Delete only ${ownedID}? [y/N]`));
+    run.input.write("yes\r");
+    await vi.waitFor(() => expect(run.calls).toContain(`delete:${ownedID}`));
+    await vi.waitFor(() => expect(run.output()).toContain(`Deleted ${ownedID}; OpenCode confirmed it is absent.`));
+    expect(run.ownedSessions.records.has(ownedID)).toBe(false);
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("declines cleanup by default and preserves the exact ledger entry", async () => {
+    const ownedID = `ses_${"e".repeat(24)}`;
+    const run = startHarness({
+      terminal: true,
+      ownedSessionRecords: [owned(ownedID)],
+      unregisteredSessions: [{ id: ownedID, projectRoot: PROJECT.root }],
+    });
+    await vi.waitFor(() => expect(run.output()).toContain(`[y/N]`));
+    run.input.write("\r");
+    await vi.waitFor(() => expect(run.output()).toContain(`Kept ${ownedID}; no cleanup was attempted.`));
+    expect(run.calls).not.toContain(`delete:${ownedID}`);
+    expect(run.ownedSessions.records.has(ownedID)).toBe(true);
+    run.input.write("\u0004");
+    const finishCode = await run.finished;
+    expect(finishCode, run.output()).toBe(0);
+  });
+
+  it("keeps the ledger entry when confirmed stale cleanup cannot be verified", async () => {
+    const ownedID = `ses_${"8".repeat(24)}`;
+    const run = startHarness({
+      terminal: true,
+      ownedSessionRecords: [owned(ownedID)],
+      unregisteredSessions: [{ id: ownedID, projectRoot: PROJECT.root }],
+      deleteFails: true,
+    });
+    await vi.waitFor(() => expect(run.output()).toContain(`[y/N]`));
+    run.input.write("y\r");
+    await vi.waitFor(() => expect(run.output()).toContain(`Could not confirm cleanup of ${ownedID}`));
+    expect(run.ownedSessions.records.has(ownedID)).toBe(true);
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("treats Ctrl-C during cleanup confirmation as a decline", async () => {
+    const ownedID = `ses_${"f".repeat(24)}`;
+    const run = startHarness({
+      terminal: true,
+      ownedSessionRecords: [owned(ownedID)],
+      unregisteredSessions: [{ id: ownedID, projectRoot: PROJECT.root }],
+    });
+    await vi.waitFor(() => expect(run.output()).toContain(`[y/N]`));
+    run.input.write("\u0003");
+    await vi.waitFor(() => expect(run.output()).toContain("Cleanup declined; the listed OpenCode session remains"));
+    expect(run.calls).not.toContain(`delete:${ownedID}`);
+    expect(run.ownedSessions.records.has(ownedID)).toBe(true);
+    run.input.write("\u0004");
+    const finishCode = await run.finished;
+    expect(finishCode, run.output()).toBe(0);
+  });
+
+  it("reports but never offers a same-ID session whose canonical project differs", async () => {
+    const ownedID = `ses_${"9".repeat(24)}`;
+    const run = startHarness({
+      terminal: true,
+      ownedSessionRecords: [owned(ownedID)],
+      unregisteredSessions: [{ id: ownedID, projectRoot: "/other/project" }],
+    });
+    await vi.waitFor(() => expect(run.output()).toContain("mismatched Quoder session record(s) untouched"));
+    expect(run.output()).not.toContain(`[y/N]`);
+    expect(run.calls).not.toContain(`delete:${ownedID}`);
+    expect(run.ownedSessions.records.has(ownedID)).toBe(true);
+    run.input.write("\u0004");
+    await expect(run.finished).resolves.toBe(0);
+  });
+
+  it("preserves an unavailable ownership ledger and does not accept prompts", async () => {
+    const run = startHarness({ ownedSessionLedgerCorrupt: true });
+    run.input.end("should not run\n");
+
+    await expect(run.finished).resolves.toBe(1);
+
+    expect(run.output()).toContain("OpenCode session ownership is unavailable");
+    expect(run.output()).toContain("source was preserved unchanged");
+    expect(run.calls.filter((call) => call.startsWith("create:"))).toHaveLength(0);
   });
 });
 

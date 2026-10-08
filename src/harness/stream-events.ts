@@ -3,7 +3,7 @@
  * a small typed union. It holds no presentation, so a later full-screen TUI can consume it as is.
  *
  * Shapes verified live against OpenCode 1.18.33 (spec 2026-10-03-milestone-2-streaming-ui, Group 1).
- * Strings stay raw here; whoever displays them sanitizes them.
+ * Content-bearing text remains raw for the renderer; error diagnostics are reduced to fixed text.
  */
 
 export interface TokenUsage {
@@ -99,9 +99,9 @@ export function narrowStreamEvent(event: RawEvent): StreamEvent | undefined {
       return tokens === undefined ? { kind: "step-ended", sessionID, messageID } : { kind: "step-ended", sessionID, messageID, tokens };
     }
     case "step.failed":
-      return { kind: "step-failed", sessionID, message: errorMessage(data.error) };
+      return { kind: "step-failed", sessionID, message: "OpenCode reported a failed model step" };
     case "retried":
-      return { kind: "retried", sessionID, attempt: count(data, "attempt") ?? 0, message: errorMessage(data.error) };
+      return { kind: "retried", sessionID, attempt: count(data, "attempt") ?? 0, message: "OpenCode is retrying the request" };
     case "text.delta": {
       const textID = text(data, "textID");
       const delta = text(data, "delta");

@@ -585,6 +585,9 @@ export function createExecutionHistoryStore(
     try {
       await options.afterDeleteSnapshot?.();
       if (paths.length === 0) return { status: "missing" };
+      const existing = await get(id);
+      if (existing.status === "unavailable") return existing;
+      if (existing.status === "missing") return { status: "missing" };
       const tombstonePath = join(directory, `.deleted-${id}`);
       try {
         const handle = await open(tombstonePath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
@@ -754,9 +757,7 @@ export function createExecutionHistoryStore(
       const unavailable = await ready();
       if (unavailable !== undefined) return { ok: false, reason: unavailable };
       const previous = await loadRetention();
-      if (previous.status === "unavailable" && previous.reason !== "corrupt" && previous.reason !== "invalid-data" && previous.reason !== "unsupported-version" && previous.reason !== "oversized") {
-        return { ok: false, reason: previous.reason };
-      }
+      if (previous.status === "unavailable") return { ok: false, reason: previous.reason };
       try {
         const bytes = Buffer.from(JSON.stringify({ version: EXECUTION_HISTORY_VERSION, maxCompletedRecords }), "utf8");
         await writeAtomic(settingsPath, bytes);
@@ -775,6 +776,12 @@ export function createExecutionHistoryStore(
           const parsed = parseFilename(name);
           return parsed === undefined ? [] : [parsed.id];
         }));
+        // Inspect every source before deleting any records so corrupt state cannot be
+        // silently erased, or leave a partially-cleared history behind.
+        for (const id of ids) {
+          const current = await get(id);
+          if (current.status === "unavailable") return current;
+        }
         let deleted = 0;
         for (const id of ids) {
           const result = await deleteRecord(id);

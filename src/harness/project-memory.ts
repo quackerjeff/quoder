@@ -61,7 +61,7 @@ export interface ProjectMemoryStore {
   load(): Promise<ProjectMemoryLoadResult>;
   /** Refuses to replace an existing malformed or unsupported document. */
   save(memory: ProjectMemory): Promise<ProjectMemoryWriteResult>;
-  /** Explicit user-directed reset; can replace malformed or unsupported JSON. */
+  /** Clears readable state; refuses to replace an unavailable or malformed source. */
   clear(): Promise<ProjectMemoryWriteResult>;
 }
 
@@ -334,15 +334,8 @@ export function createProjectMemoryStore(
     clear: async () => {
       const unavailable = await ready();
       if (unavailable !== undefined) return { ok: false, reason: unavailable };
-      try {
-        const info = await lstat(filePath);
-        if (info.isSymbolicLink() || !info.isFile()) return { ok: false, reason: "unsafe-path" };
-        if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
-          return { ok: false, reason: "unsafe-path" };
-        }
-      } catch (error) {
-        if (!isMissing(error)) return { ok: false, reason: unavailableFrom(error) };
-      }
+      const current = await readDocument(filePath);
+      if (current.status === "unavailable") return { ok: false, reason: current.reason };
       return writeAtomic(filePath, emptyProjectMemory());
     },
   };
