@@ -115,6 +115,10 @@ export function formatGitSummary(comparison: GitComparison, theme: Theme = PLAIN
 
   const lines: string[] = [];
   const { observedChanges, preExistingPaths, resolvedPaths, before, after } = comparison;
+  const hasRunChanges = observedChanges.length > 0 || resolvedPaths.length > 0 ||
+    preExistingPaths.some((entry) => entry.statusChanged) || comparison.headChanged || comparison.branchChanged;
+  if (!hasRunChanges) return "";
+
   if (observedChanges.length === 0) {
     lines.push("Git changes observed: none");
   } else {
@@ -165,10 +169,6 @@ export function formatGitSummary(comparison: GitComparison, theme: Theme = PLAIN
   }
   if (comparison.committedDiff !== undefined && comparison.committedDiff.files > 0) {
     lines.push(statsLine("Committed tree change", comparison.committedDiff));
-  }
-  if (observedChanges.length === 0 && preExistingPaths.length === 0 && resolvedPaths.length === 0 &&
-    !comparison.headChanged && !comparison.branchChanged) {
-    lines.push("Repository state: clean");
   }
   return `${lines.map((line) => theme.paint("dim", line)).join("\n")}\n`;
 }

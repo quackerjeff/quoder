@@ -1102,7 +1102,8 @@ export class Harness {
       this.#write(`\n${formatResult(result, theme, stats)}\n`);
       const afterGit = await this.#captureGitState();
       const comparison = await this.#compareGitState(beforeGit, afterGit);
-      this.#write(`${formatGitSummary(comparison, theme)}\n`);
+      const gitSummary = formatGitSummary(comparison, theme);
+      if (gitSummary !== "") this.#write(`${gitSummary}\n`);
       const status = result.outcome.kind;
       await this.#completeHistory(
         status,

@@ -32,6 +32,9 @@ export type GitDiffResult = GitDiffDocument | GitDiffUnavailable;
 
 export function hasInspectableGitDiff(comparison: GitComparison): boolean {
   if (comparison.after.kind !== "available") return false;
+  const hasRunChanges = comparison.observedChanges.length > 0 || comparison.resolvedPaths.length > 0 ||
+    comparison.preExistingPaths.some((entry) => entry.statusChanged) || comparison.headChanged || comparison.branchChanged;
+  if (!hasRunChanges) return false;
   return comparison.after.trackedDiff.files > 0 ||
     comparison.after.untrackedPaths.length > 0 ||
     (comparison.committedDiff?.files ?? 0) > 0;
