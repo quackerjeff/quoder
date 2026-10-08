@@ -44,12 +44,25 @@ const historyRecord = (overrides: Partial<ExecutionHistoryRecord> = {}): Executi
 describe("prompt result formatting", () => {
   it("ends an answered turn with a status line; the answer itself is shown by the live view", () => {
     expect(formatResult(result({ kind: "answered", text: "Hello" }))).toBe("✓ Done in 2.3s\n");
-    expect(formatResult(result({ kind: "answered", text: "Hello" }), undefined, { tools: 4, outputTokens: 12_345 })).toBe(
-      "✓ Done in 2.3s · 4 tools · 12.3k tokens\n",
+    expect(formatResult(result({ kind: "answered", text: "Hello" }), undefined, { tools: 4, inputTokens: 1_234, outputTokens: 12_345 })).toBe(
+      "✓ Done in 2.3s · 4 tools · 1.2k input tokens · 12.3k output tokens\n",
     );
     expect(formatResult(result({ kind: "answered", text: "Hello" }), undefined, { tools: 1, outputTokens: 0 })).toBe(
-      "✓ Done in 2.3s · 1 tool\n",
+      "✓ Done in 2.3s · 1 tool · 0 output tokens\n",
     );
+    expect(formatResult(result({ kind: "answered", text: "Hello" }), undefined, { tools: 4, inputTokens: 0 })).toBe(
+      "✓ Done in 2.3s · 4 tools · 0 input tokens\n",
+    );
+  });
+
+  it("omits unavailable usage fields independently and never adds usage to stopped outcomes", () => {
+    expect(formatResult(result({ kind: "answered", text: "Hello" }), undefined, { tools: 4, inputTokens: 120 })).toBe(
+      "✓ Done in 2.3s · 4 tools · 120 input tokens\n",
+    );
+    expect(formatResult(result({ kind: "cancelled" }), undefined, { tools: 4, inputTokens: 120, outputTokens: 30 })).toContain(
+      "– Execution cancelled after 2.3s.",
+    );
+    expect(formatResult(result({ kind: "cancelled" }), undefined, { tools: 4, inputTokens: 120, outputTokens: 30 })).not.toContain("input tokens");
   });
 
   it("explains a rejected permission without granting anything", () => {

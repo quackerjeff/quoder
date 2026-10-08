@@ -56,7 +56,18 @@ describe("live view", () => {
     live.handle({ kind: "tool-succeeded", sessionID: S, callID: "c1", structured: {}, output: "" });
     live.handle({ kind: "step-ended", sessionID: S, messageID: "m1", tokens: { input: 10, output: 40, reasoning: 0 } });
     live.handle({ kind: "step-ended", sessionID: S, messageID: "m2", tokens: { input: 10, output: 2, reasoning: 0 } });
-    expect(live.finish(answered("x"))).toEqual({ tools: 1, outputTokens: 42 });
+    expect(live.finish(answered("x"))).toEqual({ tools: 1, inputTokens: 20, outputTokens: 42 });
+  });
+
+  it("keeps absent usage distinct from SDK-reported zero and sums available fields independently", () => {
+    const { live } = view();
+    live.handle({ kind: "step-ended", sessionID: S, messageID: "m1", tokens: { input: 0 } });
+    live.handle({ kind: "step-ended", sessionID: S, messageID: "m2", tokens: { output: 0 } });
+    live.handle({ kind: "step-ended", sessionID: S, messageID: "m3", tokens: {} });
+    expect(live.finish(answered("x"))).toEqual({ tools: 0, inputTokens: 0, outputTokens: 0 });
+    const absent = view();
+    absent.live.handle({ kind: "step-ended", sessionID: S, messageID: "m1" });
+    expect(absent.live.finish(answered("x"))).toEqual({ tools: 0 });
   });
 
   it("shows a failed tool, a failed step and a retry as warnings, but no step failure while cancelling", () => {

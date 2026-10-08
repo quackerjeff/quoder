@@ -9,7 +9,7 @@ selection. The Milestone 0 feasibility probe remains as regression evidence.
 Quoder is a single-developer local tool. It reviews what the model is about to
 do; it does not contain it. See "Known limitations".
 
-## Using Quoder (Milestones 1–7)
+## Using Quoder (Milestones 1–8)
 
 Install the pinned dependencies, build, and put `quoder` on your `PATH`:
 
@@ -46,7 +46,7 @@ Reading the import code.
 
 I added a guard that rejects empty files…               (streamed Markdown)
 
-✓ Done in 41.8s · 3 tools · 1.2k tokens
+✓ Done in 41.8s · 3 tools · 1.2k input tokens · 800 output tokens
 ```
 
 How it behaves:
@@ -76,7 +76,13 @@ How it behaves:
     commands with exit code and last output line, and searches.
   - On an interactive terminal, a status line shows the spinner, the current
     phase, the elapsed time and the model.
-  - A closing line reports the result, duration, tools and tokens.
+  - Before each run, Quoder reports the harness-context and current-request sizes
+    in Unicode code points. The background context retains the M5 4,096-code-point
+    limit and pruning policy.
+  - A closing line reports the result, duration, tools, and SDK-reported input
+    and output token usage when available. Counts are summed from reported step
+    events for that run; unavailable fields are omitted, while reported zero is
+    shown as `0`. These values are not estimated or saved in execution history.
 - **Colour.** Colour follows your terminal. `--no-color` or `NO_COLOR` turns it
   off, and `FORCE_COLOR` forces it on. Piped output is plain, with no cursor
   control.
@@ -183,6 +189,13 @@ SIGINT. It checks:
 
 QA recorded `Milestone 1 Exit Criterion: MET` and `Milestone 2 Exit Criterion:
 MET` on 2026-10-04.
+
+Milestone 8's fixed synthetic 20-turn comparison supplied 15,645 Unicode code
+points through Quoder versus 128,561 for the full transcript baseline (12.17% of
+baseline). The fixture covers follow-up references, saved decisions and
+constraints, and live Git state without a model call. It measures supplied text,
+not provider tokenization or total OpenCode system/tool context; see
+`docs/tech.md` and the Milestone 8 QA report for evidence and limits.
 
 ## Milestone 0 status
 

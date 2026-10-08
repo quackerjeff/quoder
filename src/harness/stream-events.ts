@@ -7,9 +7,9 @@
  */
 
 export interface TokenUsage {
-  readonly input: number;
-  readonly output: number;
-  readonly reasoning: number;
+  readonly input?: number;
+  readonly output?: number;
+  readonly reasoning?: number;
 }
 
 export type StreamEvent =
@@ -55,17 +55,24 @@ const text = (record: Record<string, unknown>, key: string): string | undefined 
   return typeof value === "string" ? value : undefined;
 };
 
-const count = (record: Record<string, unknown>, key: string): number => {
+const count = (record: Record<string, unknown>, key: string): number | undefined => {
   const value = record[key];
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 };
 
 const errorMessage = (value: unknown): string => (isRecord(value) && text(value, "message")) || "unknown error";
 
-const tokenUsage = (value: unknown): TokenUsage | undefined =>
-  isRecord(value)
-    ? { input: count(value, "input"), output: count(value, "output"), reasoning: count(value, "reasoning") }
-    : undefined;
+const tokenUsage = (value: unknown): TokenUsage | undefined => {
+  if (!isRecord(value)) return undefined;
+  const input = count(value, "input");
+  const output = count(value, "output");
+  const reasoning = count(value, "reasoning");
+  return {
+    ...(input === undefined ? {} : { input }),
+    ...(output === undefined ? {} : { output }),
+    ...(reasoning === undefined ? {} : { reasoning }),
+  };
+};
 
 const contentText = (value: unknown): string =>
   Array.isArray(value)
@@ -94,7 +101,7 @@ export function narrowStreamEvent(event: RawEvent): StreamEvent | undefined {
     case "step.failed":
       return { kind: "step-failed", sessionID, message: errorMessage(data.error) };
     case "retried":
-      return { kind: "retried", sessionID, attempt: count(data, "attempt"), message: errorMessage(data.error) };
+      return { kind: "retried", sessionID, attempt: count(data, "attempt") ?? 0, message: errorMessage(data.error) };
     case "text.delta": {
       const textID = text(data, "textID");
       const delta = text(data, "delta");

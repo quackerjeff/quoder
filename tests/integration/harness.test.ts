@@ -1502,7 +1502,7 @@ describe("quoder harness live view (Milestone 2)", () => {
     expect(order.every((index) => index >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(occurrences(output, "Streamed answer done.")).toBe(1);
-    expect(output).toMatch(/✓ Done in \d+\.\ds · 1 tool · 1\.2k tokens/u);
+    expect(output).toMatch(/✓ Done in \d+\.\ds · 1 tool · 1\.9k input tokens · 1\.2k output tokens/u);
     // Piped output carries no cursor control and no colour.
     expect(output).not.toContain("\u001b");
     const events = run.trace.map((event) => event.event);
@@ -1510,6 +1510,9 @@ describe("quoder harness live view (Milestone 2)", () => {
     expect(events.indexOf("stream.first-text")).toBeLessThan(events.indexOf("prompt.completed"));
     expect(run.trace).toContainEqual({ event: "activity.tool", tool: "read" });
     expect(sessionsDeleted(run.trace)).toEqual(["ses_1"]);
+    expect(run.history.completed[0]).not.toHaveProperty("inputTokens");
+    expect(run.history.completed[0]).not.toHaveProperty("outputTokens");
+    expect(run.history.completed[0]).not.toHaveProperty("usage");
   });
 
   it("prints the full answer when the stream missed part of it", async () => {
@@ -1765,7 +1768,7 @@ describe("persistent context prompt lifecycle (Milestone 5)", () => {
     expect(prompts[1]).toContain("Current repository snapshot (live Git data): main; 1 dirty path");
     expect(prompts[1]).toContain("src/import.ts");
     expect(run.output()).toContain("Harness context:");
-    expect(run.output()).toContain("Prompt: 42 chars");
+    expect(run.output()).toContain("Prompt: 42 code points");
     expect(run.memory.saved).toHaveLength(2);
     expect(run.memory.saved[0]?.previousExecution?.requestExcerpt).toBe("Now add tests for what we just implemented");
     expect(run.memory.saved[0]?.previousExecution?.responseExcerpt).toContain("Answer: Now add tests for what we just implemented");
@@ -1854,7 +1857,7 @@ describe("persistent context prompt lifecycle (Milestone 5)", () => {
     const submitted = (run.fake.client.v2.session.prompt as unknown as { mock: { calls: Array<[{ prompt: { text: string } }]> } }).mock.calls[0]?.[0].prompt.text ?? "";
     expect(submitted.endsWith("Current developer request:\n🙂 do the work")).toBe(true);
     expect(run.output()).toContain(`Harness context: `);
-    expect(run.output()).toContain("Prompt: 13 chars");
+    expect(run.output()).toContain("Prompt: 13 code points");
     expect(Array.from(submitted.split("\n\nCurrent developer request:\n")[0] ?? "").length).toBeLessThanOrEqual(HARNESS_CONTEXT_MAX_CODE_POINTS);
     expect(HARNESS_CONTEXT_MAX_CODE_POINTS).toBe(4_096);
   });

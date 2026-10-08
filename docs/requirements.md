@@ -1197,9 +1197,21 @@ Immediate previous result
 
 over complete conversation transcripts.
 
+Context and request sizes are reported in Unicode code points. SDK-reported
+input and output token usage is shown in the completion summary when available;
+missing values are omitted, reported zero remains visible, and no new usage
+metrics are persisted. The existing Milestone 5 context-pruning policy and
+4,096-code-point background-context limit remain unchanged.
+
 ## Exit Criteria
 
-The harness consistently supplies substantially less context than a long-running OpenCode conversation while maintaining sufficient continuity for normal development work.
+Acceptance uses a fixed synthetic 20-turn comparison: for each turn, compare
+Quoder's generated prompt with the complete transcript through that turn, sum
+Unicode code points over all turns, and require Quoder's total to be no more
+than 50% of the transcript total. Synthetic continuity checks cover follow-up
+references, saved decisions and constraints, and live Git state. This validates
+supplied-text reduction and selected context behavior; it does not measure
+provider tokens, all OpenCode system/tool overhead, or live model quality.
 
 ---
 

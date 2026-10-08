@@ -86,8 +86,17 @@ describe("narrowing OpenCode display events", () => {
     expect(narrow("tool.success", { ...base, callID: "c1", structured: null, content: "x" })).toMatchObject({ structured: {}, output: "" });
     expect(narrow("tool.failed", { ...base, callID: "c1", error: 42 })).toMatchObject({ message: "unknown error" });
     expect(narrow("step.ended", { ...base, tokens: { input: -1, output: "9", reasoning: Number.NaN } })).toMatchObject({
-      tokens: { input: 0, output: 0, reasoning: 0 },
+      tokens: {},
     });
     expect(narrow("step.ended", { ...base })).toEqual({ kind: "step-ended", sessionID: "ses_1", messageID: "msg_1" });
+  });
+
+  it("preserves reported zero and omits absent or malformed usage fields", () => {
+    expect(narrow("step.ended", { ...base, tokens: { input: 0, output: 12, reasoning: "bad" } })).toEqual({
+      kind: "step-ended", sessionID: "ses_1", messageID: "msg_1", tokens: { input: 0, output: 12 },
+    });
+    expect(narrow("step.ended", { ...base, tokens: { cache: { read: 20 } } })).toEqual({
+      kind: "step-ended", sessionID: "ses_1", messageID: "msg_1", tokens: {},
+    });
   });
 });

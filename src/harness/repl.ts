@@ -988,7 +988,7 @@ export class Harness {
     this.#view = view;
     this.#trace({ event: "prompt.started" });
     try {
-      view.note(`${theme.paint("dim", `Harness context: ${harnessContext.contextCharacters} chars · Prompt: ${harnessContext.promptCharacters} chars`)}\n`);
+      view.note(`${theme.paint("dim", `Harness context: ${harnessContext.contextCharacters} code points · Prompt: ${harnessContext.promptCharacters} code points`)}\n`);
       let server: ServerSession;
       try {
         server = await this.#ensureServer();

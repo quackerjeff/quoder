@@ -212,12 +212,16 @@ export function formatGitDiff(document: GitDiffDocument): string {
   return document.truncated ? `${text}${truncationNotice(document)}\n` : text;
 }
 
-/** The final status line, e.g. `✓ Done in 41.8s · 4 tools · 1.2k tokens`. */
+/** The final status line, e.g. `✓ Done in 41.8s · 4 tools · 1.2k input tokens · 800 output tokens`. */
 const statusLine = (result: PromptResult, theme: Theme, stats: TurnStats | undefined): string => {
   const elapsed = seconds(result.elapsedMs);
   switch (result.outcome.kind) {
     case "answered": {
-      const extra = stats === undefined ? [] : [count(stats.tools, "tool"), ...(stats.outputTokens > 0 ? [`${tokens(stats.outputTokens)} tokens`] : [])];
+      const extra = stats === undefined ? [] : [
+        count(stats.tools, "tool"),
+        ...(stats.inputTokens === undefined ? [] : [`${tokens(stats.inputTokens)} input tokens`]),
+        ...(stats.outputTokens === undefined ? [] : [`${tokens(stats.outputTokens)} output tokens`]),
+      ];
       return `${theme.paint("success", `✓ Done in ${elapsed}`)}${theme.paint("dim", extra.map((part) => ` · ${part}`).join(""))}`;
     }
     case "cancelled":

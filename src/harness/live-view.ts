@@ -9,7 +9,8 @@ import type { HistoryCommand, HistoryToolActivity } from "./execution-history.js
 /** Totals for the final status line. */
 export interface TurnStats {
   readonly tools: number;
-  readonly outputTokens: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
 }
 
 export interface LiveViewOptions {
@@ -97,7 +98,8 @@ export class LiveView {
   #phase = "Starting session";
   #reasoning = "";
   #toolCount = 0;
-  #outputTokens = 0;
+  #inputTokens: number | undefined;
+  #outputTokens: number | undefined;
   #sawText = false;
   #cancelling = false;
   #finished = false;
@@ -137,7 +139,8 @@ export class LiveView {
         this.#phase = "Thinking";
         break;
       case "step-ended":
-        this.#outputTokens += event.tokens?.output ?? 0;
+        if (event.tokens?.input !== undefined) this.#inputTokens = (this.#inputTokens ?? 0) + event.tokens.input;
+        if (event.tokens?.output !== undefined) this.#outputTokens = (this.#outputTokens ?? 0) + event.tokens.output;
         break;
       case "step-failed":
         if (!this.#cancelling) this.#permanent(`${this.#paint("warning", `! Step failed: ${sanitizeLine(event.message, 120)}`)}\n`);
@@ -258,7 +261,11 @@ export class LiveView {
   }
 
   #stats(): TurnStats {
-    return { tools: this.#toolCount, outputTokens: this.#outputTokens };
+    return {
+      tools: this.#toolCount,
+      ...(this.#inputTokens === undefined ? {} : { inputTokens: this.#inputTokens }),
+      ...(this.#outputTokens === undefined ? {} : { outputTokens: this.#outputTokens }),
+    };
   }
 
   #text(textID: string, messageID: string): TextBlock {
